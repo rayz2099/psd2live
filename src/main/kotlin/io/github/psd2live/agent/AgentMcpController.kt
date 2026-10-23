@@ -29,16 +29,31 @@ interface AgentMcpSettingsStore {
     fun save(settings: AgentMcpSettings)
 }
 
-/** Per-user Java preferences. The stdio proxy reads the token and port keys from the same node. */
+/**
+ * 用户级 Java Preferences 存储。
+ * 为支持多 Agent 并行及 CLI 动态分配端口，允许通过构造参数、JVM 参数或环境变量进行端口与令牌覆盖，
+ * 避免不同实例间相互覆盖持久化配置。
+ */
 class PreferencesAgentMcpSettingsStore(
     private val preferences: Preferences = Preferences.userNodeForPackage(AgentMcpCredentials::class.java),
+    private val overridePort: Int? = null,
+    private val overrideToken: String? = null,
 ) : AgentMcpSettingsStore {
     override fun load(): AgentMcpSettings {
-        val token = preferences.get(TOKEN_KEY, null)?.takeIf(AgentMcpCredentials::isValidToken)
+        val envToken = System.getenv("PSD2LIVE_MCP_TOKEN")?.takeIf(AgentMcpCredentials::isValidToken)
+        val token = overrideToken?.takeIf(AgentMcpCredentials::isValidToken)
+            ?: envToken
+            ?: preferences.get(TOKEN_KEY, null)?.takeIf(AgentMcpCredentials::isValidToken)
             ?: AgentMcpCredentials.generateToken().also { preferences.put(TOKEN_KEY, it) }
+
+        val sysPort = System.getProperty("psd2live.agent.port")?.toIntOrNull()?.takeIf { it in 1024..65535 }
+        val envPort = System.getenv("PSD2LIVE_MCP_PORT")?.toIntOrNull()?.takeIf { it in 1024..65535 }
+        val prefPort = preferences.getInt(PORT_KEY, DEFAULT_MCP_PORT).takeIf { it in 1024..65535 } ?: DEFAULT_MCP_PORT
+        val port = overridePort?.takeIf { it in 1024..65535 } ?: sysPort ?: envPort ?: prefPort
+
         return AgentMcpSettings(
             enabled = preferences.getBoolean(ENABLED_KEY, true),
-            port = preferences.getInt(PORT_KEY, DEFAULT_MCP_PORT).takeIf { it in 1024..65535 } ?: DEFAULT_MCP_PORT,
+            port = port,
             token = token,
             profile = AgentToolProfile.fromKey(preferences.get(PROFILE_KEY, null)) ?: AgentToolProfile.CORE,
         )
@@ -46,8 +61,13 @@ class PreferencesAgentMcpSettingsStore(
 
     override fun save(settings: AgentMcpSettings) {
         preferences.putBoolean(ENABLED_KEY, settings.enabled)
-        preferences.putInt(PORT_KEY, settings.port)
-        preferences.put(TOKEN_KEY, settings.token)
+        // 仅在非临时覆盖或用户在界面主动调整了端口时持久化，防止多实例临时端口污染主配置
+        if (overridePort == null || settings.port != overridePort) {
+            preferences.putInt(PORT_KEY, settings.port)
+        }
+        if (overrideToken == null) {
+            preferences.put(TOKEN_KEY, settings.token)
+        }
         preferences.put(PROFILE_KEY, settings.profile.key)
         runCatching { preferences.flush() }
     }

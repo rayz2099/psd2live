@@ -48,7 +48,12 @@ internal const val DEFAULT_MCP_MAX_REQUEST_BODY_BYTES = 96L * 1024 * 1024
 private const val SHUTDOWN_GRACE_MILLIS = 100L
 private const val SHUTDOWN_TIMEOUT_MILLIS = 500L
 
+// 默认端口与用于多 Agent/多实例并行的端口组范围（23871-23880 共 10 个端口，避免多工程并发竞争单一端口）
 const val DEFAULT_MCP_PORT = 23871
+const val DEFAULT_MCP_PORT_START = 23871
+const val DEFAULT_MCP_PORT_END = 23880
+val DEFAULT_MCP_PORT_RANGE: IntRange = DEFAULT_MCP_PORT_START..DEFAULT_MCP_PORT_END
+
 
 data class AgentMcpConfig(
 	val host: String = "127.0.0.1",

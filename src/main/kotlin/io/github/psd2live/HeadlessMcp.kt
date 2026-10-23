@@ -24,19 +24,42 @@ internal object HeadlessMcp {
 	fun run(arguments: List<String>): Int {
 		// Views render with AWT images on the CPU; nothing needs a display.
 		System.setProperty("java.awt.headless", "true")
-		val options = arguments.drop(1).chunked(2).associate { pair ->
-			require(pair.size == 2 && pair[0] in setOf("--port", "--token", "--store", "--profile")) { "Usage: mcp [--port N] [--token T] [--store DIR] [--profile core|full]" }
-			pair[0] to pair[1]
+		val rawArgs = arguments.drop(1)
+		val options = mutableMapOf<String, String>()
+		var index = 0
+		while (index < rawArgs.size) {
+			val arg = rawArgs[index]
+			if (index == 0 && arg.toIntOrNull() != null) {
+				// 兼容位置参数直接指定端口（如 mcp 23872），简化命令行与多 Agent 启动脚本
+				options["--port"] = arg
+				index++
+			} else if (arg in setOf("--port", "-p", "--token", "--store", "--profile") && index + 1 < rawArgs.size) {
+				val key = if (arg == "-p") "--port" else arg
+				options[key] = rawArgs[index + 1]
+				index += 2
+			} else {
+				throw IllegalArgumentException("Usage: mcp [port] [--port N] [--token T] [--store DIR] [--profile core|full]")
+			}
 		}
-		val store = Path.of(options["--store"] ?: Path.of(System.getProperty("user.home"), "psd2live-mcp").toString()).toAbsolutePath()
+
+		val sysPort = System.getProperty("psd2live.agent.port")?.toIntOrNull()?.takeIf { it in 1024..65535 }
+		val envPort = System.getenv("PSD2LIVE_MCP_PORT")?.toIntOrNull()?.takeIf { it in 1024..65535 }
+		val explicitPort = options["--port"]?.toIntOrNull()?.takeIf { it in 1024..65535 }
+		val port = explicitPort ?: sysPort ?: envPort ?: DEFAULT_MCP_PORT
+
+		// 多端口实例并行时，若未显式指定 store，自动按端口隔离目录，避免多个 Agent 并发读写同一份状态与锁
+		val defaultStoreName = if (port != DEFAULT_MCP_PORT) "psd2live-mcp-$port" else "psd2live-mcp"
+		val store = Path.of(options["--store"] ?: Path.of(System.getProperty("user.home"), defaultStoreName).toString()).toAbsolutePath()
 		Files.createDirectories(store)
+
 		val profile = options["--profile"]?.let { requireNotNull(AgentToolProfile.fromKey(it)) { "Unknown profile: $it" } } ?: AgentToolProfile.CORE
 		val presentation = HeadlessPresentation()
 		val host = WorkspaceHost(presentation, store)
 		presentation.attach(host)
 		val operations = WorkspaceOperations(host)
-		val service = AgentMcpService(host, AgentMcpConfig(port = options["--port"]?.toInt() ?: DEFAULT_MCP_PORT,
-			token = options["--token"] ?: AgentMcpCredentials.generateToken(), profile = profile), operations)
+		val envToken = System.getenv("PSD2LIVE_MCP_TOKEN")?.takeIf(AgentMcpCredentials::isValidToken)
+		val token = options["--token"] ?: envToken ?: AgentMcpCredentials.generateToken()
+		val service = AgentMcpService(host, AgentMcpConfig(port = port, token = token, profile = profile), operations)
 		val connection = service.start()
 		println("endpoint ${connection.endpoint}")
 		println("token ${connection.token}")

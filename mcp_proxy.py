@@ -95,8 +95,8 @@ def get_endpoint() -> str:
     endpoint = os.environ.get("PSD2LIVE_MCP_ENDPOINT")
     if endpoint:
         return require_local_endpoint(endpoint)
-    port = _read_saved("agent_mcp_port")
-    return f"http://127.0.0.1:{port if port and port.isdigit() else DEFAULT_PORT}/mcp"
+    port = os.environ.get("PSD2LIVE_MCP_PORT") or _read_saved("agent_mcp_port")
+    return f"http://127.0.0.1:{port if port and str(port).isdigit() else DEFAULT_PORT}/mcp"
 
 
 ENDPOINT = get_endpoint()

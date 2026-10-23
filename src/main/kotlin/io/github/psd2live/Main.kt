@@ -49,8 +49,13 @@ fun main(arguments: Array<String>) {
 	io.github.psd2live.render.SkiaGpu.requestOpenGl()
 	configureLanguage(arguments)
 	val command = commandArguments(arguments)
-	if (command.isEmpty()) {
-		runGui()
+	val isGui = command.isEmpty() ||
+		command.first() == "gui" ||
+		(!command.contains("--input") && command.any { it in setOf("--port", "-p", "--store", "--token") }) ||
+		(command.size == 1 && command.first().toIntOrNull() != null)
+
+	if (isGui) {
+		runGui(parseGuiOptions(command))
 		return
 	}
 	if (command.first() == "--clear-user-data") {
@@ -118,12 +123,62 @@ private fun useAppIconInDock() {
 	}
 }
 
+/**
+ * 界面启动配置参数。
+ * 支持指定 MCP 端口、存储目录与令牌，使多个开发界面或 Agent 工作区可并行运行。
+ */
+internal data class GuiOptions(
+	val port: Int? = null,
+	val store: Path? = null,
+	val token: String? = null,
+)
+
+internal fun parseGuiOptions(command: List<String>): GuiOptions {
+	val rawArgs = if (command.firstOrNull() == "gui") command.drop(1) else command
+	var port: Int? = null
+	var store: Path? = null
+	var token: String? = null
+	var index = 0
+	while (index < rawArgs.size) {
+		val arg = rawArgs[index]
+		if (index == 0 && arg.toIntOrNull() != null) {
+			// 支持首个位置参数直接传入端口号，如 just dev 23872
+			port = arg.toIntOrNull()?.takeIf { it in 1024..65535 }
+			index++
+		} else if ((arg == "--port" || arg == "-p") && index + 1 < rawArgs.size) {
+			port = rawArgs[index + 1].toIntOrNull()?.takeIf { it in 1024..65535 }
+			index += 2
+		} else if (arg == "--store" && index + 1 < rawArgs.size) {
+			store = Path.of(rawArgs[index + 1])
+			index += 2
+		} else if (arg == "--token" && index + 1 < rawArgs.size) {
+			token = rawArgs[index + 1]
+			index += 2
+		} else {
+			index++
+		}
+	}
+	return GuiOptions(port = port, store = store, token = token)
+}
+
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
-private fun runGui() {
+private fun runGui(options: GuiOptions = GuiOptions()) {
 	SessionLog.install(Path.of(System.getProperty("user.home"), ".psd2live", "logs"))
 	FreezeWatchdog().start()
+
+	// 端口隔离逻辑：当显式指定非默认端口且未指定 store 时，自动将 store 目录隔离至对应端口子目录，
+	// 避免多个并发 GUI 实例在同一个 .instance.lock 上产生文件锁互斥
+	val storeRoot = options.store ?: run {
+		val p = options.port
+		if (p != null && p != io.github.psd2live.agent.DEFAULT_MCP_PORT) {
+			WorkspaceStore.defaultRoot().resolveSibling("agent-workspaces-port-$p")
+		} else {
+			WorkspaceStore.defaultRoot()
+		}
+	}
+
 	val instanceLock = try {
-		AppInstanceLock.acquire(WorkspaceStore.defaultRoot()) ?: run {
+		AppInstanceLock.acquire(storeRoot) ?: run {
 			// Held by a running editor; leave it alone rather than share its store and MCP port.
 			System.err.println(tr("app.alreadyRunning"))
 			runCatching { JOptionPane.showMessageDialog(null, tr("app.alreadyRunning"), tr("app.title"), JOptionPane.WARNING_MESSAGE) }
@@ -135,9 +190,13 @@ private fun runGui() {
 	}
 	val viewModel = PSD2LiveViewModel()
 	val failureReports = UiFailureReports()
-	val agentWorkspace = DesktopWorkspace(viewModel)
+	val agentWorkspace = DesktopWorkspace(viewModel, storeRoot)
 	viewModel.attachWorkspace(agentWorkspace)
-	val agentMcp = AgentMcpController(agentWorkspace, observer = viewModel.agentCallObserver)
+	val agentMcpStore = io.github.psd2live.agent.PreferencesAgentMcpSettingsStore(
+		overridePort = options.port,
+		overrideToken = options.token,
+	)
+	val agentMcp = AgentMcpController(agentWorkspace, store = agentMcpStore, observer = viewModel.agentCallObserver)
 	agentMcp.start()
 	viewModel.operationDocs = agentMcp::operationDocs
 	viewModel.watchAgentMcp(agentMcp.status)
