@@ -44,6 +44,7 @@ internal object RigAuthoringJournal {
         RigLayerDeletion.OP -> RigLayerDeletion.replay(model, edit)
         // Replay starts after the last checkpoint; an earlier one is history and changes nothing here.
         RigCheckpoint.OP -> model
+        RigMeshSeed.OP -> model
         GeneratedOverrides.OP -> GeneratedOverrides.apply(model, edit).model
         MeshGenerationBaseline.OP -> MeshGenerationBaseline.replay(model, edit)
         RigGenerationBaseline.OP -> RigGenerationBaseline.replay(model, edit)
@@ -79,6 +80,8 @@ internal object RigAuthoringJournal {
         "warp" -> RigWarpEdit.fromJson(edit.getValue("warp").jsonObject).applyTo(model)
         "parameter_keys" -> ParameterKeyEdits.apply(model, edit)
         "structure" -> RigStructureEdits.apply(model, edit.getValue("edits").jsonArray.map { it.jsonObject })
+        RigObjectPaste.OP -> RigObjectPaste.apply(model, edit)
+        RigIdConversion.OP -> RigIdConversion.apply(model, edit)
         else -> error("Unknown authoring journal operation")
         }
     }
@@ -144,6 +147,20 @@ internal object RigAuthoringJournal {
             // A mirror is materialized as the sets and copies it computes, each recorded as its own entry.
             if (op == KeyformMirror.OP) {
                 KeyformMirror.compile(current, command).forEach { record(it.text("op"), it) }
+                continue
+            }
+            // The keyform tools are materialized as the sets they compute.
+            if (op in KeyformTools.OPS) {
+                KeyformTools.compile(current, command).forEach { record("set", it) }
+                continue
+            }
+            // A paste request fixes its new IDs here; a mesh duplication records one mesh replacement per target.
+            if (op == RigObjectPaste.OP && RigObjectPaste.isRequest(command)) {
+                RigObjectPaste.compile(current, command).forEach { record(it.text("op"), it) }
+                continue
+            }
+            if (op == RigMeshDuplication.OP) {
+                RigMeshDuplication.compile(current, command).forEach { record(it.text("op"), it) }
                 continue
             }
             val compiled = when (op) {
@@ -230,7 +247,7 @@ internal object RigAuthoringJournal {
                 VertexGroupJournal.RULE -> VertexGroupJournal.compileRule(current, command)
                 // Absolute points from the producer become sparse deltas against the geometry shown here.
                 "canvas_geometry" -> CanvasGeometryJournal.encode(current, command)
-                GeneratedOverrides.OP, DepthSplit.OP, MeshGenerationBaseline.OP, RigGenerationBaseline.OP, RigGenerationScaffold.OP, RigGenerationJournal.OP, RigGenerationFrames.OP, RigMeshActivation.OP, RigWarpTopology.OP, RigBezierJournal.OP, SourcePartitionJournal.OP, ArtPrimitiveJournal.OP, RasterMeshJournal.OP, RasterMeshCreation.OP, LayerDeletionJournal.OP, "parameter_keys", "copy", "delete", "warp", "structure", "path_delete", VertexGroupJournal.PUT, VertexGroupJournal.DELETE, "canvas_topology", "canvas_create_warp", "canvas_create_rotation" -> command
+                GeneratedOverrides.OP, DepthSplit.OP, MeshGenerationBaseline.OP, RigGenerationBaseline.OP, RigGenerationScaffold.OP, RigGenerationJournal.OP, RigGenerationFrames.OP, RigMeshActivation.OP, RigWarpTopology.OP, RigBezierJournal.OP, SourcePartitionJournal.OP, ArtPrimitiveJournal.OP, RasterMeshJournal.OP, RasterMeshCreation.OP, LayerDeletionJournal.OP, RigObjectPaste.OP, RigIdConversion.OP, "parameter_keys", "copy", "delete", "warp", "structure", "path_delete", VertexGroupJournal.PUT, VertexGroupJournal.DELETE, "canvas_topology", "canvas_create_warp", "canvas_create_rotation" -> command
                 // Glue pairs vertices where both meshes rest, as Cubism's glue: a weld does nothing at rest. Older records keep their pose.
                 "canvas_create_glue", "canvas_glue_edit" -> JsonObject(command - "pose")
                 else -> error("Unknown authoring operation: $op")

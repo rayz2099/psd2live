@@ -27,7 +27,7 @@
 | 方向起终点 | 各坐标 0–1 | 图层范围内的传播方向；两点距离至少 0.05 |
 | 横 / 纵鼠标倍率 | 各 0.1–1 | 均匀线性倍率，只作用于鼠标试动 |
 
-局部引导线保存源像素坐标、半径（正数）、强度和“仅纵向”标记；由[按纹理结构重布点](TEXTURE_STRUCTURE_MESH.md)识别出的线另记 `detected`（`FOLD` / `SHADE` / `PATTERN`）。普通 TOPOLOGY 线不会自行产生褶皱；FOLD 才参与造型，检测线须由作者标为褶皱。手绘引导线通过数值控制点调整，引导线画布手柄尚未实现。
+局部引导线保存源像素坐标、半径（正数）、强度和“仅纵向”标记；由[按纹理结构重布点](TEXTURE_STRUCTURE_MESH.md)识别出的线另记 `detected`（`FOLD` / `SHADE` / `PATTERN`）。普通 TOPOLOGY 线不会自行产生褶皱；FOLD 才参与造型，检测线须由作者标为褶皱。引导线可在面板按数值调整，也可用下文的画布手柄绘制和编辑。
 
 ## 核心与生成表示
 
@@ -38,7 +38,20 @@
 - 输入可读已有 NORMAL/BLEND 参数，要求不循环且默认值位于范围内部。省略绑定时优先用标准身体 X/Y，缺少时创建私有输入；显式空 ID 表示新建。非零默认值使用 F(0) 常量/门控残差分解，保持 Cubism blend 的中性值 0。
 - blend 字段加入当前 grid 默认偏移及标量参考，匹配原生求值器的减参考语义，避免重复扣除导致中性漂移。
 
-内部网格可按纹理结构重布点（见[按纹理结构重布点](TEXTURE_STRUCTURE_MESH.md)）：外轮廓行与边缘带保留，内侧沿识别出的褶皱、明暗分界与图案线条重建；有内部造型的网格在同一历史节点中重新烘焙。手工布点工具与曲面/引导线画布手柄留到后续 PR。
+内部网格可按纹理结构重布点（见[按纹理结构重布点](TEXTURE_STRUCTURE_MESH.md)）：外轮廓行与边缘带保留，内侧沿识别出的褶皱、明暗分界与图案线条重建；有内部造型的网格在同一历史节点中重新烘焙。编辑模式的布点、删边与重新三角化同样适用于内部网格，改动后在同一步重新烘焙（见[网格拓扑 · 手工拓扑编辑](MESH_TOPOLOGY_AND_SPLIT.md#手工拓扑编辑)）。
+
+## 画布手柄
+
+物体模式的“内部造型手柄”工具（快捷键见 `ShortcutRegistry` 的 `TOOL_INTERIOR`，默认 Shift+I；面板工具条“画布编辑”同样进入，从其他模式进入时切到物体模式）在选中网格上显示已开启的效果。物体模式不画网格顶点，手柄不与顶点重叠；编辑模式不再提供该工具。网格没有效果或效果已关闭时，选项条提示原因并给出“开启内部造型”。按下没有落在手柄、引导线上时：落在其他物体上则按物体模式选中它（手柄随之移到它的效果上），落在当前网格或画布空白处则开始画褶皱线；没有可编辑的效果时，单击物体即选中它。
+
+- **虚拟曲面**：虚线框是源 alpha 的可见范围（曲面跨度，由轮廓决定，没有独立的中心或范围参数）；中心十字的四条臂分别是鼓起（上）、偏压（左）、横向幅度（右）和纵向幅度（下），臂长随数值线性变化，2 时到达框边，0 时仍离中心一小段以免手柄重叠。框内画出横纵两条拱线：实线为静止拱（高度随鼓起），虚线为满输入时按偏压倾斜的拱。拱线是示意，不是位移结果。
+- **传动方向**：开启缓动与传动时显示箭头，两端点分别拖动，中点同时平移两端；坐标归一化到网格源像素范围，两端距离小于 0.05 时拒绝该位置。
+- **引导线**：褶皱（FOLD）以暖色绘制并用半透明带表示影响半径，识别出的 SHADE / PATTERN 线按类型着色，未标为褶皱的识别线淡显。在网格上或画布空白处单击开始画新褶皱线，逐点单击，单击最后一点或 Enter 完成，Delete 退回一点，Esc 取消；拖动点移动（识别线的点只在选中该线后显示并可拾取），拖动线段平移整条线，Ctrl+单击线段插点，Alt+单击删点，Delete 删除所选点（未选点时删整条线）。选中的褶皱线另有半径手柄。选项条可把所选线标为 / 取消褶皱或删除。
+- **反馈**：悬停的手柄、点与线高亮，状态栏显示手柄名称和当前值；拖动中的手柄按选中样式绘制。点与线一律使用 `MeshLook`。
+
+手柄几何、命令转换和引导线编辑都是 `core/interior/InteriorHandles.kt` 中的纯函数（`InteriorHandles`、`InteriorGuideEdits`、`InteriorPolylines`）。引导线与手柄保存在源像素坐标，`InteriorCanvasMap` 用网格 UV 对应的源像素位置做三角形重心映射，所以它们随网格当前的显示位置移动，屏幕坐标反算回源像素。
+
+拖动只改与面板共用的 `InteriorDraft`，面板数值随之更新，面板修改也立即反映到手柄。试动进行中，草稿经 `InteriorController.previewLater` 以同一条 `interior_put` 在隔离候选上预览（中性姿态下效果本身不移动顶点，只更新手柄与拱线）。拖动期间不写文档，松手提交一次完整的 `interior_put`（`NativeInteriorAuthoring.request` 生成，面板提交也用它）；一次 `interior_put` 即一个历史节点，所以一次拖动只记一条历史。拖动不会被前一次提交落地打断；Esc 取消拖动时草稿回到按下前，并撤回尚未提交的试动预览。草稿的值等于已保存配方时（含前一次提交落地后）即视为干净，之后撤销与 MCP 修改照常同步到草稿。画线完成、删点和标为褶皱同样各提交一次。没有新增文档字段，重放、保存恢复与 MCP 均沿用已有配方。
 
 ## 缓动和传播
 
@@ -63,7 +76,7 @@ UI 与 MCP 共用 `interior_put` 和 `interior_delete` 文档命令。目标接�
 ## 验证与限制
 
 ```bash
-./gradlew test --tests '*InteriorSurfaceTest' --tests '*InteriorReferenceParityTest' --tests '*InteriorBasisKeyformTest' --tests '*InteriorMotionTest' --tests '*NativeInteriorEffectTest'
+./gradlew test --tests '*InteriorSurfaceTest' --tests '*InteriorReferenceParityTest' --tests '*InteriorBasisKeyformTest' --tests '*InteriorMotionTest' --tests '*NativeInteriorEffectTest' --tests '*InteriorHandlesTest'
 ./gradlew test
 ```
 

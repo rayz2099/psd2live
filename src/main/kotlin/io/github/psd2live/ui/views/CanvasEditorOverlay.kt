@@ -350,6 +350,8 @@ internal fun BoxScope.CanvasEditorOverlay(
             val hovered = editor.hoveredMeshVertex
             val hoveredGroup = hovered?.let { welds.members(it) }.orEmpty()
             val hoverReach = editor.brushHoverReach(viewport)
+            // Soft selection rings the points a drag of the picked ones would carry, by the share each would follow.
+            val softReach = editor.softSelectionReach(viewport)
             // The selection brush rings, in the selection's colour, the points a press would take.
             val selectReach = if (editor.tool == CanvasTool.BRUSH_SELECT && !editor.inGesture)
                 editor.cursor?.let { it to (editor.radius * viewport.scale).toFloat() } else null
@@ -382,6 +384,7 @@ internal fun BoxScope.CanvasEditorOverlay(
                     val isHovered = vertex == hovered || (primary && hovered == null && i == editor.hoveredVertex)
                     drawMeshHandle(p, meshColor, colors.accent, selected = i in selected || i in stroked, hovered = isHovered)
                     reach?.getOrNull(i)?.let { w -> drawReachRing(p, editor.reachShown(w), MeshLook.Reach) }
+                    if (i !in selected) softReach[t.id]?.getOrNull(i)?.let { w -> drawReachRing(p, w, MeshLook.Reach) }
                     selectReach?.let { (center, r) -> if ((p - center).getDistance() <= r) drawReachRing(p, 1f, colors.accent) }
                 }
             }
@@ -538,8 +541,22 @@ internal fun BoxScope.CanvasEditorOverlay(
                     drawMeshHandle(p, MeshLook.Structure, colors.accent, selected = i in editor.vertices,
                         hovered = i == editor.hoveredVertex, shape = HandleShape.SQUARE)
                     reach?.getOrNull(i)?.let { w -> drawReachRing(p, editor.reachShown(w), MeshLook.Reach) }
+                    if (i !in editor.vertices) editor.softSelectionReach(viewport)[target.id]?.getOrNull(i)?.let { w -> drawReachRing(p, w, MeshLook.Reach) }
                 }
             }
+        }
+
+        // 2b. The temporary warp's lattice, in the mesh look with square control points, as a warp's level-1 lattice.
+        editor.activeTemporaryWarp()?.let { warp ->
+            val pts = editor.temporaryWarpScreen(viewport)
+            val columns = warp.columns + 1
+            val wires = ArrayList<Offset>()
+            pts.indices.forEach { i ->
+                if (i % columns < columns - 1) { wires += pts[i]; wires += pts[i + 1] }
+                if (i + columns < pts.size) { wires += pts[i]; wires += pts[i + columns] }
+            }
+            drawMeshWires(wires, MeshLook.Structure)
+            pts.forEach { p -> drawMeshHandle(p, MeshLook.Structure, colors.accent, selected = false, hovered = false, shape = HandleShape.SQUARE) }
         }
 
         // 3. Transform box (shared by TRANSFORM tool and points)
@@ -631,6 +648,11 @@ internal fun BoxScope.CanvasEditorOverlay(
         viewModel.structureMesh.takeIf { it.showLines }?.preview?.let { preview ->
             drawStructurePreview(preview) { x, y -> Offset(viewport.x(x).toFloat(), (viewport.offsetY + y * viewport.scale).toFloat()) }
         }
+
+        // The interior tool's surface, propagation and guide handles on the selected mesh.
+        if (editor.tool == CanvasTool.INTERIOR) drawInteriorHandles(editor.interiorTool, viewport, colors)
+        // The fitted features' handles.
+        if (editor.tool == CanvasTool.FEATURE) drawFeatureHandles(editor.featureTool, editor.state.recipe, viewport, colors)
 
         // 3c-3e. Paint mode: the shape being drawn, the tip, the colour pick and the tip being retuned.
         drawPaintOverlays(editor, viewport, colors, textMeasurer)
@@ -801,10 +823,10 @@ internal fun BoxScope.CanvasEditorOverlay(
             }
         }
 
-        // 3g. The knife's polyline: the anchors placed so far, the red rubber band that shows where the cut
+        // 3g. The point tool's line: the anchors placed so far, the red rubber band that shows where the line
         //     would run to the pointer, and a ring that turns red and grows where a click would snap to a
         //     vertex or an edge instead of dropping a new point.
-        if (editor.tool == CanvasTool.KNIFE && currentTarget != null && currentTarget.kind == "mesh") {
+        if (editor.knifing && currentTarget != null && currentTarget.kind == "mesh") {
             val placed = editor.knifeDraft.mapNotNull { editor.knifeAnchorScreen(it, currentTarget, viewport) }
             for (index in 0 until placed.size - 1) {
                 drawLine(Color.Black.copy(alpha = 0.45f), placed[index], placed[index + 1], 2.5f)
@@ -822,6 +844,14 @@ internal fun BoxScope.CanvasEditorOverlay(
                 val isLast = index == placed.lastIndex
                 drawCircle(if (isLast) colors.accent else colors.textPrimary, 3.5f, point)
             }
+        }
+
+        // 3g'. The point tool's points: the stroke laying new points, else where a click would land - the vertex it would grab,
+        //      the spot on an edge it would split, or the free point it would add.
+        if (editor.tool == CanvasTool.MESH_POINT && !editor.knifing && currentTarget != null && currentTarget.kind == "mesh") {
+            val stroke = editor.pointStroke
+            if (stroke.size > 1) drawMeshWires(stroke.zipWithNext().flatMap { listOf(it.first, it.second) }, MeshLook.Structure, alpha = 1f)
+            else editor.knifeHover?.let { at -> drawMeshHandle(at, MeshLook.Structure, colors.accent, hovered = true) }
         }
 
         // 3h. The weight gradient: the drag from full to empty, with the two lines the ramp runs between.
@@ -2036,8 +2066,12 @@ internal fun BoxScope.CanvasToolBar(
                     selected = if (creating) placingTool == tool || editor.tool == tool else editor.tool == tool,
                     enabled = (if (creating) editor.editable else !editor.busy) && !waiting,
                     tooltip = if (waiting) tr("editor.glueNeedTwo", editor.glueMeshCount()) else null,
-                    // The shape tool answers to its shapes' chords, so its row shows the one that is in hand.
-                    keyLabel = keymap.labelFor(if (tool == CanvasTool.PAINT_SHAPE) editor.paintShape.action else tool.action).orEmpty(),
+                    // The shape and point tools answer to their faces' chords, so their rows show the one that is in hand.
+                    keyLabel = keymap.labelFor(when (tool) {
+                        CanvasTool.PAINT_SHAPE -> editor.paintShape.action
+                        CanvasTool.MESH_POINT -> editor.meshPointMode.action
+                        else -> tool.action
+                    }).orEmpty(),
                     keyCap = true,
                     icon = { color ->
                         ToolIcon(
@@ -2046,6 +2080,8 @@ internal fun BoxScope.CanvasToolBar(
                             brushShape = if (tool == CanvasTool.BRUSH || tool == CanvasTool.WEIGHT_PAINT) editor.brushShape else null,
                             paintShape = if (tool == CanvasTool.PAINT_SHAPE) editor.paintShape else null,
                             skeletonEditSubTool = if (tool == CanvasTool.SKELETON_EDIT) editor.skeletonEditSubTool else null,
+                            paintSelectShape = if (tool == CanvasTool.PAINT_SELECT) editor.paintSelectShape else null,
+                            meshPointMode = if (tool == CanvasTool.MESH_POINT) editor.meshPointMode else null,
                         )
                     },
                     onClick = {
@@ -2082,6 +2118,14 @@ internal fun BoxScope.CanvasToolBar(
         RailVariants(editor.hierarchyMode == EditHierarchyMode.PAINT && editor.tool == CanvasTool.PAINT_SHAPE, PaintShape.entries,
             { editor.paintShape == it }, { tr(it.labelKey) }, { color, shape -> PaintShapeIcon(shape = shape, color = color) },
             keys = { keymap.labelFor(PaintShape.entries[it].action).orEmpty() }) { shape -> editor.selectPaintShape(shape); focus() }
+        // The point tool's two faces, points and a line, each on its own chord.
+        RailVariants(editor.hierarchyMode == EditHierarchyMode.EDIT && editor.tool == CanvasTool.MESH_POINT, MeshPointMode.entries,
+            { editor.meshPointMode == it }, { tr(it.labelKey) }, { color, mode -> MeshPointModeIcon(mode = mode, color = color) },
+            keys = { keymap.labelFor(MeshPointMode.entries[it].action).orEmpty() }) { mode -> editor.selectMeshPointMode(mode); focus() }
+        // The selection tool's faces, under it the same way, on the number keys.
+        RailVariants(editor.hierarchyMode == EditHierarchyMode.PAINT && editor.tool == CanvasTool.PAINT_SELECT, PaintSelectShape.entries,
+            { editor.paintSelectShape == it }, { tr(it.labelKey) }, { color, shape -> PaintSelectShapeIcon(shape = shape, color = color) },
+            keys = { pickKey(keymap, it) }) { shape -> editor.paintSelectShape = shape; focus() }
         // Picking a group kind is picking which group of the mesh the weight strokes write.
         RailVariants(editor.hierarchyMode == EditHierarchyMode.SIMULATE, PAINTED_GROUP_KINDS, { editor.weightGroupKind == it },
             { tr("sim.group.${it.jsonName}") }, { _, kind -> VertexGroupKindIcon(kind = kind, color = vertexGroupKindColor(kind)) },
@@ -2843,6 +2887,152 @@ private fun SkeletonPoseLayer(editor: CanvasEditor, viewport: CanvasViewport, pa
     }
 }
 
+/** Past this many edge segments the selection shows as its bounding box rather than its marching ants. */
+private const val MAX_ANT_SEGMENTS = 200_000
+
+/** Each selection outline as one path in canvas units, traced while that outline is the session's. */
+private val selectionPathCache = java.util.WeakHashMap<FloatArray, Pair<io.github.psd2live.project.LayerTransform, androidx.compose.ui.graphics.Path>>()
+
+/**
+ * The paint selection and the drafts of the tools that make one: the marching ants around what is selected, the
+ * box, ellipse or lasso being drawn, the gradient being dragged and the axes a mirrored stroke is painted across.
+ */
+/**
+ * A free transform in hand: the lifted pixels where the box puts them, and the box with its handles. The pixels go
+ * from the lifted area of the raster, through the layer's frame and the box, onto the screen in one matrix.
+ */
+private fun DrawScope.drawPaintTransform(editor: CanvasEditor, hand: CanvasEditor.PaintTransformInHand, viewport: CanvasViewport,
+                                         colors: ToolColors) {
+    val session = editor.paintSession ?: return
+    val scale = viewport.scale.toFloat()
+    val region = hand.region
+    val raster = io.github.psd2live.project.LayerTransform(1f / session.scaleX, 0f, 0f, 1f / session.scaleY,
+        session.originX + region.x / session.scaleX, session.originY + region.y / session.scaleY)
+    val view = io.github.psd2live.project.LayerTransform(scale, 0f, 0f, scale, viewport.offsetX.toFloat(), viewport.offsetY.toFloat())
+    val m = view.after(hand.box.transform.after(session.frame.after(raster)))
+    val matrix = androidx.compose.ui.graphics.Matrix().apply {
+        this[0, 0] = m.a; this[0, 1] = m.b; this[1, 0] = m.c; this[1, 1] = m.d; this[3, 0] = m.e; this[3, 1] = m.f
+    }
+    withTransform({ transform(matrix) }) { drawImage(hand.preview) }
+    fun screen(p: Offset) = Offset(viewport.x(p.x).toFloat(), (viewport.offsetY + p.y * viewport.scale).toFloat())
+    val corners = hand.box.corners.map(::screen)
+    val outline = Path().apply {
+        moveTo(corners[0].x, corners[0].y); corners.drop(1).forEach { lineTo(it.x, it.y) }; close()
+    }
+    drawPath(outline, Color.Black.copy(alpha = 0.7f), style = Stroke(3f))
+    drawPath(outline, colors.accent, style = Stroke(1.2f))
+    for (handle in PaintTransformBox.handlePoints) {
+        val at = screen(hand.box.point(handle.x, handle.y))
+        val half = 4f
+        drawRect(Color.White, at - Offset(half, half), Size(half * 2, half * 2))
+        drawRect(colors.accent, at - Offset(half, half), Size(half * 2, half * 2), style = Stroke(1.2f))
+    }
+    // The point it turns about.
+    val center = screen(hand.box.center)
+    drawCircle(Color.Black.copy(alpha = 0.7f), 3.5f, center, style = Stroke(2.5f))
+    drawCircle(colors.accent, 3.5f, center, style = Stroke(1f))
+}
+
+private fun DrawScope.drawPaintSelectionOverlays(editor: CanvasEditor, viewport: CanvasViewport, colors: ToolColors) {
+    val session = editor.paintSession
+    val scale = viewport.scale.toFloat()
+    fun screen(p: Offset) = Offset(viewport.x(p.x).toFloat(), (viewport.offsetY + p.y * viewport.scale).toFloat())
+    val dash = PathEffect.dashPathEffect(floatArrayOf(4f, 4f))
+    val offset = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 4f)
+    // Two dashes out of step, black and white, read on any artwork.
+    fun ants(path: androidx.compose.ui.graphics.Path) {
+        drawPath(path, Color.Black.copy(alpha = 0.8f), style = Stroke(1f, pathEffect = dash))
+        drawPath(path, Color.White.copy(alpha = 0.9f), style = Stroke(1f, pathEffect = offset))
+    }
+    if (session != null) {
+        val outline = session.selectionOutline
+        val bounds = session.selectionBounds
+        val frame = session.frame
+        // Raster pixels to canvas units, through the layer's own transform: where the canvas shows a raster point.
+        fun shownX(x: Float, y: Float) = frame.x(session.originX + x / session.scaleX, session.originY + y / session.scaleY)
+        fun shownY(x: Float, y: Float) = frame.y(session.originX + x / session.scaleX, session.originY + y / session.scaleY)
+        val path: androidx.compose.ui.graphics.Path? = when {
+            // An edge too long to trace every frame - a wand over noise - and a selection too faint to have one show
+            // as the box they fill instead.
+            bounds != null && (outline.isEmpty() || outline.size / 4 > MAX_ANT_SEGMENTS) ->
+                selectionPathCache[outline]?.takeIf { it.first == frame }?.second ?: androidx.compose.ui.graphics.Path().also { box ->
+                    val l = bounds.x.toFloat(); val t = bounds.y.toFloat()
+                    val r = (bounds.x + bounds.width).toFloat(); val btm = (bounds.y + bounds.height).toFloat()
+                    box.moveTo(shownX(l, t), shownY(l, t)); box.lineTo(shownX(r, t), shownY(r, t))
+                    box.lineTo(shownX(r, btm), shownY(r, btm)); box.lineTo(shownX(l, btm), shownY(l, btm)); box.close()
+                    selectionPathCache[outline] = frame to box
+                }
+            outline.isNotEmpty() -> selectionPathCache[outline]?.takeIf { it.first == frame }?.second ?: androidx.compose.ui.graphics.Path().also { edge ->
+                for (i in outline.indices step 4) {
+                    edge.moveTo(shownX(outline[i], outline[i + 1]), shownY(outline[i], outline[i + 1]))
+                    edge.lineTo(shownX(outline[i + 2], outline[i + 3]), shownY(outline[i + 2], outline[i + 3]))
+                }
+                selectionPathCache[outline] = frame to edge
+            }
+            else -> null
+        }
+        // The path stays in canvas units and the view is applied to the drawing, so nothing is copied per frame; the
+        // line and its dashes are divided by the scale to stay one screen pixel.
+        // A selection being transformed moves with its pixels; its old outline would only mislead.
+        if (path != null && editor.paintTransform == null) withTransform({
+            translate(viewport.offsetX.toFloat(), viewport.offsetY.toFloat())
+            scale(scale, scale, Offset.Zero)
+        }) {
+            val unit = 1f / scale
+            drawPath(path, Color.Black.copy(alpha = 0.8f), style = Stroke(unit, pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f * unit, 4f * unit))))
+            drawPath(path, Color.White.copy(alpha = 0.9f), style = Stroke(unit, pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f * unit, 4f * unit), 4f * unit)))
+        }
+        // The mirror axes run through the middle of the canvas.
+        val symmetry = editor.paintSymmetry
+        if (editor.paintBrushActive && symmetry != io.github.psd2live.core.PaintSymmetry.OFF) {
+            val guide = colors.accent.copy(alpha = 0.55f)
+            val w = session.canvasWidth.toFloat(); val h = session.canvasHeight.toFloat()
+            if (symmetry.vertical) drawLine(guide, screen(Offset(w / 2f, 0f)), screen(Offset(w / 2f, h)), 1f, pathEffect = dash)
+            if (symmetry.horizontal) drawLine(guide, screen(Offset(0f, h / 2f)), screen(Offset(w, h / 2f)), 1f, pathEffect = dash)
+        }
+    }
+    editor.paintTransform?.let { drawPaintTransform(editor, it, viewport, colors) }
+    // The quick selection brush: its ring under the pointer, sized in the layer's frame as the paint tips are.
+    editor.cursor?.takeIf { editor.paintQuickSelectActive }?.let { cur ->
+        val r = (editor.paintQuickSelectSize / editor.paintPixelsPerUnit / 2f * editor.paintShownScale * viewport.scale.toFloat()).coerceAtLeast(1f)
+        drawCircle(Color.Black.copy(alpha = 0.7f), r, cur, style = Stroke(3f))
+        drawCircle(Color.White.copy(alpha = 0.9f), r, cur, style = Stroke(1.2f))
+    }
+    // The lasso or polygon being drawn; the polygon's last side follows the pointer until the next click.
+    val draft = editor.paintSelectDraft
+    if (draft.isNotEmpty()) {
+        val path = androidx.compose.ui.graphics.Path().apply {
+            val first = screen(draft.first())
+            moveTo(first.x, first.y)
+            draft.drop(1).forEach { val p = screen(it); lineTo(p.x, p.y) }
+            if (editor.paintSelectShape == PaintSelectShape.POLYGON) editor.cursor?.let { lineTo(it.x, it.y) }
+        }
+        ants(path)
+        if (editor.paintSelectShape == PaintSelectShape.POLYGON) drawCircle(colors.accent, 3f, screen(draft.first()))
+    }
+    val s = editor.paintStrokeStart
+    val c = editor.paintStrokeCurrent
+    if (editor.isPainting && s != null && c != null) when (editor.tool) {
+        CanvasTool.PAINT_SELECT -> if (editor.paintSelectShape == PaintSelectShape.RECTANGLE || editor.paintSelectShape == PaintSelectShape.ELLIPSE) {
+            val topLeft = Offset(minOf(s.x, c.x), minOf(s.y, c.y))
+            val size = Size(kotlin.math.abs(c.x - s.x), kotlin.math.abs(c.y - s.y))
+            val path = androidx.compose.ui.graphics.Path().apply {
+                if (editor.paintSelectShape == PaintSelectShape.RECTANGLE) addRect(androidx.compose.ui.geometry.Rect(topLeft, size))
+                else addOval(androidx.compose.ui.geometry.Rect(topLeft, size))
+            }
+            ants(path)
+        }
+        CanvasTool.PAINT_GRADIENT -> {
+            drawLine(Color.Black.copy(alpha = 0.7f), s, c, 3f, cap = StrokeCap.Round)
+            drawLine(Color.White.copy(alpha = 0.9f), s, c, 1.2f, cap = StrokeCap.Round)
+            drawCircle(editor.paintColor, 4f, s)
+            drawCircle(Color.Black.copy(alpha = 0.7f), 4f, s, style = Stroke(1f))
+            drawCircle(Color.Black.copy(alpha = 0.7f), 4f, c, style = Stroke(1f))
+        }
+        else -> Unit
+    }
+}
+
 /** [MeshTopology.uniqueEdges] of each index array the overlay draws, kept while that array is alive. */
 private val uniqueEdgeCache = java.util.WeakHashMap<IntArray, List<org.umamo.edit.MeshElement.Edge>>()
 
@@ -2863,6 +3053,7 @@ private val BezierHandleColor = Color(0xFFF2B84B)
  */
 internal fun DrawScope.drawPaintOverlays(editor: CanvasEditor, viewport: CanvasViewport, colors: ToolColors,
                                          textMeasurer: androidx.compose.ui.text.TextMeasurer) {
+    if (editor.hierarchyMode == EditHierarchyMode.PAINT) drawPaintSelectionOverlays(editor, viewport, colors)
     // 3c. Paint mode: live stroke & shape preview while dragging
     if (editor.hierarchyMode == EditHierarchyMode.PAINT && editor.isPainting) {
         val col = editor.paintColor.copy(alpha = editor.paintOpacity)

@@ -12,6 +12,12 @@ public object CapabilityScan {
 	                defaults: Map<Feature, Handling> = emptyMap()): List<LossEntry> {
 		fun handling(feature: Feature, fallback: Handling) = options.handling[feature] ?: defaults[feature] ?: fallback
 		val losses = ArrayList<LossEntry>()
+		val meshIds = ir.meshes.mapTo(HashSet()) { it.id }
+		for (area in ir.hitAreas) {
+			if (!profile.hitAreas) losses += LossEntry(area.id, Feature.STRUCTURE, Handling.DROPPED, note = "Hit areas are not supported by this target")
+			else for (mesh in area.meshes.filterNot(meshIds::contains))
+				losses += LossEntry(area.id, Feature.STRUCTURE, Handling.DROPPED, note = "Hit area ${area.name} names mesh $mesh, which the rig no longer has")
+		}
 		if (!profile.structure) {
 			losses += LossEntry("*", Feature.STRUCTURE, Handling.BAKED, note = "Rendered to pixels; deformers, parameters and meshes are not kept")
 			if (ir.physics.groups.isNotEmpty() && profile.physics == PhysicsSupport.NONE)
@@ -219,11 +225,16 @@ public interface FrameSession : AutoCloseable {
 		frames.map { (parameters, delta) -> render(parameters, delta, frame) }
 }
 
-/** Evaluated geometry of a rig at one pose: mesh vertices in canvas pixels (y down), opacity and draw order. */
+/**
+ * Evaluated geometry of a rig at one pose: mesh vertices in canvas pixels (y down), opacity and draw order, and
+ * the multiply and screen colours (RGB) of the meshes that have them.
+ */
 public class PoseGeometry(
 	public val positions: Map<String, FloatArray>,
 	public val opacity: Map<String, Float>,
 	public val drawOrder: Map<String, Float>,
+	public val multiplyColor: Map<String, FloatArray> = emptyMap(),
+	public val screenColor: Map<String, FloatArray> = emptyMap(),
 )
 
 /**

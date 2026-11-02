@@ -23,17 +23,15 @@ internal object WorkspaceDocumentEdits {
         "rig_edit_structure", "object_edit_appearance", "vertex_group_update", WorkspaceDrawOrderEdits.OP, WorkspaceRasterEdits.REBUILD_MESH, WorkspaceStructureMeshEdits.OP) + WorkspaceLayerTransform.supported +
         WorkspaceRasterCommands.supported + WorkspaceLayerEdits.supported + WorkspaceAssetLayerEdits.supported + WorkspacePartitionCommands.supported + WorkspaceGenerationUpdate.supported + WorkspaceWarpEdits.supported + WorkspaceWarpControlEdits.supported +
         setOf("auto", "put", "enable", "bone", "move", "bind", "remove", "delete").map { "skeleton_$it" } +
-        setOf("put", "delete", "seed_builtin", "set_key", "delete_key", "remove_curve", "pose", "move_keys", "delete_keys", "paste_keys", "replace_keys", "preset", "create", "duplicate", "rename", "properties").map { "motion_$it" } +
+        setOf("put", "delete", "seed_builtin", "set_key", "delete_key", "remove_curve", "pose", "move_keys", "delete_keys", "paste_keys", "replace_keys", "preset", "create", "duplicate", "rename", "properties", "close_loop", "set_event", "delete_event").map { "motion_$it" } +
         setOf("warp", "rotation", "glue", "topology").map { "canvas_$it" } +
         setOf("put", "delete", "deform").map { "path_$it" } +
         setOf("swing_put", "swing_delete", "interior_put", "interior_delete") + WorkspacePhysicsEdits.batchable + WorkspaceSimulationEdits.supported + WorkspaceCanvasWeightEdits.supported + WorkspaceCanvasDeformEdits.supported + WorkspaceTextureEdits.supported +
-        WorkspaceLayoutEdits.supported + WorkspaceMaterialEdits.supported
+        WorkspaceLayoutEdits.supported + WorkspaceMaterialEdits.supported + WorkspaceHitAreaEdits.supported + WorkspaceSidecarEdits.supported + WorkspaceObjectEdits.supported
 
     /**
-     * [operation] on [document]. Layout edits (tags, classification, placement, generation) read the whole document;
-     * an edit of the rig reads it as the generators do, without the layers placed since the last generation
-     * ([WorkspaceLayoutPreview.base]), and those layers come back unchanged. An edit naming a pending layer takes the
-     * pending layer's own edit ([WorkspaceGenerationEdits.pendingEdit]); a project not generated yet has no rig to edit.
+     * [operation] on the complete editing document. Layout generation state only gates automatic semantic rigging;
+     * every mesh, including one placed since the last generation, accepts the ordinary authoring commands.
      */
     fun apply(operation: WorkspaceDocumentOperation, document: WorkspaceDocument, model: RigPreviewModel,
               simulationWork: WorkspaceSimulationWork = WorkspaceSimulationWork.Direct,
@@ -41,33 +39,8 @@ internal object WorkspaceDocumentEdits {
               rasterWork: WorkspaceRasterWork = WorkspaceRasterWork.Direct,
               assetResources: WorkspaceAssetWorkflow? = null): WorkspaceDocument =
         // A layer an edit gave pixels of its own no longer shows its material.
-        WorkspaceReferenceMeshes.ensure(WorkspaceMaterialLinks.reconcile(document, routed(operation, document, model, simulationWork, physicsWork, rasterWork, assetResources)), model)
-
-    private fun routed(operation: WorkspaceDocumentOperation, document: WorkspaceDocument, model: RigPreviewModel,
-                       simulationWork: WorkspaceSimulationWork, physicsWork: WorkspacePhysicsWork, rasterWork: WorkspaceRasterWork,
-                       assetResources: WorkspaceAssetWorkflow?): WorkspaceDocument {
-        val id = operation.operation
-        // Layout edits read the whole document; texture edits route pending layers themselves.
-        if (id in WorkspaceLayoutEdits.supported || id in WorkspaceMaterialEdits.supported || id == "layer_classify" ||
-            id in WorkspaceTextureEdits.supported) return applyGenerated(operation, document, model,
-            simulationWork, physicsWork, rasterWork, assetResources)
-        val pending = WorkspaceLayoutPreview.pendingIds(document)
-        val targets = WorkspaceGenerationEdits.targets(operation)
-        if (targets.isNotEmpty() && targets.all { it in pending } && id in WorkspaceGenerationEdits.pendingLayerOperations)
-            return WorkspaceGenerationEdits.pendingEdit(operation, document, model)
-        if (!document.layout.generation.generated) {
-            if (id in WorkspaceGenerationEdits.ungeneratedOperations) return applyGenerated(operation, document, model,
-                simulationWork, physicsWork, rasterWork, assetResources)
-            throw WorkspaceNotGenerated()
-        }
-        targets.firstOrNull { it in pending }?.let { throw WorkspaceNotGenerated("Layer $it was placed since the last generation; generate the rig first (rig_generate)") }
-        if (pending.isNotEmpty() && WorkspaceLayoutPreview.MESH_PREFIX in operation.request.toString())
-            throw WorkspaceNotGenerated("A layer placed since the last generation has no rig to edit yet; generate the rig first (rig_generate)")
-        val edited = if (pending.isEmpty()) applyGenerated(operation, document, model, simulationWork, physicsWork, rasterWork, assetResources)
-            else WorkspaceLayoutPreview.restore(document, applyGenerated(operation, WorkspaceLayoutPreview.base(document), model.generated,
-                simulationWork, physicsWork, rasterWork, assetResources))
-        return edited
-    }
+        WorkspaceReferenceMeshes.ensure(WorkspaceMaterialLinks.reconcile(document,
+            applyGenerated(operation, document, model, simulationWork, physicsWork, rasterWork, assetResources)), model)
 
     /** [layerId] showing [raster] over its unchanged rectangle, as `layer_replace_image` does. */
     fun replaceImage(document: WorkspaceDocument, model: RigPreviewModel, layerId: String, raster: org.umamo.format.art.LayerRaster,
@@ -79,6 +52,8 @@ internal object WorkspaceDocumentEdits {
               assetResources: WorkspaceAssetWorkflow?): WorkspaceDocument {
         val request = operation.request
         WorkspaceArtPrimitives.requireCurrentReferences(document.rigEdits, request)
+        // Every document operation, not only journal edits: a copy over the bangs is made anew on each build.
+        refuseCopies(model, request)
         return when (operation.operation) {
             WorkspaceDrawOrderEdits.OP -> WorkspaceDrawOrderEdits.apply(document, model, request)
             WorkspaceLayerTransform.OP -> WorkspaceLayerTransform.apply(document, model, request)
@@ -97,18 +72,29 @@ internal object WorkspaceDocumentEdits {
             in WorkspaceLayerEdits.supported -> WorkspaceLayerEdits.apply(document, model, operation)
             in WorkspaceAssetLayerEdits.supported -> WorkspaceAssetLayerEdits.apply(document, model, operation, assetResources, rasterWork::checkpoint)
             in WorkspaceSimulationEdits.supported -> WorkspaceSimulationEdits.apply(operation, document, model, simulationWork).document
+            in WorkspaceHitAreaEdits.supported -> WorkspaceHitAreaEdits.apply(operation, document, model)
+            in WorkspaceSidecarEdits.supported -> WorkspaceSidecarEdits.apply(operation, document, model)
+            in WorkspaceObjectEdits.supported -> WorkspaceObjectEdits.apply(operation, document, model)
             "settings_update" -> settings(document, model, request.getValue("changes").jsonObject)
             "layer_mesh_update" -> mesh(document, model, request.text("layer_id"), request["changes"]?.jsonObject,
                 request["reset"]?.jsonPrimitive?.boolean ?: false)
             "layer_classify" -> {
-                require(listOf("type", "role", "side", "parameter", "switch_id").any { it in request }) { "Provide at least one classification field" }
-                val current = WorkspaceLayoutEdits.classification(document, model, request.text("layer_id"))
-                classify(document, model, request.text("layer_id"), LayerClassificationOverride(
+                require(listOf("type", "role", "side", "parameter", "switch_id", "part").any { it in request }) { "Provide at least one classification field" }
+                val id = request.text("layer_id")
+                val current = WorkspaceLayoutEdits.classification(document, model, id)
+                classify(document, model, id, LayerClassificationOverride(
                     request["type"]?.jsonPrimitive?.content?.uppercase()?.let(LayerType::valueOf) ?: current.type,
                     request["role"]?.jsonPrimitive?.content?.uppercase()?.let(SemanticTag::valueOf) ?: current.tag,
                     request["side"]?.jsonPrimitive?.content?.uppercase()?.let(Side::valueOf) ?: current.side,
                     request["parameter"]?.jsonPrimitive?.content ?: current.parameter,
-                    request["switch_id"]?.jsonPrimitive?.int ?: current.switchId))
+                    request["switch_id"]?.jsonPrimitive?.int ?: current.switchId,
+                    // part: a role word, none for no role, auto to let the analysis guess again.
+                    when (val part = request["part"]?.jsonPrimitive?.content) {
+                        null -> document.layerOverrides[id]?.role
+                        "auto" -> null
+                        "none" -> PartRole.PLAIN
+                        else -> requireNotNull(PartRole.ofWord(part)) { "Unknown part: $part" }
+                    }))
             }
             "parameter_create", "parameter_update", "parameter_delete" -> parameter(document, model,
                 operation.operation.removePrefix("parameter_"), request)
@@ -147,8 +133,13 @@ internal object WorkspaceDocumentEdits {
                 journal(document, model, JsonArray(listOf(command)))
             }
             else -> when {
-                operation.operation.startsWith("canvas_") -> journal(document, model, JsonArray(listOf(
-                    WorkspaceCanvasCommands.create(model.rig.puppet, operation.operation.removePrefix("canvas_"), request))))
+                operation.operation.startsWith("canvas_") -> {
+                    val command = WorkspaceCanvasCommands.create(model.rig.puppet, operation.operation.removePrefix("canvas_"), request)
+                    // A mesh already as Delaunay as it can be is no change, not a refusal.
+                    if (operation.operation == "canvas_topology" && request["action"]?.jsonPrimitive?.content == "retriangulate" &&
+                        !WorkspaceMeshTopology.changes(model.rig.puppet, command)) document
+                    else journal(document, model, JsonArray(listOf(command)))
+                }
                 operation.operation.startsWith("source_paint_") -> paint(document, model,
                     JsonObject(request + ("mode" to JsonPrimitive(operation.operation.removePrefix("source_paint_")))), rasterWork)
                 operation.operation.startsWith("skeleton_") -> skeleton(document, model,
@@ -174,8 +165,10 @@ internal object WorkspaceDocumentEdits {
         require(classification.switchId >= 0) { "switch_id must be nonnegative" }
         val layer = model.analysis.layers.firstOrNull { it.source.id.raw == id } ?: throw IllegalArgumentException("Layer not found: $id")
         require(id !in document.deletedLayerIds) { "Layer is deleted: $id" }
+        // A role the user names must be the layer's; one left to the analysis matches whatever it guessed.
         fun matches(current: LayerSemantic) = current.type == classification.type && current.tag == classification.tag &&
-            current.side == classification.side && current.parameter == classification.parameter && current.switchId == classification.switchId
+            current.side == classification.side && current.parameter == classification.parameter && current.switchId == classification.switchId &&
+            when (val role = classification.role) { null -> document.layerOverrides[id]?.role == null; PartRole.PLAIN -> current.role == null; else -> current.role == role }
         val generation = document.layout.generation
         if (!generation.generated || id in WorkspaceLayoutPreview.pendingIds(document)) {
             return if (matches(layer.semantic) && id !in generation.pendingClassifications) document
@@ -211,19 +204,19 @@ internal object WorkspaceDocumentEdits {
         val id = request.text("parameter_id").trim()
         val current = model.rig.puppet.parameters.firstOrNull { it.id.raw == id }
         if (mode == "delete") {
-            require(current != null) { "Parameter not found: $id" }
+            io.github.psd2live.core.RigRefusal.found(current != null, "parameter:$id") { "Parameter not found: $id" }
             // A generator's own parameter goes with the generator; once the user has taken it in, it is theirs to delete.
-            require(id !in GeneratedParameterAdoption.generated(model.rig.puppet, model.authored.rig.puppet)) {
-                "$id belongs to a swing or simulation; remove that instead"
-            }
+            if (id in GeneratedParameterAdoption.generated(model.rig.puppet, model.authored.rig.puppet))
+                throw io.github.psd2live.core.RigRefusal(io.github.psd2live.core.RigRefusal.Code.OWNED_BY_GENERATOR, "$id belongs to a swing or simulation; remove that instead", "parameter:$id")
             return appendParameterCommand(document, model, mode, id).withMotionClips { MotionClips.withoutParameter(it, id) }
+                .let { it.copy(rigEdits = ModelSidecars.withoutParameter(it.rigEdits, id)) }
         }
         if (mode == "create") {
             require(Regex("[A-Za-z][A-Za-z0-9_]{0,63}").matches(id)) { "New parameter ID must be 1-64 ASCII letters, digits, or underscores and start with a letter" }
-            require(current == null) { "Parameter already exists: $id" }
+            io.github.psd2live.core.RigRefusal.free(current == null, "parameter:$id") { "Parameter already exists: $id" }
         } else {
             require(mode == "update") { "Unknown parameter edit: $mode" }
-            require(current != null) { "Parameter not found: $id" }
+            io.github.psd2live.core.RigRefusal.found(current != null, "parameter:$id") { "Parameter not found: $id" }
             require(listOf("name", "min", "max", "default", "kind", "repeat").any { it in request }) { "parameter_update requires at least one editable field" }
         }
         val kind = request["kind"]?.jsonPrimitive?.content?.let { raw ->
@@ -237,10 +230,14 @@ internal object WorkspaceDocumentEdits {
             created = mode == "create" || document.rigEdits.parameterEdits.any { it.id == id && it.created })
         if (mode == "update" && current != null && current.name == edit.name && current.min == edit.min &&
             current.max == edit.max && current.default == edit.default && current.kind == edit.kind && current.repeat == edit.repeat) return document
-        return appendParameterCommand(document, model, mode, id, edit).withMotionClips { MotionClips.withParameterRange(it, id, edit.min, edit.max) }
+        return appendParameterCommand(document, model, mode, id, edit).withMotionClips { MotionClips.withParameterRange(it, id, edit.min, edit.max, edit.repeat) }
+            .let { it.copy(rigEdits = ModelSidecars.withParameterRange(it.rigEdits, id, edit.min, edit.max)) }
     }
 
-    /** Motions keep playing within the axes they drive: a narrowed or deleted axis takes their keys with it. */
+    /**
+     * Motions keep playing within the axes they drive: a narrowed or deleted axis takes their keys with it, and the
+     * expression entries on it likewise ([ModelSidecars]).
+     */
     private fun WorkspaceDocument.withMotionClips(change: (List<MotionClip>) -> List<MotionClip>): WorkspaceDocument {
         val clips = change(rigEdits.motionClips)
         return if (clips == rigEdits.motionClips) this else copy(rigEdits = rigEdits.copy(motionClips = clips))
@@ -267,11 +264,79 @@ internal object WorkspaceDocumentEdits {
     }
 
     fun journal(document: WorkspaceDocument, model: RigPreviewModel, edits: JsonArray): WorkspaceDocument {
+        refuseCopies(model, edits)
         // Recorded on the shown rig, they replay on the authored one, before the generators.
         val journal = JournalRecording.record(model.rig.puppet, model.authored.rig.puppet, document.rigEdits, edits, model.primitiveSkins)
         // A deleted Warp leaves the swings that moved it in the same step.
-        return document.copy(rigEdits = SwingAuthoring.withoutTargets(document.rigEdits.copy(
+        val next = document.copy(rigEdits = SwingAuthoring.withoutTargets(document.rigEdits.copy(
             authoringJournal = document.rigEdits.authoringJournal + journal), SwingAuthoring.deletedDeformers(journal)))
+        return rebakeInteriors(next, model, journal)
+    }
+
+    /**
+     * Edits that change a mesh carrying an interior effect - its topology or its rest shape, by any command that names
+     * the mesh - bake the effect again on the edited mesh in the same step, as the structure rebuild does, so the point
+     * tools work on interior meshes as on any other. Only effects that matched their mesh before the edit and no longer
+     * match it after are baked; one already out of date stays as it was. A bake the new mesh cannot take (its area
+     * checks, or another refusal the bake raises) does not refuse the edit: the effect keeps its recipe and reports the
+     * mesh mismatch until it is baked again. Cancellation and programming errors are never swallowed.
+     */
+    private fun rebakeInteriors(document: WorkspaceDocument, model: RigPreviewModel, journal: List<JsonObject>): WorkspaceDocument {
+        val effects = document.rigEdits.interiorEffects
+        if (effects.isEmpty() || journal.isEmpty()) return document
+        // A cheap filter first: only an effect whose mesh the batch names can have changed, so drags, weights and
+        // deformer edits elsewhere never pay for the authored replay below.
+        val named = journal.map { it.toString() }
+        val candidates = effects.filter { effect -> named.any { "\"${effect.target}\"" in it || "\"mesh:${effect.target}\"" in it } }
+        if (candidates.isEmpty()) return document
+        val before = model.authored.rig.puppet
+        fun stamp(puppet: org.umamo.runtime.model.PuppetModel, target: String) =
+            puppet.drawables.firstOrNull { it.id.raw == target }?.mesh?.let(io.github.psd2live.core.interior.InteriorMeshStamp::of)
+        val current = candidates.filter { stamp(before, it.target) == it.meshStamp }
+        if (current.isEmpty()) return document
+        val authored = model.authoredPuppet(document.rigEdits)
+        var overlay = document.rigEdits
+        for (effect in current) {
+            val stamped = stamp(authored, effect.target) ?: continue
+            if (stamped == effect.meshStamp) continue
+            overlay = try {
+                io.github.psd2live.core.interior.NativeInteriorAuthoring.put(model, overlay, buildJsonObject { put("target", effect.target) }, authored)
+            } catch (cancelled: java.util.concurrent.CancellationException) {
+                throw cancelled
+            } catch (refused: IllegalArgumentException) {
+                // The bake's own refusals (require / check / error): its area limits, a texture it cannot read.
+                overlay
+            } catch (refused: IllegalStateException) {
+                overlay
+            }
+        }
+        return document.copy(rigEdits = overlay)
+    }
+
+    /** The request fields that name a mesh to act on: the split's reference fields, an edited object's id, its masks and parent. */
+    private val copyReferenceFields = WorkspaceArtPrimitives.referenceFields + setOf("id", "ids", "masked_by", "mask_ids", "source", "sources", "target", "targets")
+
+    /**
+     * Refuses [edits] whose reference fields ([copyReferenceFields]) name a copy over the bangs the shown rig holds - as
+     * an id, or as `<kind>:<id>` - with [WorkspaceGeneratedCopyEdit]: the authored rig has no such mesh, and the finished
+     * one would make it anew. Names, search text and other free strings are not references.
+     */
+    fun refuseCopies(model: RigPreviewModel, edits: JsonElement) {
+        val copies = model.rig.seeThroughCopies
+        if (copies.isEmpty()) return
+        fun visit(element: JsonElement, reference: Boolean) {
+            when (element) {
+                is JsonObject -> element.forEach { (key, child) -> visit(child, key in copyReferenceFields) }
+                is JsonArray -> element.forEach { visit(it, reference) }
+                is JsonPrimitive -> if (reference && element.isString) {
+                    val text = element.content
+                    val id = if (text in copies) text else text.substringAfter(':', "").takeIf { it in copies }
+                    if (id != null) throw WorkspaceGeneratedCopyEdit(id, copies.getValue(id))
+                }
+                else -> Unit
+            }
+        }
+        visit(edits, false)
     }
 
     fun paint(document: WorkspaceDocument, model: RigPreviewModel, request: JsonObject,
@@ -285,15 +350,21 @@ internal object WorkspaceDocumentEdits {
             requireNotNull(document.rigEdits.skeleton) { "No skeleton to delete" }
             return document.copy(rigEdits = document.rigEdits.copy(skeleton = null))
         }
-        val spec = WorkspaceSkeletonMotionEdits.skeleton(document.rigEdits.skeleton, request) { SkeletonAutoBuilder.build(model.analysis, model.rig) }
+        // The automatic armature binds only what the bake can: meshes under the IDs the generated rig gives them.
+        val spec = WorkspaceSkeletonMotionEdits.skeleton(document.rigEdits.skeleton, request) {
+            SkeletonAutoBuilder.build(model.copy(config = model.config.copy(rigEdits = document.rigEdits)))
+        }
         SkeletonDraftEdits.validated(spec, model.rig.puppet.drawables.mapTo(HashSet()) { it.id.raw })
+        WorkspaceObjectEdits.refuseUnbakedBindings(spec, document.rigEdits.skeleton, document.rigEdits, model.rig)
         return document.copy(rigEdits = document.rigEdits.copy(skeleton = spec))
     }
 
     fun motion(document: WorkspaceDocument, model: RigPreviewModel, request: JsonObject): WorkspaceDocument {
-        val ranges = model.rig.puppet.parameters.associate { it.id.raw to (it.min..it.max) }
+        val parameters = model.rig.puppet.parameters
+        val ranges = parameters.associate { it.id.raw to (it.min..it.max) }
         return document.copy(rigEdits = document.rigEdits.copy(motionClips = WorkspaceSkeletonMotionEdits.motion(
-            document.rigEdits.motionClips, request, ranges, document.rigEdits.skeleton, document.rigEdits.motionPresets)))
+            document.rigEdits.motionClips, request, ranges, document.rigEdits.skeleton, document.rigEdits.motionPresets,
+            MotionLoops.keyLimits(parameters), parameters, document.rigEdits.idRenames.parameters)))
     }
 
     fun swing(document: WorkspaceDocument, puppet: org.umamo.runtime.model.PuppetModel, edit: RigSwingEdit, estimatePhysics: Boolean): WorkspaceDocument {

@@ -17,8 +17,13 @@ import io.github.psd2live.project.transform
 import io.github.psd2live.i18n.tr
 import io.github.psd2live.ui.tutorial.expandShortcutMarkup
 import io.github.psd2live.ui.state.*
+import io.github.psd2live.ui.utils.toImageBitmapFast
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import org.umamo.edit.MeshElement
+import org.umamo.edit.MeshManualOps
+import org.umamo.edit.MeshShapes
 import org.umamo.edit.MeshTopology
 import org.umamo.edit.MeshRefinementOps
 import org.umamo.format.art.SourceLayer
@@ -113,8 +118,11 @@ internal enum class CanvasTool(val action: ShortcutAction) {
     GLUE(ShortcutAction.TOOL_GLUE),
     /** Region subdivide: a radius brush over the mesh's edges. */
     SUBDIVIDE(ShortcutAction.TOOL_SUBDIVIDE),
-    /** The knife: click anchors along a cut, connect them, commit with Enter. */
-    KNIFE(ShortcutAction.TOOL_KNIFE),
+    /**
+     * The point tool, with a [meshPointMode]: points (click or stroke to add vertices, drag them, Shift-click to
+     * connect, Alt-click to delete) or a line (click anchors along it, every two joined by an edge, commit with Enter).
+     */
+    MESH_POINT(ShortcutAction.TOOL_MESH_POINT),
     /** Paints a simulation vertex group (pin, stiffness, goal...) on the edited meshes. */
     WEIGHT_PAINT(ShortcutAction.TOOL_WEIGHT_PAINT),
     /** Drags a linear gradient into the same vertex group the weight brush paints. */
@@ -127,6 +135,21 @@ internal enum class CanvasTool(val action: ShortcutAction) {
     PAINT_EYEDROPPER(ShortcutAction.TOOL_PAINT_EYEDROPPER),
     /** Line, rectangle and ellipse: one tool with a [paintShape], not three tools. */
     PAINT_SHAPE(ShortcutAction.TOOL_PAINT_LINE),
+    /**
+     * Object-mode handles of the selected mesh's interior effect: its surface, propagation and guides ([InteriorCanvasTool]).
+     * Object mode draws no mesh points, so the handles do not sit among vertices.
+     */
+    INTERIOR(ShortcutAction.TOOL_INTERIOR),
+    /** The fitted features' handles - eye corners and lid middles, brow ends and arch, mouth corners and lip middles ([FeatureCanvasTool]). */
+    FEATURE(ShortcutAction.TOOL_FEATURE),
+    /** Marquee, lasso, polygon lasso and magic wand: one tool with a [paintSelectShape]. */
+    PAINT_SELECT(ShortcutAction.TOOL_PAINT_SELECT),
+    /** Drags a linear or radial gradient over the selection, or the whole layer. */
+    PAINT_GRADIENT(ShortcutAction.TOOL_PAINT_GRADIENT),
+    /** A tip that blurs what it passes over instead of painting. */
+    PAINT_BLUR(ShortcutAction.TOOL_PAINT_BLUR),
+    /** Free Transform of the selection's pixels, or the layer's, in a box of handles ([PaintTransformBox]). */
+    PAINT_TRANSFORM(ShortcutAction.TOOL_PAINT_TRANSFORM),
 }
 
 internal enum class SelectionStyle { BOX, LASSO }
@@ -277,12 +300,19 @@ internal val PAINT_TOOLS = setOf(
     CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER,
     CanvasTool.PAINT_BUCKET, CanvasTool.PAINT_EYEDROPPER,
     CanvasTool.PAINT_SHAPE,
+    CanvasTool.PAINT_SELECT, CanvasTool.PAINT_GRADIENT, CanvasTool.PAINT_BLUR, CanvasTool.PAINT_TRANSFORM,
 )
 
 /** The paint tools that stamp a tip: they are the ones with a size, a hardness and an opacity. */
 internal val PAINT_BRUSH_TOOLS = setOf(
-    CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER,
+    CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER, CanvasTool.PAINT_BLUR,
 )
+
+/** The topology actions the editor builds before sending, so a refusal reads as the op's own notice. */
+private val MANUAL_TOPOLOGY = setOf("add_points", "delete_edges", "retriangulate", "connect", "delete")
+
+/** Above this many triangles the editor leaves the hand-placement pre-check to the reducer, off the UI thread. */
+private const val PREJUDGE_TRIANGLES = 3000
 
 /**
  * Tools that edit points rather than whole objects.
@@ -300,11 +330,12 @@ internal val TOOLBAR_TOOL_ORDER = listOf(
     CanvasTool.SELECT, CanvasTool.TRANSFORM, CanvasTool.LASSO_SELECT, CanvasTool.BRUSH_SELECT,
     CanvasTool.BRUSH, CanvasTool.SMOOTH, CanvasTool.INFLATE,
     CanvasTool.SKELETON_POSE, CanvasTool.SKELETON_EDIT,
-    CanvasTool.SUBDIVIDE, CanvasTool.KNIFE, CanvasTool.GLUE,
+    CanvasTool.MESH_POINT, CanvasTool.SUBDIVIDE, CanvasTool.GLUE,
+    CanvasTool.INTERIOR, CanvasTool.FEATURE,
     CanvasTool.WEIGHT_PAINT, CanvasTool.WEIGHT_GRADIENT,
-    CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER,
-    CanvasTool.PAINT_BUCKET, CanvasTool.PAINT_EYEDROPPER,
-    CanvasTool.PAINT_SHAPE,
+    CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER, CanvasTool.PAINT_BLUR,
+    CanvasTool.PAINT_BUCKET, CanvasTool.PAINT_GRADIENT, CanvasTool.PAINT_EYEDROPPER,
+    CanvasTool.PAINT_SHAPE, CanvasTool.PAINT_SELECT, CanvasTool.PAINT_TRANSFORM,
     CanvasTool.CREATE_WARP, CanvasTool.CREATE_ROTATION, CanvasTool.CREATE_DEFORM_PATH,
 )
 
@@ -317,12 +348,13 @@ internal fun toolbarRows(mode: EditHierarchyMode): List<List<CanvasTool>> =
  * of it: they arm a placement rather than a mode's tool, and follow it in object mode ([toolbarRows]).
  *
  * Object mode is the one without the vertex tools. Deform mode edits points without changing topology.
- * Edit mode handles mesh topology (subdivide / knife). Simulate paints the simulation's vertex groups,
+ * Edit mode handles mesh topology (points and lines / subdivide). Simulate paints the simulation's vertex groups,
  * Skeleton poses or reshapes the armature, and Paint replaces layer pixels.
  */
 internal fun toolbarGroups(mode: EditHierarchyMode): List<List<CanvasTool>> = when (mode) {
     EditHierarchyMode.SELECT -> listOf(
         listOf(CanvasTool.SELECT, CanvasTool.TRANSFORM, CanvasTool.LASSO_SELECT),
+        listOf(CanvasTool.INTERIOR, CanvasTool.FEATURE),
     )
     EditHierarchyMode.DEFORM -> listOf(
         listOf(CanvasTool.SELECT, CanvasTool.TRANSFORM, CanvasTool.LASSO_SELECT, CanvasTool.BRUSH_SELECT),
@@ -331,7 +363,7 @@ internal fun toolbarGroups(mode: EditHierarchyMode): List<List<CanvasTool>> = wh
     EditHierarchyMode.EDIT -> listOf(
         listOf(CanvasTool.SELECT, CanvasTool.TRANSFORM, CanvasTool.LASSO_SELECT, CanvasTool.BRUSH_SELECT),
         listOf(CanvasTool.BRUSH, CanvasTool.SMOOTH, CanvasTool.INFLATE),
-        listOf(CanvasTool.SUBDIVIDE, CanvasTool.KNIFE, CanvasTool.GLUE),
+        listOf(CanvasTool.MESH_POINT, CanvasTool.SUBDIVIDE, CanvasTool.GLUE),
     )
     EditHierarchyMode.SIMULATE -> listOf(
         listOf(CanvasTool.WEIGHT_PAINT, CanvasTool.WEIGHT_GRADIENT),
@@ -340,9 +372,9 @@ internal fun toolbarGroups(mode: EditHierarchyMode): List<List<CanvasTool>> = wh
         listOf(CanvasTool.SKELETON_POSE, CanvasTool.SKELETON_EDIT),
     )
     EditHierarchyMode.PAINT -> listOf(
-        listOf(CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER),
-        listOf(CanvasTool.PAINT_BUCKET, CanvasTool.PAINT_EYEDROPPER),
-        listOf(CanvasTool.PAINT_SHAPE),
+        listOf(CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_PENCIL, CanvasTool.PAINT_ERASER, CanvasTool.PAINT_BLUR),
+        listOf(CanvasTool.PAINT_BUCKET, CanvasTool.PAINT_GRADIENT, CanvasTool.PAINT_EYEDROPPER),
+        listOf(CanvasTool.PAINT_SHAPE, CanvasTool.PAINT_SELECT, CanvasTool.PAINT_TRANSFORM),
     )
 }
 
@@ -549,7 +581,7 @@ internal class CanvasEditor(
 		if (committedSkeleton != null) { onReady(); return }
 		val started = viewModel.uiState.value
 		val expected = viewModel.currentWorkspaceState() ?: return
-		val spec = state.previewModel?.let { io.github.psd2live.core.SkeletonAutoBuilder.build(it.analysis, it.rig) } ?: return
+		val spec = state.previewModel?.let { io.github.psd2live.core.SkeletonAutoBuilder.build(it) } ?: return
 		if (spec.bones.isEmpty()) { error = tr("skeleton.create.empty"); return }
 		skeletonCreating = true
 		viewModel.setSkeleton(spec.copy(enabled = true), expected) { failure ->
@@ -995,6 +1027,7 @@ internal class CanvasEditor(
         get() = viewModel.uiState.value.forCanvas(canvasId, workspaceId, CanvasMode.EDIT)
     internal fun selectLayer(id: String?) {
 		if (id != null && viewModel.tryApplyClipMaskPick(id)) return
+        endTemporaryWarp()
         viewModel.updateCanvasPresentation(workspaceId, canvasId, CanvasMode.EDIT) {
             it.copy(
                 selectedReferenceId = null,
@@ -1005,9 +1038,12 @@ internal class CanvasEditor(
         }
         viewModel.noteSelectionAnchor(id)
     }
-    private fun selectDeformer(id: String?) = viewModel.updateCanvasPresentation(workspaceId, canvasId, CanvasMode.EDIT) {
-        it.copy(selectedDeformerId = id, selectedLayerId = if (id != null) null else it.selectedLayerId,
-            selectedLayerIds = if (id != null) emptySet() else it.selectedLayerIds)
+    private fun selectDeformer(id: String?) {
+        endTemporaryWarp()
+        viewModel.updateCanvasPresentation(workspaceId, canvasId, CanvasMode.EDIT) {
+            it.copy(selectedDeformerId = id, selectedLayerId = if (id != null) null else it.selectedLayerId,
+                selectedLayerIds = if (id != null) emptySet() else it.selectedLayerIds)
+        }
     }
     // Hover is an input-frame detail. Keeping it on this editor prevents a mouse move in one
     // canvas from emitting a document-wide state update and recomposing all dock panels.
@@ -1032,9 +1068,21 @@ internal class CanvasEditor(
         set(value) {
             if (value == hierarchyModeState) return
             hierarchyModeState = value
+            if (value != EditHierarchyMode.SELECT) lastWorkMode = value
             viewModel.switchHierarchyModeView(value, canvasId, workspaceId)
         }
     var editLevel by mutableStateOf(2) // Level 1 (grid), Level 2 (bezier), Level 3 (macro)
+
+    /** The mode Tab returns to from object mode: the last mode other than Select the canvas was in or asked for. */
+    private var lastWorkMode = EditHierarchyMode.DEFORM
+
+    /**
+     * Where Tab goes: object mode from any other mode, and back to [lastWorkMode] from object mode.
+     * A request still waiting for its pick counts as being in the mode it asked for.
+     */
+    internal val objectModeToggleTarget: EditHierarchyMode
+        get() = if (hierarchyMode == EditHierarchyMode.SELECT && (deferredMode?.mode ?: EditHierarchyMode.SELECT) == EditHierarchyMode.SELECT)
+            lastWorkMode else EditHierarchyMode.SELECT
 
     /**
      * The mode the user asked for that has no part to work on yet, waiting for the pick that gives it
@@ -1063,11 +1111,12 @@ internal class CanvasEditor(
         error?.let { return CanvasStatusMessage(it, CanvasStatusTone.ERROR) }
         waiting?.let { return CanvasStatusMessage(it, CanvasStatusTone.WARNING) }
         if (busy) return CanvasStatusMessage(tr("editor.saving"), CanvasStatusTone.NORMAL)
-        // Status bar is always composed; model may still be absent before any PSD is loaded.
-        val source = preview ?: state.previewModel?.rig?.puppet
+        // Status bar is always composed; model may still be absent before any PSD is loaded. The document's puppet, not
+        // the drag's preview: the hint depends only on what is selected, and reading the preview recomposes every frame.
+        val source = state.previewModel?.rig?.puppet
         val target = source?.let { target(it, selectedLayerId, selectedDeformerId) }
         val hintKey = when {
-            tool == CanvasTool.KNIFE -> "editor.knifeGestureHint"
+            tool == CanvasTool.MESH_POINT -> meshPointMode.hintKey
             tool == CanvasTool.SUBDIVIDE -> "editor.subdivideHint"
             tool == CanvasTool.SELECT && target?.kind == "rotation" -> "editor.rotationGestureHint"
             tool == CanvasTool.CREATE_DEFORM_PATH -> "editor.pathHint"
@@ -1088,6 +1137,8 @@ internal class CanvasEditor(
         }
         val glueCount = if (tool == CanvasTool.GLUE) glueMeshCount() else -1
         val hint = when {
+            tool == CanvasTool.INTERIOR -> interiorTool.hint()
+            tool == CanvasTool.FEATURE -> featureTool.hint()
             tool == CanvasTool.GLUE && glueCount == 2 -> tr("editor.glueReadyHint")
             tool == CanvasTool.GLUE -> tr("editor.glueNeedTwo", glueCount)
             else -> tr(hintKey)
@@ -1105,6 +1156,9 @@ internal class CanvasEditor(
     var paintEraserSize by mutableStateOf(24f)
     /** The line width of the shape tool; its own, so drawing a thin outline leaves the brush tip as it was. */
     var paintShapeSize by mutableStateOf(16f)
+    var paintBlurSize by mutableStateOf(32f)
+    /** The quick selection brush's size; its own, since it is sized to the region being picked rather than to a mark. */
+    var paintQuickSelectSize by mutableStateOf(24f)
 
     /** The open document's longest side in pixels; 0 with nothing open. */
     val documentLongSide: Int
@@ -1142,6 +1196,8 @@ internal class CanvasEditor(
         paintPencilSize = (paintPencilSize * k).coerceIn(1f, limit)
         paintEraserSize = (paintEraserSize * k).coerceIn(1f, limit)
         paintShapeSize = (paintShapeSize * k).coerceIn(1f, limit)
+        paintBlurSize = (paintBlurSize * k).coerceIn(1f, limit)
+        paintQuickSelectSize = (paintQuickSelectSize * k).coerceIn(1f, limit)
         radius = (radius * k).coerceIn(1f, limit)
         skeletonWeightRadius = (skeletonWeightRadius * k).coerceIn(1f, limit)
         brushScaleApplied = scale
@@ -1156,6 +1212,8 @@ internal class CanvasEditor(
             CanvasTool.PAINT_PENCIL -> paintPencilSize
             CanvasTool.PAINT_ERASER -> paintEraserSize
             CanvasTool.PAINT_SHAPE -> paintShapeSize
+            CanvasTool.PAINT_BLUR -> paintBlurSize
+            CanvasTool.PAINT_SELECT -> paintQuickSelectSize
             else -> paintBrushSize
         }
         set(value) {
@@ -1163,6 +1221,8 @@ internal class CanvasEditor(
                 CanvasTool.PAINT_PENCIL -> paintPencilSize = value
                 CanvasTool.PAINT_ERASER -> paintEraserSize = value
                 CanvasTool.PAINT_SHAPE -> paintShapeSize = value
+                CanvasTool.PAINT_BLUR -> paintBlurSize = value
+                CanvasTool.PAINT_SELECT -> paintQuickSelectSize = value
                 else -> paintBrushSize = value
             }
         }
@@ -1202,6 +1262,8 @@ internal class CanvasEditor(
         paintPencilSize = (paintPencilSize * k).coerceIn(1f, limit)
         paintEraserSize = (paintEraserSize * k).coerceIn(1f, limit)
         paintShapeSize = (paintShapeSize * k).coerceIn(1f, limit)
+        paintBlurSize = (paintBlurSize * k).coerceIn(1f, limit)
+        paintQuickSelectSize = (paintQuickSelectSize * k).coerceIn(1f, limit)
         paintSizeDensity = density
     }
 
@@ -1209,10 +1271,15 @@ internal class CanvasEditor(
     val paintBrushActive: Boolean
         get() = hierarchyMode == EditHierarchyMode.PAINT && tool in PAINT_BRUSH_TOOLS
 
+    /** Whether the selection tool is the quick selection brush, whose ring the canvas shows under the pointer. */
+    val paintQuickSelectActive: Boolean
+        get() = hierarchyMode == EditHierarchyMode.PAINT && tool == CanvasTool.PAINT_SELECT && paintSelectShape == PaintSelectShape.QUICK
+
     /** Whether the active tool has a size at all: the shapes are drawn with one, the fills are not. */
     val paintSizeActive: Boolean
         get() = hierarchyMode == EditHierarchyMode.PAINT && tool in PAINT_TOOLS &&
-            tool != CanvasTool.PAINT_BUCKET && tool != CanvasTool.PAINT_EYEDROPPER
+            tool != CanvasTool.PAINT_BUCKET && tool != CanvasTool.PAINT_EYEDROPPER &&
+            tool != CanvasTool.PAINT_SELECT && tool != CanvasTool.PAINT_GRADIENT
 
     /**
      * The tip the active paint tool draws with: the tool's own size, the shared hardness - and, for the
@@ -1230,6 +1297,97 @@ internal class CanvasEditor(
     var paintOpacity by mutableStateOf(1f)
     var paintTolerance by mutableStateOf(32)
     var paintShapeFilled by mutableStateOf(false)
+
+    // Painting assists and the tools after the shape (selection, gradient, blur).
+    /** The stroke stabilizer's level, 0 off ([io.github.psd2live.core.PaintStabilizer]). */
+    var paintStabilizer by mutableStateOf(0)
+    /** Lock transparency: the tools colour only what is already painted, and the eraser paints the background colour. */
+    var paintLockAlpha by mutableStateOf(false)
+    /** The axes the brush tools mirror their strokes across, through the middle of the canvas. */
+    var paintSymmetry by mutableStateOf(io.github.psd2live.core.PaintSymmetry.OFF)
+    /** Off makes the bucket and the wand take every pixel of the colour, joined to the click or not. */
+    var paintContiguous by mutableStateOf(true)
+    /** The selection tool's face; changing it drops a polygon or lasso half drawn with the previous one. */
+    var paintSelectShape: PaintSelectShape
+        get() = paintSelectShapeState
+        set(value) { if (value != paintSelectShapeState) paintSelectDraft = emptyList(); paintSelectShapeState = value }
+    private var paintSelectShapeState by mutableStateOf(PaintSelectShape.RECTANGLE)
+    var paintSelectOp by mutableStateOf(io.github.psd2live.core.PaintSelectionOp.REPLACE)
+    /** The radius the Feather action softens the selection's edge over, in the layer's pixels. */
+    var paintFeather by mutableStateOf(4f)
+    /** How far Expand and Contract move the selection's edge, in the layer's pixels. */
+    var paintSelectGrow by mutableStateOf(4f)
+    var paintGradientRadial by mutableStateOf(false)
+    var paintGradientEnd by mutableStateOf(PaintGradientEnd.BACKGROUND)
+    /** How far the blur tip moves a pixel towards the blur under it, 0..1. */
+    var paintBlurStrength by mutableStateOf(0.5f)
+    /** The lasso or polygon outline being drawn, in canvas units; empty when none is. */
+    var paintSelectDraft by mutableStateOf<List<Offset>>(emptyList())
+        private set
+    /** Where the last brush stroke ended, in canvas units: a Shift + click draws a straight line on from there. */
+    private var paintLastEnd: Offset? = null
+    private var paintStabilizerInHand: io.github.psd2live.core.PaintStabilizer? = null
+
+    /**
+     * Whether a fill, gradient, clear or selection change is being worked out off the UI thread: they can cover the
+     * whole layer, so they run on [Dispatchers.Default] one after another, and the paint tools, undo and apply wait.
+     */
+    val paintWorking: Boolean get() = paintPending > 0
+    private var paintPending by mutableStateOf(0)
+    private val paintWork = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default)
+    /** The session's background edits; cancelled with the session, a fresh one for the next. */
+    private var paintSessionWork = kotlinx.coroutines.SupervisorJob(paintWork.coroutineContext[kotlinx.coroutines.Job])
+    private var paintJob: kotlinx.coroutines.Job? = null
+
+    /** Waits for the background session edits queued, if any, to land. */
+    internal suspend fun awaitPaintWork() { paintJob?.join() }
+
+    /**
+     * Queues [block] - one session edit - behind the ones already running in the background; a failure lands in
+     * [error] as any canvas failure does. Nothing queued runs once the session has ended.
+     */
+    private fun paintInBackground(block: () -> Unit) {
+        val work = paintSessionWork
+        val previous = paintJob
+        paintPending++
+        paintJob = kotlinx.coroutines.CoroutineScope(work + kotlinx.coroutines.Dispatchers.Default).launch {
+            val failure = try {
+                previous?.join()
+                ensureActive()
+                block(); null
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                null
+            } catch (failure: Exception) {
+                failure
+            }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable + kotlinx.coroutines.Dispatchers.Main) {
+                // A session ended meanwhile has already let go of its count and its errors.
+                if (work === paintSessionWork) {
+                    paintPending--
+                    failure?.let { error = it.message?.takeIf(String::isNotBlank) ?: "Failed requirement." }
+                }
+            }
+        }
+    }
+
+    /**
+     * Ends the paint session through [end] once its background edits are done: right away when none runs, else
+     * after the one running has landed - off the UI thread, which would otherwise wait on the session's lock - with
+     * the ones still queued dropped. The editor lets go of the session at once either way.
+     */
+    private fun retirePaintSession(end: (PaintSession) -> Unit) {
+        val session = paintSession ?: return
+        val work = paintSessionWork
+        paintSessionWork = kotlinx.coroutines.SupervisorJob(paintWork.coroutineContext[kotlinx.coroutines.Job])
+        paintJob = null
+        paintPending = 0
+        work.cancel()
+        if (work.children.all { it.isCompleted }) { end(session); return }
+        paintWork.launch {
+            work.join()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { end(session) }
+        }
+    }
 
     /** Which of the shape tool's three faces is in hand. Its keys arm both the shape and the tool. */
     var paintShape by mutableStateOf(PaintShape.LINE)
@@ -1357,10 +1515,16 @@ internal class CanvasEditor(
     var selection by mutableStateOf<Map<String, Set<Int>>>(emptyMap())
 
     /** The primary target's slice of [selection] - all the single-target tools ever need. */
+    /**
+     * The id of the target the selection is kept under: from the document's puppet ([selectionTarget]), so reading
+     * [vertices] (the status bar does) does not read a drag's preview; the preview only for what exists in it alone.
+     */
+    private fun selectionTargetId(): String? = (selectionTarget() ?: target())?.id
+
     var vertices: Set<Int>
-        get() = target()?.id?.let { selection[it] }.orEmpty()
+        get() = selectionTargetId()?.let { selection[it] }.orEmpty()
         set(value) {
-            val id = target()?.id
+            val id = selectionTargetId()
             val rest = if (hierarchyMode == EditHierarchyMode.EDIT) selection else emptyMap()
             selection = when {
                 id == null -> emptyMap()
@@ -1369,6 +1533,14 @@ internal class CanvasEditor(
             }
         }
     var radius by mutableStateOf(48f)
+
+    /**
+     * Deform's soft selection: a drag or transform of picked points also carries the points around them, each by the
+     * [brushFalloff] share of the move its own place would make, out to [softRadius] canvas units from the nearest
+     * picked point. It shapes the points of one edit; the committed command is the ordinary geometry it computes.
+     */
+    var softSelection by mutableStateOf(false)
+    var softRadius by mutableStateOf(64f)
     var strength by mutableStateOf(0.5f)
     var hardness by mutableStateOf(0.35f)
     var brushShape by mutableStateOf(BrushShape.CIRCLE)
@@ -1403,7 +1575,15 @@ internal class CanvasEditor(
     var draft by mutableStateOf(emptyList<Pair<Float, Float>>())
     var cursor by mutableStateOf<Offset?>(null)
     var marquee by mutableStateOf(emptyList<Offset>())
-    var preview by mutableStateOf<PuppetModel?>(null)
+    private var previewModelState by mutableStateOf<PuppetModel?>(null)
+
+    /**
+     * What the canvas shows while an edit is pending. Every tool's preview passes through here: the copies over the
+     * bangs are made anew from their originals as the preview has them ([SeeThroughLayers.refresh]), as the commit will.
+     */
+    var preview: PuppetModel?
+        get() = previewModelState
+        set(value) { previewModelState = value?.let { io.github.psd2live.core.SeeThroughLayers.refresh(it, state.previewModel) } }
     var busy by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
     var space by mutableStateOf(false)
@@ -1416,6 +1596,37 @@ internal class CanvasEditor(
     internal fun selectDeformationParameters(ids: Collection<ParameterId>) {
         deformationParameters = ids.map { it.raw }.distinct()
     }
+
+    /** The parameters the panel last set, the first of them [parameter]. */
+    internal fun deformationParameterIds(): List<String> = deformationParameters
+
+    /**
+     * Draws a screen point to the canvas's grid and guides, or null while snapping is off. The viewport sets it;
+     * a drag applies it to the grabbed point, not the pointer, so the point itself lands on the line.
+     */
+    internal var snapScreenPoint: ((Offset) -> Offset)? = null
+    /** Where the point a drag grabbed sat on screen at the press, found on the drag's first move. */
+    private var snapAnchor: Offset? = null
+
+    /** The drag's pointer moved so that the grabbed point, not the pointer, meets the line it is drawn to. */
+    private fun snappedDrag(pos: Offset, t: CanvasTarget, viewport: CanvasViewport): Offset {
+        val snap = snapScreenPoint ?: return pos
+        // Only a move snaps: a rotate or scale handle turned by a point's offset would jump in angle or size.
+        if (boxDrag && activeHandle != BoundingHandle.NONE && activeHandle != BoundingHandle.BODY) return pos
+        val anchor = snapAnchor ?: run {
+            val candidates = if (boxDrag) initialScreenPoints.flatMapIndexed { item, points ->
+                val indices = dragIndices.getOrElse(item) { points.indices.toSet() }
+                points.filterIndexed { i, _ -> i in indices }
+            } else screen(t.geometry.points, t, viewport).filterIndexed { i, _ -> i in vertices }
+            (candidates.minByOrNull { (it - start).getDistance() } ?: start).also { snapAnchor = it }
+        }
+        return start + (snap(anchor + (pos - start)) - anchor)
+    }
+
+    /** Whether the pointer is over one of the editor's own handles, which a press takes before a guide. */
+    internal fun hoversHandle(): Boolean = hoveredVertex != null || hoveredMeshVertex != null || hoveredPathPoint != null ||
+        hoveredHandle != BoundingHandle.NONE || hoveredBezierAnchor != null || hoveredBezierHandle != null ||
+        swingHover != null || placementHover != BoundingHandle.NONE
     private var activeElementMode by mutableStateOf(0)
     var elementMode: Int
         get() = activeElementMode
@@ -1471,9 +1682,25 @@ internal class CanvasEditor(
     /** "vertex" or "edge" while [knifeHover] sits on a snap target, null while it is a free point. */
     var knifeSnapKind by mutableStateOf<String?>(null)
 
+    /** Which face of the point tool is in hand. Its keys arm both the face and the tool. */
+    var meshPointMode by mutableStateOf(MeshPointMode.POINT)
+        private set
+
+    /** Takes [mode] in hand. The tool follows, so a face's chord is enough to start with it; a line being drawn is dropped. */
+    fun selectMeshPointMode(mode: MeshPointMode) {
+        meshPointMode = mode
+        activateTool(CanvasTool.MESH_POINT)
+    }
+
+    /** Whether the point tool is drawing lines: anchors joined by edges, committed with Enter (journalled as `knife`). */
+    val knifing: Boolean get() = tool == CanvasTool.MESH_POINT && meshPointMode == MeshPointMode.LINE
+
+    /** Whether the point tool is laying points one click or stroke at a time (journalled as `add_points`). */
+    private val pointing: Boolean get() = tool == CanvasTool.MESH_POINT && meshPointMode == MeshPointMode.POINT
+
     fun undoDraftPoint() {
         if (busy) return
-        if (tool == CanvasTool.KNIFE) {
+        if (knifing) {
             knifeInput?.dropLast()
             knifeDraft = knifeDraft.dropLast(1)
             if (knifeDraft.isEmpty()) knifeInput = null
@@ -1484,6 +1711,16 @@ internal class CanvasEditor(
         }
         error = null
     }
+
+    /** The point tool's stroke over open canvas, in screen space: where its new vertices are laid. Empty between strokes. */
+    var pointStroke by mutableStateOf<List<Offset>>(emptyList())
+    private var pointStroking = false
+
+    /** Canvas pixels between the vertices one point-tool stroke lays; a click lays one. */
+    var pointSpacing by mutableStateOf(24f)
+
+    /** Whether the point tool repeats each add, vertex delete and edge delete at its mirror image across the mesh's vertical centre. */
+    var pointMirror by mutableStateOf(false)
 
     /** The vertices the subdivide brush is currently covering; the stroke's union, not the last radius. */
     var subdivideEdges by mutableStateOf<Set<MeshElement.Edge>>(emptySet())
@@ -1563,6 +1800,9 @@ internal class CanvasEditor(
      */
     private var pressedObject: String? = null
     private var initialScreenPoints = emptyList<List<Offset>>()
+
+    /** Per target of a box drag, how far each point follows the picked ones under soft selection; null without it. */
+    private var softWeightsAtPress = emptyList<FloatArray?>()
     private var objectTargets = emptyList<CanvasTarget>()
     private var pendingObjects = emptyList<JsonObject>()
     /** The rectangle an object-mode box drag moves a file-imported layer to, when the drag only moves and scales it. */
@@ -1570,6 +1810,7 @@ internal class CanvasEditor(
     private var previous = Offset.Zero
     private var targetAtPress: CanvasTarget? = null
     private var original: PuppetModel? = null
+
     private var pending: JsonObject? = null
     private var gestureState: String? = null
     private var moved = false
@@ -1603,10 +1844,27 @@ internal class CanvasEditor(
         val next = (brushShape.ordinal + 1) % entries.size
         brushShape = entries[next]
     }
-    private var cachedSource: PuppetModel? = null
-    private var cachedPose = emptyMap<ParameterId, Float>()
-    private var cachedWorlds = emptyMap<DeformerId, DeformerWorld>()
-    private val cachedTargets = mutableMapOf<String, CanvasTarget>()
+    /** Deformer worlds and targets of one puppet at one pose. */
+    private class TargetCache(val source: PuppetModel, val pose: Map<ParameterId, Float>, val worlds: Map<DeformerId, DeformerWorld>) {
+        val targets = mutableMapOf<String, CanvasTarget>()
+    }
+
+    /**
+     * The last two puppets' [TargetCache]s. A drag asks for targets of both its preview and the document's puppet in
+     * every frame (tool options, keyform targets): with one slot each call threw the other's worlds and geometry away.
+     */
+    private val targetCaches = ArrayDeque<TargetCache>(2)
+
+    private fun targetCache(source: PuppetModel): TargetCache {
+        val pose = state.parameterValues
+        targetCaches.firstOrNull { it.source === source && it.pose == pose }?.let { return it }
+        val defaults = source.parameters.associate { it.id to it.default }
+        val made = TargetCache(source, pose, buildDeformerWorlds(source.deformers, { p -> pose[p] ?: defaults[p] ?: 0f }, { defaults[it] ?: 0f }))
+        targetCaches.removeAll { it.source === source }
+        if (targetCaches.size >= 2) targetCaches.removeFirst()
+        targetCaches.addLast(made)
+        return made
+    }
 
     val inGesture get() = dragging
     val model get() = preview ?: state.previewModel!!.rig.puppet
@@ -1650,12 +1908,18 @@ internal class CanvasEditor(
         }
     val editable get() = !busy && !state.workspaceEditBusy && !state.isGenerating && !state.isAnalyzing && state.historySnapshot != null
 
+    /**
+     * The selection's target on the document's puppet, without the gesture in progress: for what shows what is selected
+     * (status bar, tool options), which then does not read the preview a drag replaces every frame and recompose with it.
+     */
+    fun selectionTarget(): CanvasTarget? = target(state.previewModel?.rig?.puppet)
+
     fun target(source: PuppetModel? = preview ?: state.previewModel?.rig?.puppet, layerId: String? = state.selectedLayerId, deformerId: String? = state.selectedDeformerId): CanvasTarget? {
         // Panels can be composed before a project is loaded or while it is closing.
         val resolvedSource = source ?: return null
         val rig = state.previewModel?.rig ?: return null
         val deformer = resolvedSource.deformers.firstOrNull { it.id.raw == deformerId }
-        val drawable = resolvedSource.drawables.firstOrNull { rig.layerIdByDrawableId[it.id.raw] == layerId }
+        val drawable = resolvedSource.drawables.firstOrNull { rig.ownLayerIdByDrawableId[it.id.raw] == layerId }
         val kind: String; val id: String; val parent: DeformerId?; val indices: IntArray
         if (deformer is Deformer.Warp) {
             if (!deformer.isSelectable || !deformer.isVisible || state.deformerVisibility[deformer.id.raw] == false) return null
@@ -1668,15 +1932,11 @@ internal class CanvasEditor(
             if (layerId !in state.effectiveVisibleLayerIds || !drawable.isSelectable) return null
             kind = "mesh"; id = drawable.id.raw; parent = drawable.parentDeformerId; indices = drawable.mesh!!.indices
         } else return null
-        if (cachedSource !== resolvedSource || cachedPose != state.parameterValues) {
-            cachedSource = resolvedSource; cachedPose = state.parameterValues; cachedTargets.clear()
-            val defaults = resolvedSource.parameters.associate { it.id to it.default }
-            cachedWorlds = buildDeformerWorlds(resolvedSource.deformers, { p -> state.parameterValues[p] ?: defaults[p] ?: 0f }, { defaults[it] ?: 0f })
-        }
-        val worlds = cachedWorlds
+        val cache = targetCache(resolvedSource)
+        val worlds = cache.worlds
         if (parent != null && worlds[parent] == null) return null
         return try {
-            cachedTargets.getOrPut("$kind:$id") {
+            cache.targets.getOrPut("$kind:$id") {
                 CanvasTarget(
                     kind, id,
                     RigGeometryTools.geometry(resolvedSource, kind, id, sanitizedPose(resolvedSource)),
@@ -1931,26 +2191,43 @@ internal class CanvasEditor(
         paintSession?.canRedo() == true
 
     fun undoPaint(layerId: String = targetLayerId(paintTarget()) ?: "") {
+        // Undo during a free transform takes the transform back, as Photoshop's does.
+        if (paintTransform != null) { cancelPaintTransform(); return }
+        if (paintWorking) return
         val session = paintSession ?: return
         session.undo()
     }
 
     fun redoPaint(layerId: String = targetLayerId(paintTarget()) ?: "") {
+        if (paintWorking || paintTransformInFlight) return
         val session = paintSession ?: return
         session.redo()
     }
 
     fun jumpToPaintStroke(index: Int) {
+        if (paintWorking || paintTransformInFlight) return
         val session = paintSession ?: return
         session.jumpToStroke(index)
     }
 
+    /**
+     * Lets go of the paint session without discarding a commit under way. Called from a commit's thread too, it runs
+     * on the UI thread, where the session and its background edits are kept - and only if that session is still in hand.
+     */
     fun resetPaintSession() {
-        paintSession?.dismiss()
+        if (!java.awt.EventQueue.isDispatchThread()) {
+            val session = paintSession
+            java.awt.EventQueue.invokeLater { if (paintSession === session) resetPaintSession() }
+            return
+        }
+        retirePaintSession { it.dismiss() }
         paintSession = null
+        dropPaintTransformState()
         isPainting = false
         paintStrokeStart = null
         paintStrokeCurrent = null
+        paintLastEnd = null
+        paintSelectDraft = emptyList(); paintQuickStroke = mutableListOf()
     }
 
     /** Drops the session's strokes and paints on: a fresh session on the same target - a layer, or a material. */
@@ -1962,20 +2239,28 @@ internal class CanvasEditor(
 
     /** Drops the session's strokes and closes it, for a switch to another target or out of painting. */
     fun closePaintSession() {
-        val session = paintSession ?: return
-        session.discard()
+        if (paintSession == null) return
+        retirePaintSession { it.discard() }
         paintSession = null
+        dropPaintTransformState()
         isPainting = false
         paintStrokeStart = null
         paintStrokeCurrent = null
+        paintLastEnd = null
+        paintSelectDraft = emptyList(); paintQuickStroke = mutableListOf()
     }
 
     fun clearCurrentLayerPaint() {
+        if (paintTransformInFlight) return
         val session = paintSession ?: ensurePaintSession() ?: return
-        session.clear(tr("editor.paint.strokeClear"))
+        val name = tr("editor.paint.strokeClear")
+        paintInBackground { session.clear(name) }
     }
 
     fun promptCommitPaintSession() {
+        // A transform in hand lands first; the commit follows once it has.
+        if (paintTransform != null) { applyPaintTransform { promptCommitPaintSession() }; return }
+        if (paintWorking) return
         val session = paintSession ?: return
         if (!session.isDirty) return
         // The layer keeps its meshes: the commit cuts the paint along them, what lies off them a new layer of its own.
@@ -2024,7 +2309,7 @@ internal class CanvasEditor(
      */
     val eyedropperArmed: Boolean
         get() = hierarchyMode == EditHierarchyMode.PAINT && tool in PAINT_TOOLS && !adjustingBrush &&
-            (tool == CanvasTool.PAINT_EYEDROPPER || isSampling || (altHeld && !dragging))
+            (tool == CanvasTool.PAINT_EYEDROPPER || isSampling || (altHeld && !dragging && tool != CanvasTool.PAINT_SELECT))
 
     /**
      * Where the sampling ring belongs, or null when no pick is under way. The ring is the pick in
@@ -2062,13 +2347,410 @@ internal class CanvasEditor(
      * the stroke drawn so far.
      */
     private fun applyLiveSegment(from: Offset, to: Offset, erase: Boolean) {
-        val session = paintSession ?: return
         val vp = viewport ?: return
-        val start = screenToCanvasPoint(from, vp) ?: return
-        val end = screenToCanvasPoint(to, vp) ?: return
-        // Nothing new under the segment - a stroke doubling back over itself - is nothing to redraw.
-        session.segment(start.first, start.second, end.first, end.second, paintTip(), paintColor, paintOpacity, erase)
+        paintCanvasSegment(canvasPoint(from, vp), canvasPoint(to, vp), erase)
+    }
+
+    /** [pos] on the canvas as shown, in canvas units: before the painted layer's own transform. */
+    private fun canvasPoint(pos: Offset, viewport: CanvasViewport) = Offset(viewport.canvasX(pos.x), viewport.canvasY(pos.y))
+
+    /** A canvas point on screen. */
+    private fun screenPoint(p: Offset, viewport: CanvasViewport) =
+        Offset(viewport.x(p.x).toFloat(), (viewport.offsetY + p.y * viewport.scale).toFloat())
+
+    /**
+     * One segment of the live stroke between two canvas points, and its mirror images when [paintSymmetry] is on:
+     * the images share the stroke's coverage, so where they overlap they land once, like a stroke crossing itself.
+     * The axes run through the middle of the canvas, where a character's face usually is.
+     */
+    private fun paintCanvasSegment(from: Offset, to: Offset, erase: Boolean) {
+        val session = paintSession ?: return
+        val tip = paintTip()
+        val ax = session.canvasWidth / 2f
+        val ay = session.canvasHeight / 2f
+        val starts = paintSymmetry.images(from.x, from.y, ax, ay)
+        val ends = paintSymmetry.images(to.x, to.y, ax, ay)
+        // Lock transparency turns the eraser into the background colour, as in Photoshop.
+        val color = if (erase && paintLockAlpha) paintSecondaryColor else paintColor
+        val erasing = erase && !paintLockAlpha
+        for (i in starts.indices) {
+            val (x0, y0) = session.toFrame(starts[i].first, starts[i].second)
+            val (x1, y1) = session.toFrame(ends[i].first, ends[i].second)
+            // Nothing new under the segment - a stroke doubling back over itself - is nothing to redraw.
+            if (tool == CanvasTool.PAINT_BLUR) session.blurSegment(x0, y0, x1, y1, tip, paintBlurStrength)
+            else session.segment(x0, y0, x1, y1, tip, color, paintOpacity, erasing, paintLockAlpha)
+        }
+        paintLastEnd = to
         refreshPaintPreview()
+    }
+
+    /** The operation a selection gesture takes: Photoshop's Shift adds, Alt subtracts, both intersect. */
+    private fun paintSelectOpFor(shift: Boolean, alt: Boolean) = when {
+        shift && alt -> io.github.psd2live.core.PaintSelectionOp.INTERSECT
+        shift -> io.github.psd2live.core.PaintSelectionOp.ADD
+        alt -> io.github.psd2live.core.PaintSelectionOp.SUBTRACT
+        else -> paintSelectOp
+    }
+    private var paintSelectOpInHand = io.github.psd2live.core.PaintSelectionOp.REPLACE
+
+    /** Changes the paint session's selection; [mode] and the fields [build] adds are one selection request. */
+    private fun paintSelect(mode: String, op: io.github.psd2live.core.PaintSelectionOp? = null, build: JsonObjectBuilder.() -> Unit = {}) {
+        if (paintTransformInFlight) return
+        val session = paintSession ?: ensurePaintSession() ?: return
+        if (isPainting && tool != CanvasTool.PAINT_SELECT) return
+        val request = buildJsonObject {
+            put("mode", mode)
+            op?.let { put("op", it.name.lowercase()) }
+            build()
+        }
+        // The wand, a feather or a combination walks the whole raster.
+        paintInBackground { session.select(request) }
+    }
+
+    /** [points] as a lasso request's points, thinned to what a lasso takes. */
+    private fun lassoPoints(session: PaintSession, points: List<Offset>): JsonArray =
+        JsonArray(io.github.psd2live.core.thinOutline(points.map { it.x to it.y }, LASSO_MAX_POINTS, 0.5f)
+            .map { (x, y) -> framePoint(session, Offset(x, y)) })
+
+    /** A canvas point in the painted layer's frame, as a JSON point of a session request. */
+    private fun framePoint(session: PaintSession, p: Offset): JsonArray =
+        session.toFrame(p.x, p.y).let { (x, y) -> JsonArray(listOf(JsonPrimitive(x), JsonPrimitive(y))) }
+
+    fun selectAllPaint() = paintSelect("all")
+    fun deselectPaint() = paintSelect("none")
+    fun invertPaintSelection() { if (paintHasSelection) paintSelect("invert") }
+    fun featherPaintSelection() = paintSelect("feather") { put("radius", (paintFeather / paintPixelsPerUnit).coerceIn(0.5f, 256f)) }
+    /** Grows the selection's edge outwards by [paintSelectGrow], or draws it in by that with [contract]. */
+    fun growPaintSelection(contract: Boolean = false) {
+        if (paintHasSelection) paintSelect(if (contract) "contract" else "expand") {
+            put("radius", (paintSelectGrow / paintPixelsPerUnit).coerceIn(0.5f, 256f))
+        }
+    }
+    /** Selects the layer's pixels by their opacity, Photoshop's Ctrl + click on the thumbnail. */
+    fun selectOpaquePaint(op: io.github.psd2live.core.PaintSelectionOp = io.github.psd2live.core.PaintSelectionOp.REPLACE) =
+        paintSelect("opaque", op)
+    val paintHasSelection: Boolean get() = paintSession?.hasSelection == true
+
+    /** Fills the selection, or the whole layer without one, with the foreground colour - the background one for [secondary]. */
+    fun fillPaintSelection(secondary: Boolean = false) {
+        if (paintTransformInFlight) return
+        val session = paintSession ?: ensurePaintSession() ?: return
+        if (isPainting) return
+        val color = if (secondary) paintSecondaryColor else paintColor
+        val opacity = paintOpacity; val lockAlpha = paintLockAlpha; val name = tr("editor.paint.strokeFillSelection")
+        paintInBackground { session.fill(color, opacity, name, lockAlpha) }
+    }
+
+    /** Clears what the selection holds, the way Delete does in Photoshop; without a selection there is nothing to clear. */
+    fun deletePaintSelection() {
+        if (paintTransformInFlight) return
+        val session = paintSession ?: return
+        if (isPainting || !session.hasSelection) return
+        val name = tr("editor.paint.strokeDeleteSelection")
+        paintInBackground { session.clear(name) }
+    }
+
+    /** Delete in Paint: the last point of a polygon being clicked out, else what the selection holds. */
+    fun deleteInPaint() {
+        val draft = paintSelectDraft
+        if (draft.isNotEmpty()) paintSelectDraft = draft.dropLast(1) else deletePaintSelection()
+    }
+
+    /** Lock transparency on or off, the "/" key of Photoshop. */
+    fun togglePaintLockAlpha() { paintLockAlpha = !paintLockAlpha }
+
+    /** Runs the paint-only keys the canvas and the material window share; false for any other action. */
+    fun paintShortcut(action: ShortcutAction): Boolean {
+        when (action) {
+            ShortcutAction.TOOL_PAINT_SELECT -> activateTool(CanvasTool.PAINT_SELECT)
+            ShortcutAction.TOOL_PAINT_GRADIENT -> activateTool(CanvasTool.PAINT_GRADIENT)
+            ShortcutAction.TOOL_PAINT_BLUR -> activateTool(CanvasTool.PAINT_BLUR)
+            ShortcutAction.TOOL_PAINT_TRANSFORM -> activateTool(CanvasTool.PAINT_TRANSFORM)
+            ShortcutAction.PAINT_DESELECT -> deselectPaint()
+            ShortcutAction.PAINT_FILL_SELECTION -> fillPaintSelection()
+            ShortcutAction.PAINT_RESET_COLORS -> resetPaintColors()
+            ShortcutAction.PAINT_LOCK_ALPHA -> togglePaintLockAlpha()
+            else -> return false
+        }
+        return true
+    }
+
+    /** A press of the selection tool: the wand selects at once, the polygon takes a point, the rest start a drag. */
+    private fun pressPaintSelect(pos: Offset, viewport: CanvasViewport, shift: Boolean, alt: Boolean) {
+        val session = paintSession ?: return
+        val here = canvasPoint(pos, viewport)
+        when (paintSelectShape) {
+            PaintSelectShape.WAND -> {
+                paintSelect("wand", paintSelectOpFor(shift, alt)) {
+                    put("point", framePoint(session, here)); put("tolerance", paintTolerance); put("contiguous", paintContiguous)
+                }
+                isPainting = false
+                dragging = false
+            }
+            PaintSelectShape.POLYGON -> {
+                val draft = paintSelectDraft
+                val first = draft.firstOrNull()
+                if (draft.isEmpty()) paintSelectOpInHand = paintSelectOpFor(shift, alt)
+                // A click back on the first point closes the outline.
+                if (first != null && draft.size >= 3 && (screenPoint(first, viewport) - pos).getDistance() <= POLYGON_CLOSE_PX) finishPaintPolygon()
+                else paintSelectDraft = draft + here
+                isPainting = false
+                dragging = false
+            }
+            PaintSelectShape.LASSO -> {
+                paintSelectOpInHand = paintSelectOpFor(shift, alt)
+                paintSelectDraft = listOf(here)
+            }
+            PaintSelectShape.RECTANGLE, PaintSelectShape.ELLIPSE -> paintSelectOpInHand = paintSelectOpFor(shift, alt)
+            PaintSelectShape.QUICK -> {
+                // Every stroke adds to what the last one picked, as Photoshop's quick selection switches to Add after
+                // its first: a new selection starts from Ctrl+D. Alt takes away, Shift + Alt intersects the stroke.
+                paintSelectOpInHand = paintSelectOpFor(shift, alt).let {
+                    if (it == io.github.psd2live.core.PaintSelectionOp.REPLACE) io.github.psd2live.core.PaintSelectionOp.ADD else it
+                }
+                paintQuickStroke = mutableListOf(here)
+                paintQuickLanded = 0
+                landPaintQuickSelect(viewport, final = false)
+            }
+        }
+    }
+
+    /** The quick selection stroke in hand, in canvas units; empty when none is. */
+    private var paintQuickStroke: MutableList<Offset> = mutableListOf()
+    /** How many points of [paintQuickStroke] have been sent to the session; the next piece starts at the last of them. */
+    private var paintQuickLanded = 0
+
+    /**
+     * Sends the part of the quick selection stroke not yet selected, so the selection grows under the brush as it moves:
+     * once it has moved [QUICK_SELECT_STEP_PX] on screen and no earlier piece is still being worked out, or all of it
+     * when the stroke ends ([final]). An intersection only makes sense for the stroke as a whole, so it waits for the end.
+     */
+    private fun landPaintQuickSelect(viewport: CanvasViewport, final: Boolean) {
+        val session = paintSession ?: return
+        val stroke = paintQuickStroke
+        val from = (paintQuickLanded - 1).coerceAtLeast(0)
+        if (stroke.isEmpty() || (paintQuickLanded > 0 && from >= stroke.size - 1)) return
+        val op = paintSelectOpInHand
+        val intersect = op == io.github.psd2live.core.PaintSelectionOp.INTERSECT
+        if (!final) {
+            if (intersect || paintWorking) return
+            if (paintQuickLanded > 0 && (screenPoint(stroke.last(), viewport) - screenPoint(stroke[from], viewport)).getDistance() < QUICK_SELECT_STEP_PX) return
+        }
+        val piece = if (intersect) stroke.toList() else stroke.subList(from, stroke.size).toList()
+        paintQuickLanded = stroke.size
+        val radius = (paintQuickSelectSize / paintPixelsPerUnit / 2f).coerceIn(0.5f, 512f)
+        paintSelect("quick", op) {
+            put("points", lassoPoints(session, piece)); put("radius", radius); put("tolerance", paintTolerance)
+        }
+    }
+
+    /** The lasso follows the drag, a point every couple of screen pixels. */
+    private fun movePaintSelect(pos: Offset, viewport: CanvasViewport) {
+        if (paintSelectShape == PaintSelectShape.QUICK && paintQuickStroke.isNotEmpty()) {
+            if ((screenPoint(paintQuickStroke.last(), viewport) - pos).getDistance() >= 2f) paintQuickStroke.add(canvasPoint(pos, viewport))
+            landPaintQuickSelect(viewport, final = false)
+            return
+        }
+        if (paintSelectShape != PaintSelectShape.LASSO) return
+        val draft = paintSelectDraft
+        val last = draft.lastOrNull()
+        if (last == null || (screenPoint(last, viewport) - pos).getDistance() >= 2f) paintSelectDraft = draft + canvasPoint(pos, viewport)
+    }
+
+    /** Closes the polygon being clicked out into a selection; fewer than three points select nothing. */
+    fun finishPaintPolygon(): Boolean {
+        val draft = paintSelectDraft
+        if (draft.isEmpty()) return false
+        paintSelectDraft = emptyList()
+        val session = paintSession ?: return true
+        if (draft.size >= 3) paintSelect("lasso", paintSelectOpInHand) { put("points", lassoPoints(session, draft)) }
+        return true
+    }
+
+    /** Ends a selection drag: the box, the ellipse or the lasso becomes the selection; a bare click drops it. */
+    private fun releasePaintSelect(viewport: CanvasViewport) {
+        val session = paintSession ?: return
+        val s = paintStrokeStart
+        val c = paintStrokeCurrent
+        val replacing = paintSelectOpInHand == io.github.psd2live.core.PaintSelectionOp.REPLACE
+        when (paintSelectShape) {
+            PaintSelectShape.RECTANGLE, PaintSelectShape.ELLIPSE -> if (s != null && c != null) {
+                // A click without a drag deselects, as in Photoshop - unless it was meant to add or take away.
+                val a = canvasPoint(s, viewport)
+                val b = canvasPoint(c, viewport)
+                val rectangle = paintSelectShape == PaintSelectShape.RECTANGLE
+                if ((c - s).getDistance() < 2f) { if (replacing) deselectPaint() }
+                // On a turned or slanted layer the box drawn on the canvas is not a box of the layer's own frame: its
+                // outline goes over as a polygon - four corners, or the ellipse traced at 64 points.
+                else if (!session.frame.isAxisAligned) {
+                    val outline = if (rectangle) listOf(a, Offset(b.x, a.y), b, Offset(a.x, b.y)) else {
+                        val cx = (a.x + b.x) / 2f; val cy = (a.y + b.y) / 2f
+                        val rx = kotlin.math.abs(b.x - a.x) / 2f; val ry = kotlin.math.abs(b.y - a.y) / 2f
+                        (0 until 64).map { i -> val t = i * 2.0 * PI / 64; Offset(cx + rx * cos(t).toFloat(), cy + ry * sin(t).toFloat()) }
+                    }
+                    paintSelect("lasso", paintSelectOpInHand) { put("points", lassoPoints(session, outline)) }
+                }
+                else paintSelect(if (rectangle) "rectangle" else "ellipse", paintSelectOpInHand) {
+                    put("from", framePoint(session, a)); put("to", framePoint(session, b))
+                }
+            }
+            PaintSelectShape.LASSO -> {
+                val draft = paintSelectDraft
+                paintSelectDraft = emptyList()
+                if (draft.size >= 3) paintSelect("lasso", paintSelectOpInHand) { put("points", lassoPoints(session, draft)) }
+                else if (replacing) deselectPaint()
+            }
+            PaintSelectShape.QUICK -> {
+                landPaintQuickSelect(viewport, final = true)
+                paintQuickStroke = mutableListOf()
+                paintQuickLanded = 0
+            }
+            else -> Unit
+        }
+    }
+
+    /** A free transform in hand: the box over the lifted pixels, where they sat on the raster, and how they look. */
+    internal class PaintTransformInHand(val box: PaintTransformBox, val region: java.awt.Rectangle,
+        val preview: androidx.compose.ui.graphics.ImageBitmap)
+
+    /** The free transform in hand, or null; its pixels are off the raster ([io.github.psd2live.application.WorkspacePaintSession.lift]) meanwhile. */
+    var paintTransform by mutableStateOf<PaintTransformInHand?>(null)
+        private set
+    /** Smooth (bilinear) resampling for a transform; off keeps hard pixels, for pixel art. */
+    var paintTransformSmooth by mutableStateOf(true)
+    /** Whether a lift is being worked out: the box arrives when it has. */
+    private var paintTransformLifting by mutableStateOf(false)
+    /** Bumped whenever a transform is dropped, so a lift arriving after is put back rather than shown. */
+    private var paintTransformSerial = 0
+    private var paintTransformHandle: PaintTransformBox.Handle? = null
+    private var paintTransformStart = io.github.psd2live.project.LayerTransform.IDENTITY
+    private var paintTransformFrom = Offset.Zero
+
+    /** Whether a free transform is in hand or on its way: the other paint commands wait for it to be applied or cancelled. */
+    val paintTransformInFlight: Boolean get() = paintTransform != null || paintTransformLifting
+
+    /**
+     * Lifts the selection's pixels - the layer's, without one - into a free transform box. Nothing happens on a layer
+     * with nothing on it, which the bar says.
+     */
+    fun beginPaintTransform() {
+        if (paintTransformInFlight || isPainting) return
+        val session = paintSession ?: ensurePaintSession() ?: return
+        val serial = paintTransformSerial
+        paintTransformLifting = true
+        paintInBackground {
+            var lift: io.github.psd2live.application.WorkspacePaintLift? = null
+            var answered = false
+            try { lift = session.lift(); answered = true } finally {
+                val taken = lift
+                val preview = taken?.let { lifted ->
+                    BufferedImage(lifted.region.width, lifted.region.height, BufferedImage.TYPE_INT_ARGB).also {
+                        it.setRGB(0, 0, lifted.region.width, lifted.region.height, lifted.pixels, 0, lifted.region.width)
+                    }.toImageBitmapFast()
+                }
+                java.awt.EventQueue.invokeLater {
+                    paintTransformLifting = false
+                    when {
+                        // A failed lift has said why already; one with nothing to take says so here.
+                        taken == null || preview == null -> if (answered && serial == paintTransformSerial) error = tr("editor.paintTransform.nothing")
+                        serial != paintTransformSerial || paintSession !== session -> paintInBackground { session.abandonStroke() }
+                        else -> paintTransform = PaintTransformInHand(paintTransformBox(session, taken.region), taken.region, preview)
+                    }
+                }
+            }
+        }
+    }
+
+    /** The box over raster [region] of [session], as the canvas shows it through the layer's transform. */
+    private fun paintTransformBox(session: PaintSession, region: java.awt.Rectangle): PaintTransformBox {
+        fun shown(x: Int, y: Int): Offset {
+            val fx = session.originX + x / session.scaleX; val fy = session.originY + y / session.scaleY
+            return Offset(session.frame.x(fx, fy), session.frame.y(fx, fy))
+        }
+        val origin = shown(region.x, region.y)
+        return PaintTransformBox(origin, shown(region.x + region.width, region.y) - origin, shown(region.x, region.y + region.height) - origin)
+    }
+
+    /**
+     * Lays the transformed pixels down as one stroke - Enter, or picking another tool - and runs [then] once they are.
+     * A box never moved puts the pixels back as they were and records nothing.
+     */
+    fun applyPaintTransform(then: () -> Unit = {}) {
+        val hand = paintTransform ?: return
+        val session = paintSession ?: return
+        paintTransform = null
+        paintTransformHandle = null
+        isPainting = false
+        val shown = hand.box.transform
+        // The box moved the pixels as the canvas shows them; the session takes the same move in the layer's own frame.
+        val frame = session.frame
+        val matrix = frame.inverse().after(shown.after(frame))
+        val name = tr("editor.paint.strokeTransform"); val smooth = paintTransformSmooth
+        paintInBackground {
+            if (shown.isIdentity) session.abandonStroke() else session.transform(matrix, smooth, name)
+            java.awt.EventQueue.invokeLater(then)
+        }
+    }
+
+    /**
+     * Puts the lifted pixels back where they were: Esc, or undo while transforming. [now] does it before returning
+     * rather than after the edits queued, for a window closing on the session.
+     */
+    fun cancelPaintTransform(now: Boolean = false) {
+        if (!paintTransformInFlight) return
+        val session = paintSession
+        paintTransformSerial++
+        val hand = paintTransform
+        paintTransform = null
+        paintTransformHandle = null
+        if (hand == null || session == null) return
+        if (now) session.abandonStroke() else paintInBackground { session.abandonStroke() }
+    }
+
+    /** Forgets a transform whose session has gone: the session's end already put its pixels back. */
+    private fun dropPaintTransformState() {
+        paintTransformSerial++
+        paintTransform = null
+        paintTransformHandle = null
+    }
+
+    /** A press of the transform tool: a handle, the inside or the outside of the box; without a box, one is lifted. */
+    private fun pressPaintTransform(pos: Offset, viewport: CanvasViewport) {
+        val hand = paintTransform
+        if (hand == null) {
+            isPainting = false; dragging = false
+            beginPaintTransform()
+            return
+        }
+        val here = canvasPoint(pos, viewport)
+        paintTransformHandle = hand.box.hit(here, PAINT_TRANSFORM_HANDLE_PX / viewport.scale.toFloat())
+        paintTransformStart = hand.box.transform
+        paintTransformFrom = here
+    }
+
+    /** Drags the box: Shift frees a corner's proportions and steps a turn by 15°, Alt scales about the middle. */
+    private fun movePaintTransform(pos: Offset, viewport: CanvasViewport, shift: Boolean, alt: Boolean) {
+        val hand = paintTransform ?: return
+        val handle = paintTransformHandle ?: return
+        hand.box.transform = hand.box.dragged(handle, paintTransformStart, paintTransformFrom, canvasPoint(pos, viewport),
+            free = shift, fromCenter = alt, snap = shift)
+    }
+
+    /** Lands the gradient dragged from [paintStrokeStart] to [paintStrokeCurrent]. */
+    private fun releasePaintGradient(viewport: CanvasViewport) {
+        val session = paintSession ?: return
+        val s = paintStrokeStart ?: return
+        val c = paintStrokeCurrent ?: return
+        if ((c - s).getDistance() < 2f) return
+        val from = canvasPoint(s, viewport)
+        val to = canvasPoint(c, viewport)
+        val (x0, y0) = session.toFrame(from.x, from.y)
+        val (x1, y1) = session.toFrame(to.x, to.y)
+        val start = paintColor
+        val end = if (paintGradientEnd == PaintGradientEnd.TRANSPARENT) paintColor.copy(alpha = 0f) else paintSecondaryColor
+        val radial = paintGradientRadial; val opacity = paintOpacity; val lockAlpha = paintLockAlpha
+        val name = tr("editor.paint.strokeGradient")
+        paintInBackground { session.gradient(x0, y0, x1, y1, start, end, radial, opacity, name, lockAlpha) }
     }
 
     /** Repaints the preview at most every ~40 ms: a gesture fires far more moves than frames. */
@@ -2082,21 +2764,26 @@ internal class CanvasEditor(
     fun cancel() {
         skeletonEntrySerial++
         if (busy) return
+        endTemporaryWarp()
         if (poseDrag != null) {
             poseDrag = null; draggingIkTargetId = null; ikTargetDragOrigin = null; ikTargetDragValues = null; ikTargetPoseDraft = null
             viewModel.cancelParameterScrub()
         }
+        cancelPaintTransform()
         // Every tip edits pixels as it goes, so an abandoned gesture has to give them back.
         val session = paintSession
-        if (isPainting && session != null) {
+        if (isPainting && session != null && tool != CanvasTool.PAINT_TRANSFORM) {
             session.abandonStroke()
             session.refreshPreview()
         }
         endBrushAdjust(cancel = true)
         preview = null; pending = null; dragging = false; targetAtPress = null; original = null; topologyFills = null
         swingHandle = null
+        interiorTool.cancel()
+        featureTool.cancel()
         knifeDraft = emptyList(); knifeDrawableId = null; subdividing = false; subdivideEdges = emptySet()
         knifeHover = null; knifeSnapKind = null
+        pointStroking = false; pointStroke = emptyList()
         placementInput = null; knifeInput = null; pathInput = null
         placement = null; placementHandle = PlacementHandle.NONE; placementDragStart = null; placementDragSnapshot = null
         glueStroking = false
@@ -2115,10 +2802,11 @@ internal class CanvasEditor(
         axis = null; gestureState = null; objectTargets = emptyList(); pendingObjects = emptyList()
         activeHandle = BoundingHandle.NONE
         initialBounds = null
-        boxDrag = false; dragIndices = emptyList()
+        boxDrag = false; dragIndices = emptyList(); softWeightsAtPress = emptyList()
         endTransformBox()
         anchorDragging = false
         isPainting = false; isSampling = false; paintStrokeStart = null; paintStrokeCurrent = null
+        paintSelectDraft = emptyList(); paintQuickStroke = mutableListOf(); paintStabilizerInHand = null
         // The frame belongs to the tool session, so cancelling is the only thing that drops it, anchor and all.
         frameAngle = 0f
         transformAnchor = null
@@ -2155,9 +2843,12 @@ internal class CanvasEditor(
             if (!hasPartFor(mode)) { deferMode(mode, next); return }
             enterMode(mode)
         }
+        // Another tool puts a free transform in hand down where it is, as Photoshop's Apply does.
+        if (next != CanvasTool.PAINT_TRANSFORM) applyPaintTransform()
         cancel()
         tool = next
         error = null
+        if (next == CanvasTool.PAINT_TRANSFORM && hierarchyMode == EditHierarchyMode.PAINT) beginPaintTransform()
         if (next == CanvasTool.LASSO_SELECT) selectionStyle = SelectionStyle.LASSO
         else if (next == CanvasTool.SELECT) selectionStyle = SelectionStyle.BOX
         if (next == CanvasTool.SELECT && objectMode) selection = emptyMap()
@@ -2588,20 +3279,8 @@ internal class CanvasEditor(
     /** Mapping for [CreatePlacement.spaceParentId]; root uses identity (model with camera Y-flip). */
     private fun placementMapping(spaceParentId: String?): DrawableSpaceMapping {
         placementInput?.takeIf { placement?.spaceParentId == spaceParentId }?.let { return it.frame }
-        val source = model
-        if (cachedSource !== source || cachedPose != state.parameterValues) {
-            cachedSource = source
-            cachedPose = state.parameterValues
-            cachedTargets.clear()
-            val defaults = source.parameters.associate { it.id to it.default }
-            cachedWorlds = buildDeformerWorlds(
-                source.deformers,
-                { p -> state.parameterValues[p] ?: defaults[p] ?: 0f },
-                { defaults[it] ?: 0f },
-            )
-        }
         if (spaceParentId == null) return DrawableSpaceMapping(null)
-        val world = cachedWorlds[DeformerId(spaceParentId)]
+        val world = targetCache(model).worlds[DeformerId(spaceParentId)]
             ?: error("Parent deformer world unavailable: $spaceParentId")
         return DrawableSpaceMapping(world)
     }
@@ -2838,6 +3517,8 @@ internal class CanvasEditor(
     @JvmName("changeHierarchyMode")
     fun setHierarchyMode(next: EditHierarchyMode) {
         if (busy) return
+        if (next != EditHierarchyMode.SELECT) lastWorkMode = next
+        if (next != EditHierarchyMode.DEFORM) endTemporaryWarp()
         if (next != EditHierarchyMode.SKELETON) skeletonEntrySerial++
         endTemporarySelection()
         if (next == EditHierarchyMode.SKELETON) {
@@ -2966,11 +3647,11 @@ internal class CanvasEditor(
      * Creation tools are handled separately and never force Edit.
      */
     internal fun modeForTool(tool: CanvasTool): EditHierarchyMode = when {
-        tool == CanvasTool.TRANSFORM -> EditHierarchyMode.SELECT
+        tool == CanvasTool.TRANSFORM || tool == CanvasTool.INTERIOR || tool == CanvasTool.FEATURE -> EditHierarchyMode.SELECT
         tool in SKELETON_TOOLS -> EditHierarchyMode.SKELETON
         tool in PAINT_TOOLS -> EditHierarchyMode.PAINT
         tool in WEIGHT_TOOLS -> EditHierarchyMode.SIMULATE
-        tool == CanvasTool.KNIFE || tool == CanvasTool.SUBDIVIDE -> EditHierarchyMode.EDIT
+        tool == CanvasTool.SUBDIVIDE || tool == CanvasTool.MESH_POINT -> EditHierarchyMode.EDIT
         else -> EditHierarchyMode.DEFORM
     }
 
@@ -3124,6 +3805,8 @@ internal class CanvasEditor(
 
     fun clearHover() {
         cursor = null
+        interiorTool.clearHover()
+        featureTool.clearHover()
         altHeld = false
         hoveredVertex = null; hoveredMeshVertex = null
         hoveredPathPoint = null
@@ -3370,8 +4053,11 @@ internal class CanvasEditor(
 
     fun updateHover(pos: Offset, viewport: CanvasViewport, ctrl: Boolean = false, shift: Boolean = false) {
         cursor = pos
-        if (tool == CanvasTool.KNIFE) {
+        if (knifing) {
             target()?.takeIf { it.kind == "mesh" }?.let { knifeAnchor(pos, it, viewport, shift) }
+        }
+        if (pointing && !dragging) {
+            target()?.takeIf { it.kind == "mesh" }?.let { pointSpot(pos, it, viewport, hover = true) }
         }
         if (tool == CanvasTool.SUBDIVIDE && !dragging) {
             subdivideEdges = target()?.takeIf { it.kind == "mesh" }?.let { edgesWithin(pos, pos, it, viewport) }.orEmpty()
@@ -3379,6 +4065,14 @@ internal class CanvasEditor(
         if (dragging) return
         if (posing()) {
             hoverPose(pos, viewport)
+            return
+        }
+        if (tool == CanvasTool.INTERIOR) {
+            interiorTool.hover(pos, viewport)
+            return
+        }
+        if (tool == CanvasTool.FEATURE) {
+            featureTool.hover(pos, viewport)
             return
         }
         hoveredBezierAnchor = null
@@ -3556,11 +4250,15 @@ internal class CanvasEditor(
         if (space) return if (dragging) move else hand
         // A swing session locks the canvas to its handles, so the tool's own pointer never applies.
         if (viewModel.swingSession != null) return if (swingHandle != null || swingHover != null) hand else arrow
+        if (tool == CanvasTool.INTERIOR) return if (interiorTool.cursorHand()) hand else cross
+        if (tool == CanvasTool.FEATURE) return if (featureTool.cursorHand()) hand else cross
         if (eyedropperArmed) return CanvasCursors.eyedropper
+        // The selection and the gradient are drawn point to point, so they aim with a cross.
+        if (hierarchyMode == EditHierarchyMode.PAINT && (tool == CanvasTool.PAINT_SELECT || tool == CanvasTool.PAINT_GRADIENT)) return cross
         if (dragging) {
             if (placementHandle == PlacementHandle.BOX) return CanvasCursors.transform(placementBoxHandle, 0f)
             if (marquee.isNotEmpty()) return cross
-            if (tool in DEFORM_BRUSH_TOOLS || tool == CanvasTool.BRUSH_SELECT || tool == CanvasTool.SUBDIVIDE || tool == CanvasTool.KNIFE) return cross
+            if (tool in DEFORM_BRUSH_TOOLS || tool == CanvasTool.BRUSH_SELECT || tool == CanvasTool.SUBDIVIDE || knifing || pointStroking) return cross
             if (boxDrag || anchorDragging) return CanvasCursors.transform(activeHandle, frameAngle)
             if (activeBezierAnchor != null || activeBezierHandle != null || poseDrag != null) return hand
             return move
@@ -3569,7 +4267,9 @@ internal class CanvasEditor(
         if (tool in CREATION_TOOLS) {
             return if (tool == CanvasTool.GLUE) hand else cross
         }
-        if (tool == CanvasTool.BRUSH_SELECT || tool in DEFORM_BRUSH_TOOLS || tool == CanvasTool.SUBDIVIDE || tool == CanvasTool.KNIFE) return cross
+        if (tool == CanvasTool.BRUSH_SELECT || tool in DEFORM_BRUSH_TOOLS || tool == CanvasTool.SUBDIVIDE || knifing) return cross
+        // Over a vertex the point tool grabs, like the select tool; anywhere else it lays a new point.
+        if (pointing) return if (knifeSnapKind == "vertex") hand else cross
         if (tool == CanvasTool.LASSO_SELECT) return cross
         // Painting gets no crosshair: the cursor is exactly where the tip ring already is, and a cross
         // over the pixels being judged is worse than no mark at all.
@@ -3790,6 +4490,399 @@ internal class CanvasEditor(
     }
 
     /**
+     * A keyform copied in Deform: what it was copied from, taken when copied ([KeyformTools.Snapshot] - so a paste
+     * writes what was copied, however the source changes after), the key it was copied at and what the paste rows
+     * name it.
+     */
+    internal class KeyformClip(val snapshot: KeyformTools.Snapshot, val key: Map<String, Float>, val label: String) {
+        val kind: String get() = snapshot.kind
+        val id: String get() = snapshot.id
+    }
+
+    /** What a paste writes: one clip per object copied together. */
+    var keyformClipboard by mutableStateOf<List<KeyformClip>>(emptyList())
+
+    /** A keyform tool the deform menu runs on the keys in hand (see [KeyformTools]). */
+    enum class KeyformToolAction { RESET_DEFAULT, RESET_REST, INTERPOLATE, PASTE, RESTORE }
+
+    /** How a paste writes: what it carries, how far it moves the key toward the copied values, and a flip. */
+    internal data class KeyformPasteOptions(
+        val channels: Set<String> = setOf("geometry"),
+        val ratio: Float = 1f,
+        val flip: String? = null,
+    )
+
+    /**
+     * The objects in hand that have keyforms - the target, then each other selected layer's mesh - each with the key
+     * the canvas shows it at; empty outside Deform.
+     */
+    private fun keyformTargets(): List<Pair<CanvasTarget, Map<String, Float>>> {
+        if (hierarchyMode != EditHierarchyMode.DEFORM) return emptyList()
+        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        val primary = target(source)?.takeIf { it.kind in setOf("mesh", "warp", "rotation") } ?: return emptyList()
+        val layers = LinkedHashSet(objects).apply { state.selectedLayerId?.let(::add) }
+        val others = if (primary.kind == "mesh") layers.mapNotNull { target(source, it, null)?.takeIf { t -> t.kind == "mesh" } } else emptyList()
+        return (listOf(primary) + others).distinctBy { it.id }.map { it to canvasDeformationCoordinate(source, it.geometry.axes, pose, deformationParameters) }
+    }
+
+    /** The target in hand that has keyforms, with the key the canvas shows it at; null outside Deform. */
+    private fun keyformTarget(): Pair<CanvasTarget, Map<String, Float>>? = keyformTargets().firstOrNull()
+
+    /** Whether [key] is one of [t]'s keyforms: no new axis, every value one of the axis's keys. */
+    private fun onKey(t: CanvasTarget, key: Map<String, Float>): Boolean {
+        val axes = t.geometry.axes
+        if (axes.isEmpty() || key.keys != axes.mapTo(HashSet()) { it.parameterId.raw }) return false
+        return axes.all { axis -> axis.keys.any { abs(it - key.getValue(axis.parameterId.raw)) <= org.umamo.runtime.eval.EPS_KEY } }
+    }
+
+    /** [keyformTarget] when its key is one of the target's keyforms. */
+    private fun keyedTarget(): Pair<CanvasTarget, Map<String, Float>>? = keyformTarget()?.takeIf { (t, key) -> onKey(t, key) }
+
+    /**
+     * Why the shape rows of the keyform menu are off for the target in hand, or null when they are not: it binds no
+     * parameter yet, or the parameters are between its keys.
+     */
+    fun keyformOffKeyNote(): String? {
+        val (t, key) = keyformTarget() ?: return null
+        return when {
+            t.geometry.axes.isEmpty() -> tr("editor.keyform.unbound")
+            !onKey(t, key) -> tr("editor.keyform.offKey")
+            else -> null
+        }
+    }
+
+    /** The points a keyform tool keeps to: the picked ones, but none of a warp's at the Bezier level or of a rotation. */
+    private fun keyformPoints(t: CanvasTarget): Set<Int> =
+        if (t.kind == "rotation" || (t.kind == "warp" && editLevel != 1)) emptySet() else vertices
+
+    /** How many points the keyform tools would keep to: 0 when they write the whole shape. */
+    fun keyformPointCount(): Int = keyformTarget()?.first?.let { keyformPoints(it).size } ?: 0
+
+    /**
+     * The ordinary parameters the key in hand sits between two keys of, which [KeyformToolAction.INTERPOLATE] can run
+     * along; a blend shape's keys are not interpolated between.
+     */
+    fun keyformInterpolationAxes(): List<String> {
+        val (t, key) = keyedTarget() ?: return emptyList()
+        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        return t.geometry.axes.filter { axis ->
+            val value = key.getValue(axis.parameterId.raw)
+            source.parameters.firstOrNull { it.id == axis.parameterId }?.kind == ParameterKind.NORMAL &&
+                axis.keys.any { it < value - org.umamo.runtime.eval.EPS_KEY } && axis.keys.any { it > value + org.umamo.runtime.eval.EPS_KEY }
+        }.map { it.parameterId.raw }
+    }
+
+    /** A parameter's display name. */
+    fun parameterLabel(id: String): String = (preview ?: state.previewModel?.rig?.puppet)?.parameters?.firstOrNull { it.id.raw == id }?.name?.ifBlank { null } ?: id
+
+    /** An object's display name. */
+    fun objectLabel(id: String): String = (preview ?: state.previewModel?.rig?.puppet)?.let { source ->
+        source.drawables.firstOrNull { it.id.raw == id }?.name ?: source.deformers.firstOrNull { it.id.raw == id }?.name
+    } ?: id
+
+    fun canCopyKeyform(): Boolean = keyformTarget() != null
+
+    /** Copies the shape and look of each object in hand at the key the canvas shows it at, for [KeyformToolAction.PASTE]. */
+    fun copyKeyform() {
+        val source = state.previewModel?.rig?.puppet ?: return
+        keyformClipboard = keyformTargets().mapNotNull { (t, key) ->
+            val snapshot = runCatching { KeyformTools.snapshot(source, "${t.kind}:${t.id}", key) }.getOrNull() ?: return@mapNotNull null
+            val name = objectLabel(t.id)
+            KeyformClip(snapshot, key, if (key.isEmpty()) name else "$name · ${describeKey(source, key)}")
+        }
+    }
+
+    /** What the paste row names: the one copied shape, or how many there are. */
+    fun keyformClipboardLabel(): String = keyformClipboard.singleOrNull()?.label
+        ?: if (keyformClipboard.isEmpty()) "…" else tr("editor.keyform.shapes", keyformClipboard.size)
+
+    /** The objects in hand a paste can write to now: those whose key the canvas shows is one of their keyforms. */
+    fun keyformPasteDestinations(): List<String> = keyformTargets().filter { (t, key) -> onKey(t, key) }.map { it.first.id }
+
+    /**
+     * Whether [clip] can be pasted onto [destination] with [channels]: its shape only onto the same object or one of its
+     * kind with the same points under the same parent ([KeyformTools.misfit]); a draw order only onto a mesh.
+     */
+    fun keyformPasteFits(clip: KeyformClip, destination: String, channels: Set<String> = setOf("geometry")): Boolean {
+        val source = state.previewModel?.rig?.puppet ?: return false
+        val t = keyformTargets().firstOrNull { it.first.id == destination }?.first ?: return false
+        if ("geometry" in channels && KeyformTools.misfit(source, clip.snapshot, "${t.kind}:${t.id}") != null) return false
+        return "drawOrder" !in channels || t.kind == "mesh"
+    }
+
+    /**
+     * Each copied shape with the object in hand it pastes onto: itself when it is in hand, else the next one not yet
+     * taken that it fits ([keyformPasteFits]); null leaves a shape out.
+     */
+    fun keyformPastePairs(channels: Set<String> = setOf("geometry")): List<Pair<KeyformClip, String?>> {
+        val free = keyformPasteDestinations().toMutableList()
+        val own = keyformClipboard.map { clip -> clip.id.takeIf { it in free && keyformPasteFits(clip, it, channels) } }
+        own.filterNotNull().forEach { free -= it }
+        return keyformClipboard.zip(own).map { (clip, mine) ->
+            clip to (mine ?: free.firstOrNull { keyformPasteFits(clip, it, channels) }?.also { free -= it })
+        }
+    }
+
+    /** Why the last paste wrote less than asked, for the paste dialog; null when it wrote everything. */
+    var keyformPasteProblem by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * The `set`s [pairs] paste with [options], each computed from the model as it is before any of them, so pasting A
+     * onto B and B onto A swaps them; empty when none can be written.
+     */
+    internal fun keyformPasteCommands(pairs: List<Pair<KeyformClip, String?>> = keyformPastePairs(),
+                                      options: KeyformPasteOptions = KeyformPasteOptions()): List<JsonObject> {
+        if (options.channels.isEmpty()) return emptyList()
+        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        val targets = keyformTargets().filter { (t, key) -> onKey(t, key) }.associateBy { it.first.id }
+        val primary = keyformTarget()?.first?.id
+        var problem: String? = null
+        val commands = pairs.flatMap { (clip, destination) ->
+            val (t, key) = targets[destination] ?: return@flatMap emptyList()
+            if (!keyformPasteFits(clip, t.id, options.channels)) return@flatMap emptyList()
+            val points = if (t.id == primary && "geometry" in options.channels) keyformPoints(t).takeIf { it.isNotEmpty() } else null
+            runCatching {
+                KeyformTools.paste(source, clip.snapshot, "${t.kind}:${t.id}", key, points, options.ratio, options.flip, options.channels.toList())
+            }.getOrElse { problem = it.message; emptyList() }
+        }
+        if (keyformPasteProblem != problem) keyformPasteProblem = problem
+        return commands
+    }
+
+    /**
+     * The commands [action] runs on the keys in hand, or empty when it cannot: the pose is off the target's keys, a
+     * reset to rest asks it of a deformer, there is nothing on both sides to interpolate from ([parameter] names the
+     * axis), nothing copied fits, or the target has no keyforms to restore.
+     */
+    internal fun keyformToolCommands(action: KeyformToolAction, parameter: String? = null): List<JsonObject> {
+        if (action == KeyformToolAction.PASTE) return keyformPasteCommands()
+        if (action == KeyformToolAction.RESTORE) {
+            val (t, _) = keyformTarget() ?: return emptyList()
+            if (t.geometry.axes.isEmpty()) return emptyList()
+            return listOf(buildJsonObject { put("op", KeyformTools.RESET); put("target", "${t.kind}:${t.id}"); put("all_keys", true) })
+        }
+        val (t, key) = keyedTarget() ?: return emptyList()
+        when (action) {
+            KeyformToolAction.RESET_REST -> if (t.kind != "mesh") return emptyList()
+            KeyformToolAction.INTERPOLATE -> if (parameter !in keyformInterpolationAxes()) return emptyList()
+            else -> Unit
+        }
+        val points = keyformPoints(t)
+        return listOf(buildJsonObject {
+            if (action == KeyformToolAction.INTERPOLATE) {
+                put("op", KeyformTools.INTERPOLATE); put("target", "${t.kind}:${t.id}"); put("parameter", parameter!!)
+            } else {
+                put("op", KeyformTools.RESET); put("target", "${t.kind}:${t.id}")
+                put("to", if (action == KeyformToolAction.RESET_REST) "rest" else "default")
+            }
+            put("key", JsonObject(key.mapValues { JsonPrimitive(it.value) }))
+            if (points.isNotEmpty()) put("vertices", JsonArray(points.sorted().map(::JsonPrimitive)))
+        })
+    }
+
+    /** Runs [commands] as one history step; says so when they would change nothing. */
+    internal fun runKeyformCommands(commands: List<JsonObject>) {
+        if (!editable || commands.isEmpty()) return
+        val committed = commitBatch(commands)
+        if (!committed && error == null) error = tr("editor.keyform.nothing")
+    }
+
+    /** Runs [action] as one history step. */
+    fun runKeyformTool(action: KeyformToolAction, parameter: String? = null) = runKeyformCommands(keyformToolCommands(action, parameter))
+
+    /** The objects in hand multi-key editing reaches, as `kind:id` references. */
+    fun multiKeyTargets(): List<String> = keyformTargets().map { "${it.first.kind}:${it.first.id}" }
+
+    /** Each parameter the keyforms of [targets] sit on, with its key values. */
+    fun multiKeyAxes(targets: List<String> = multiKeyTargets()): Map<String, List<Float>> {
+        val source = state.previewModel?.rig?.puppet ?: return emptyMap()
+        val axes = LinkedHashMap<String, MutableSet<Float>>()
+        for (ref in targets) for (key in KeyformTools.keyformKeys(source, RigAuthoringJournal.target(source, ref)))
+            for ((id, value) in key) axes.getOrPut(id) { sortedSetOf() } += value
+        return axes.mapValues { it.value.toList() }
+    }
+
+    /** How many keyforms of [targets] lie in [ranges] (per parameter, the values allowed). */
+    fun multiKeyCount(targets: List<String>, ranges: Map<String, Set<Float>>): Int {
+        val source = state.previewModel?.rig?.puppet ?: return 0
+        return targets.sumOf { ref ->
+            KeyformTools.keyformKeys(source, RigAuthoringJournal.target(source, ref)).count { key ->
+                ranges.all { (id, values) -> key[id]?.let { k -> values.any { abs(it - k) <= org.umamo.runtime.eval.EPS_KEY } } ?: true }
+            }
+        }
+    }
+
+
+    /**
+     * Deform's temporary deform tool: a disposable lattice over the picked points (or the whole object) whose control
+     * points carry those points by bilinear interpolation, as a temporary warp does in Live2D editors. Nothing of the
+     * lattice is kept: each drag of one of its points moves the carried points from where they show at the press by
+     * the lattice's own move - so an undo, another key or another author's edit in between is never written back - and
+     * commits that ordinary geometry edit, one history step. The lattice was laid at [key] on workspace [state]; a
+     * press after either changed lays it again over what the canvas shows. Enter, Esc, Done, another target or leaving
+     * Deform ends it. [uv] is each carried point's place in the box the lattice was laid as.
+     */
+    internal data class TemporaryWarp(
+        val targetId: String,
+        val key: Map<String, Float>,
+        val state: String?,
+        val rows: Int,
+        val columns: Int,
+        val lattice: FloatArray,
+        val uv: Map<Int, Pair<Float, Float>>,
+    )
+
+    var temporaryWarp by mutableStateOf<TemporaryWarp?>(null)
+
+    /** [temporaryWarp] while it still applies: in Deform, on the object it was laid over. */
+    fun activeTemporaryWarp(): TemporaryWarp? = temporaryWarp?.takeIf { hierarchyMode == EditHierarchyMode.DEFORM && target()?.id == it.targetId }
+
+    /** The lattice's rows and columns when a temporary warp begins. */
+    var temporaryWarpDivisions by mutableStateOf(2)
+    private var temporaryWarpHandle = -1
+    private var temporaryWarpPressLattice: FloatArray? = null
+    private var temporaryWarpPressWorld: FloatArray? = null
+
+    fun canBeginTemporaryWarp(): Boolean = hierarchyMode == EditHierarchyMode.DEFORM &&
+        target()?.let { it.kind == "mesh" || (it.kind == "warp" && editLevel == 1) } == true
+
+    /** Lays a [temporaryWarpDivisions] lattice over [carried] points of the target in hand (default the picked ones, or all). */
+    fun beginTemporaryWarp(carried: Collection<Int>? = null) {
+        if (!canBeginTemporaryWarp()) return
+        val t = target() ?: return
+        val source = state.previewModel?.rig?.puppet ?: return
+        val world = t.mapping.localToWorld(t.geometry.points)
+        val points = (carried ?: vertices).filter { it < t.count }.ifEmpty { (0 until t.count).toList() }
+        val xs = points.map { world[it * 2] }; val ys = points.map { world[it * 2 + 1] }
+        val padX = max((xs.max() - xs.min()) * 0.05f, 1f); val padY = max((ys.max() - ys.min()) * 0.05f, 1f)
+        val x0 = xs.min() - padX; val x1 = xs.max() + padX; val y0 = ys.min() - padY; val y1 = ys.max() + padY
+        val n = temporaryWarpDivisions.coerceIn(1, 8)
+        val lattice = FloatArray((n + 1) * (n + 1) * 2)
+        for (r in 0..n) for (c in 0..n) {
+            val i = (r * (n + 1) + c) * 2
+            lattice[i] = x0 + (x1 - x0) * c / n; lattice[i + 1] = y0 + (y1 - y0) * r / n
+        }
+        temporaryWarp = TemporaryWarp(t.id, canvasDeformationCoordinate(source, t.geometry.axes, pose, deformationParameters),
+            viewModel.currentWorkspaceState(), n, n, lattice,
+            points.associateWith { ((world[it * 2] - x0) / (x1 - x0)) to ((world[it * 2 + 1] - y0) / (y1 - y0)) })
+    }
+
+    fun endTemporaryWarp() {
+        temporaryWarp = null; temporaryWarpHandle = -1; temporaryWarpPressLattice = null; temporaryWarpPressWorld = null
+    }
+
+    /** A new lattice size: an active temporary warp starts again over what the canvas now shows. */
+    fun changeTemporaryWarpDivisions(n: Int) {
+        temporaryWarpDivisions = n
+        temporaryWarp?.let { warp -> endTemporaryWarp(); beginTemporaryWarp(warp.uv.keys) }
+    }
+
+    /** The lattice's points on screen, row by row. */
+    fun temporaryWarpScreen(viewport: CanvasViewport): List<Offset> = activeTemporaryWarp()?.lattice?.let { lattice ->
+        List(lattice.size / 2) { Offset((viewport.offsetX + lattice[it * 2] * viewport.scale).toFloat(), (viewport.offsetY - lattice[it * 2 + 1] * viewport.scale).toFloat()) }
+    }.orEmpty()
+
+    /** Where [lattice] puts the place [uv] of a lattice of [rows] × [columns], in canvas units. */
+    private fun latticePoint(lattice: FloatArray, rows: Int, columns: Int, uv: Pair<Float, Float>): Pair<Float, Float> {
+        val fu = (uv.first * columns).coerceIn(0f, columns.toFloat()); val fv = (uv.second * rows).coerceIn(0f, rows.toFloat())
+        val c = min(fu.toInt(), columns - 1); val r = min(fv.toInt(), rows - 1)
+        val s = fu - c; val u = fv - r
+        fun at(rr: Int, cc: Int, axis: Int) = lattice[(rr * (columns + 1) + cc) * 2 + axis]
+        fun axis(a: Int) = (at(r, c, a) * (1 - s) + at(r, c + 1, a) * s) * (1 - u) + (at(r + 1, c, a) * (1 - s) + at(r + 1, c + 1, a) * s) * u
+        return axis(0) to axis(1)
+    }
+
+    /**
+     * Takes the press while a temporary warp is in hand: off the lattice it does nothing; on a lattice point it first
+     * brings the pose onto the target's keys, as any deform drag does, and lays the lattice again when the key or the
+     * workspace changed since it was laid; then the drag starts from what the canvas shows now.
+     */
+    private fun pressTemporaryWarp(pos: Offset, viewport: CanvasViewport, shift: Boolean, alt: Boolean, ctrl: Boolean): Boolean {
+        val warp = temporaryWarp ?: return false
+        if (activeTemporaryWarp() == null) { endTemporaryWarp(); return false }
+        val points = temporaryWarpScreen(viewport)
+        val hit = points.indices.minByOrNull { (points[it] - pos).getDistance() }?.takeIf { (points[it] - pos).getDistance() <= 10f } ?: return true
+        val t = target() ?: return true
+        if (viewModel.snapToNearestKeys(t.kind, t.id) { press(pos, viewport, shift, alt, ctrl) }) return true
+        val source = state.previewModel?.rig?.puppet ?: return true
+        val key = canvasDeformationCoordinate(source, t.geometry.axes, pose, deformationParameters)
+        if (key != warp.key || viewModel.currentWorkspaceState() != warp.state) {
+            beginTemporaryWarp(warp.uv.keys)
+            return true
+        }
+        temporaryWarpHandle = hit
+        temporaryWarpPressLattice = warp.lattice.copyOf()
+        temporaryWarpPressWorld = t.mapping.localToWorld(t.geometry.points)
+        targetAtPress = t
+        original = source
+        dragging = true
+        return true
+    }
+
+    private fun moveTemporaryWarp(pos: Offset, viewport: CanvasViewport) {
+        val warp = temporaryWarp ?: return
+        val t = targetAtPress ?: return; val source = original ?: return
+        val pressLattice = temporaryWarpPressLattice ?: return; val pressWorld = temporaryWarpPressWorld ?: return
+        val lattice = warp.lattice.copyOf()
+        lattice[temporaryWarpHandle * 2] = ((pos.x - viewport.offsetX) / viewport.scale).toFloat()
+        lattice[temporaryWarpHandle * 2 + 1] = -((pos.y - viewport.offsetY) / viewport.scale).toFloat()
+        temporaryWarp = warp.copy(lattice = lattice)
+        // Each carried point moves from where it shows now by the lattice's move at its place.
+        val world = pressWorld.copyOf()
+        for ((i, place) in warp.uv) {
+            val (nx, ny) = latticePoint(lattice, warp.rows, warp.columns, place)
+            val (px, py) = latticePoint(pressLattice, warp.rows, warp.columns, place)
+            world[i * 2] += nx - px; world[i * 2 + 1] += ny - py
+        }
+        // Glued points are not merged here: in Deform, as for every keyed drag, the glue pulls them together when the
+        // model is evaluated.
+        val moved = warp.uv.keys
+        val cmd = geometryCommand(t, t.mapping.worldToLocal(world, t.geometry.points, moved))
+        preview = RigAuthoringJournal.apply(source, cmd); pending = cmd
+    }
+
+    private fun releaseTemporaryWarp() {
+        temporaryWarpHandle = -1; temporaryWarpPressLattice = null; temporaryWarpPressWorld = null
+        dragging = false
+        targetAtPress = null; original = null
+        val cmd = pending
+        if (cmd == null) { preview = null; return }
+        val committed = commitBatch(listOf(cmd)) {
+            // The lattice now matches what the workspace holds.
+            temporaryWarp = temporaryWarp?.copy(state = viewModel.currentWorkspaceState())
+        }
+        if (!committed) preview = null
+    }
+
+    /** Whether a drag of picked points carries the points around them: Deform's point tools with [softSelection] on. */
+    fun softSelectionActive(): Boolean = softSelection && hierarchyMode == EditHierarchyMode.DEFORM &&
+        (tool in SELECTION_TOOLS || tool == CanvasTool.TRANSFORM) &&
+        // A warp's lattice points are what it picks only at the vertex level; its Bezier handles take no soft drag.
+        target()?.let { it.kind != "warp" || editLevel == 1 } != false
+
+    private var softReachKey: List<Any?>? = null
+    private var softReach: Map<String, FloatArray> = emptyMap()
+
+    /**
+     * How far each point would follow the picked ones, by target id, for the overlay's reach rings: the weights the drag
+     * in hand uses, else those a drag would. Kept while nothing it reads changes, as the overlay asks on every frame.
+     */
+    fun softSelectionReach(viewport: CanvasViewport): Map<String, FloatArray> {
+        if (!softSelectionActive()) return emptyMap()
+        if (boxDrag && softWeightsAtPress.isNotEmpty()) return objectTargets.zip(softWeightsAtPress).mapNotNull { (t, w) -> w?.let { t.id to it } }.toMap()
+        val t = target()?.takeIf { it.kind != "rotation" } ?: return emptyMap()
+        val picked = vertices
+        if (picked.isEmpty()) return emptyMap()
+        val key = listOf(state.previewModel?.rig?.puppet, pose, viewport, softRadius, brushFalloff, picked, t.id, editLevel)
+        if (key != softReachKey) {
+            softReach = mapOf(t.id to softSelectionWeights(screen(t.geometry.points, t, viewport), picked, (softRadius * viewport.scale).toFloat(), brushFalloff))
+            softReachKey = key
+        }
+        return softReach
+    }
+
+    /**
      * Runs a topology op on the mesh selection.
      *
      * The selection afterwards is "what the op made", which the op knows and the journal does not carry -
@@ -3798,7 +4891,8 @@ internal class CanvasEditor(
      * and marks the provisional fill. It is a pure function, so the answer the reducer computes is the
      * same one; see CanvasTopology.
      */
-    fun topology(action: String, picked: Set<Int>? = null, edges: Set<MeshElement.Edge> = emptySet()) {
+    fun topology(action: String, picked: Set<Int>? = null, edges: Set<MeshElement.Edge> = emptySet(),
+                 anchors: List<MeshRefinementOps.KnifeAnchor> = emptyList(), select: Set<Int>? = null) {
         val t = target() ?: return
         if (t.kind != "mesh" || !editable) return
         gestureState = null
@@ -3822,7 +4916,10 @@ internal class CanvasEditor(
             }
         }
         val selected = picked ?: vertices
-        val chosenEdges = if (edges.isNotEmpty()) edges else if (action in setOf("subdivide", "split")) {
+        val chosenEdges = if (edges.isNotEmpty()) edges else if (action == "delete_edges") {
+            // Only edges picked as edges: a vertex or face selection does not name the edges to delete.
+            if (elementMode == 1) selectedEdges else emptySet()
+        } else if (action in setOf("subdivide", "split")) {
             when (elementMode) {
                 1 -> selectedEdges
                 2 -> selectedFaces.flatMapTo(LinkedHashSet()) { face ->
@@ -3834,13 +4931,150 @@ internal class CanvasEditor(
         // Against state.previewModel, which is what commitBatch compiles against - not `model`, which
         // prefers the in-flight `preview` and would disagree with the reducer mid-drag.
         val mesh = state.previewModel?.rig?.puppet?.drawables?.firstOrNull { it.id.raw == t.id }?.mesh
-        val outcome = mesh?.let { runCatching { CanvasTopology.build(it, action, selected, edges = chosenEdges) }.getOrNull() }
+        // The pre-check runs here, on the UI thread, so a mesh too large to answer at once skips it: the reducer still
+        // refuses what does not apply, and the selection afterwards is simply empty.
+        val source = state.previewModel?.rig?.puppet
+        val prejudged = mesh != null && (action !in MANUAL_TOPOLOGY || mesh.triangleCount <= PREJUDGE_TRIANGLES)
+        val outcome = if (!prejudged || mesh == null) null else runCatching {
+            CanvasTopology.build(mesh, action, selected, anchors, chosenEdges) { source?.let { CanvasTopology.shapes(it, DrawableId(t.id)) } ?: MeshShapes() }
+        }.getOrNull()
+        // Refused before it is sent, so the notice names the op instead of the reducer's failure.
+        if (prejudged && outcome == null && action in MANUAL_TOPOLOGY) {
+            error = tr("editor.topologyRefused.$action")
+            return
+        }
         commitBatch(listOf(buildJsonObject { put("op", "canvas_topology"); put("id", t.id); put("action", action); put("vertices", JsonArray(selected.map(::JsonPrimitive)))
-            if (chosenEdges.isNotEmpty()) put("edges", JsonArray(chosenEdges.map { JsonArray(listOf(JsonPrimitive(it.endpointLow), JsonPrimitive(it.endpointHigh))) })) })) {
-            vertices = CanvasTopology.selectedVertices(outcome)
+            if (chosenEdges.isNotEmpty()) put("edges", JsonArray(chosenEdges.map { JsonArray(listOf(JsonPrimitive(it.endpointLow), JsonPrimitive(it.endpointHigh))) }))
+            if (anchors.isNotEmpty()) put("anchors", CanvasTopology.encodeAnchors(anchors)) })) {
+            vertices = select ?: CanvasTopology.selectedVertices(outcome)
             selectedEdges = emptySet(); selectedFaces = emptySet()
             topologyFills = CanvasTopology.createdFaces(outcome).takeIf { it.isNotEmpty() }?.let { TopologyFill(t.id, it) }
         }
+    }
+
+    /** Where a point-tool press lands: on a vertex, on an edge (with its rest-space point), or free in rest space. */
+    private sealed interface PointSpot {
+        data class Vertex(val index: Int) : PointSpot
+        data class Edge(val edge: MeshElement.Edge, val rest: MeshRefinementOps.KnifeAnchor.AtPoint) : PointSpot
+        data class Free(val rest: MeshRefinementOps.KnifeAnchor.AtPoint) : PointSpot
+    }
+
+    /**
+     * Resolves [pos] for the point tool through the knife's screen-space snap: a vertex within [knifeSnapRadius] wins,
+     * then an edge, else a free point. Points are journalled in the rest mesh's space, so a point placed while a pose
+     * is shown lands where it was clicked at that pose. [hover] also moves the snap marker.
+     */
+    private fun pointSpot(pos: Offset, t: CanvasTarget, viewport: CanvasViewport, hover: Boolean = false): PointSpot {
+        val points = screen(t.geometry.points, t, viewport)
+        val geometry = t.geometry.base
+        fun mark(at: Offset, kind: String?) { if (hover) { knifeHover = at; knifeSnapKind = kind } }
+        val nearest = points.indices.minByOrNull { (points[it] - pos).getDistance() }
+        if (nearest != null && (points[nearest] - pos).getDistance() <= knifeSnapRadius) {
+            mark(points[nearest], "vertex")
+            return PointSpot.Vertex(nearest)
+        }
+        val edge = MeshTopology.uniqueEdges(t.indices).map { edge ->
+            val a = points[edge.endpointLow]; val b = points[edge.endpointHigh]
+            val fraction = CanvasGestureGeometry.project(pos, a, b)
+            Triple(edge, fraction, a + (b - a) * fraction)
+        }.minByOrNull { (it.third - pos).getDistance() }
+        if (edge != null && (edge.third - pos).getDistance() <= knifeSnapRadius) {
+            mark(edge.third, "edge")
+            val a = edge.first.endpointLow * 2; val b = edge.first.endpointHigh * 2
+            return PointSpot.Edge(edge.first, MeshRefinementOps.KnifeAnchor.AtPoint(
+                geometry[a] + (geometry[b] - geometry[a]) * edge.second, geometry[a + 1] + (geometry[b + 1] - geometry[a + 1]) * edge.second))
+        }
+        mark(pos, null)
+        val (x, y) = local(pos, t, viewport)
+        val rest = runCatching { DeformPathTools.bind(t.geometry.points, t.indices, x, y).position(t.geometry.base) }.getOrElse { x to y }
+        return PointSpot.Free(MeshRefinementOps.KnifeAnchor.AtPoint(rest.first, rest.second))
+    }
+
+    /** [pos] reflected across the vertical centre line of the mesh as it is shown, for the point tool's mirror option. */
+    private fun mirrored(pos: Offset, t: CanvasTarget, viewport: CanvasViewport): Offset {
+        val points = screen(t.geometry.points, t, viewport)
+        val axis = ((points.minOfOrNull { it.x } ?: pos.x) + (points.maxOfOrNull { it.x } ?: pos.x)) / 2f
+        return Offset(2f * axis - pos.x, pos.y)
+    }
+
+    private fun pressMeshPoint(pos: Offset, t: CanvasTarget, viewport: CanvasViewport, shift: Boolean, alt: Boolean) {
+        val spot = pointSpot(pos, t, viewport)
+        val twin = if (pointMirror) pointSpot(mirrored(pos, t, viewport), t, viewport) else null
+        when {
+            alt && spot is PointSpot.Vertex -> {
+                val removed = setOf(spot.index) + setOfNotNull((twin as? PointSpot.Vertex)?.index)
+                topology("delete", picked = removed)
+            }
+            alt && spot is PointSpot.Edge -> {
+                val edges = setOf(spot.edge) + setOfNotNull((twin as? PointSpot.Edge)?.edge)
+                topology("delete_edges", picked = emptySet(), edges = edges)
+            }
+            alt -> Unit
+            shift && spot is PointSpot.Vertex && vertices.size == 1 && spot.index !in vertices -> {
+                // Connecting walks on from the vertex just reached, so Shift-clicks draw a chain of edges.
+                topology("connect", picked = setOf(vertices.single(), spot.index), select = setOf(spot.index))
+            }
+            spot is PointSpot.Vertex -> {
+                vertices = if (shift) vertices + spot.index else if (spot.index in vertices) vertices else setOf(spot.index)
+                selectedEdges = emptySet(); selectedFaces = emptySet()
+                if (shift) return
+                val source = state.previewModel?.rig?.puppet ?: return
+                // The select tool's grab: glued partners move with the point instead of tearing off.
+                beginTransformDrag(source, transformTargets(source), BoundingHandle.BODY,
+                    if (editsMeshes()) selectionFrame(viewport) else transformFrame(viewport), viewport)
+            }
+            else -> {
+                targetAtPress = t; original = model; dragging = true
+                pointStroking = true
+                pointStroke = listOf(pos)
+            }
+        }
+    }
+
+    /**
+     * Lays the point tool's vertices: one at a click, or one every [pointSpacing] canvas pixels along a stroke, plus
+     * their mirror images when [pointMirror] is on. Points that land on an existing vertex are dropped; the rest go
+     * in as one `add_points` command, so the whole stroke is one history step.
+     */
+    private fun commitPointStroke(stroke: List<Offset>) {
+        val t = target() ?: return
+        val viewport = viewport ?: return
+        if (stroke.isEmpty() || t.kind != "mesh" || !editable) return
+        val spacing = (pointSpacing * viewport.scale).toFloat().coerceAtLeast(4f)
+        val samples = ArrayList<Offset>().apply { add(stroke.first()) }
+        var carried = 0f
+        for (index in 1 until stroke.size) {
+            val a = stroke[index - 1]; val b = stroke[index]
+            val length = (b - a).getDistance()
+            var at = spacing - carried
+            while (at <= length) { samples += a + (b - a) * (at / length); at += spacing }
+            carried = (carried + length) % spacing
+        }
+        if (stroke.size > 1 && (stroke.last() - samples.last()).getDistance() >= spacing * 0.5f) samples += stroke.last()
+        val placed = samples + if (pointMirror) samples.map { mirrored(it, t, viewport) } else emptyList()
+        val anchors = placed.mapNotNull { at ->
+            when (val spot = pointSpot(at, t, viewport)) {
+                is PointSpot.Edge -> spot.rest
+                is PointSpot.Free -> spot.rest
+                is PointSpot.Vertex -> null
+            }
+        }
+        if (anchors.isEmpty()) return
+        topology("add_points", picked = emptySet(), anchors = anchors)
+    }
+
+    /** Deletes what the selection holds in Edit mode: the selected edges in edge mode, otherwise the selected vertices. */
+    fun deleteMeshSelection() {
+        if (elementMode == 1 && selectedEdges.isNotEmpty()) topology("delete_edges", picked = emptySet(), edges = selectedEdges)
+        else topology("delete")
+    }
+
+    /** Selects the target mesh's outline vertices, or with [inner] every vertex off the outline. */
+    fun selectOutline(inner: Boolean = false) {
+        val t = target()?.takeIf { it.kind == "mesh" } ?: return
+        val outline = MeshManualOps.outlineVertices(t.indices)
+        vertices = if (inner) (0 until t.geometry.base.size / 2).filterTo(LinkedHashSet()) { it !in outline } else outline
+        selectedEdges = emptySet(); selectedFaces = emptySet()
     }
 
     /** Commits the knife polyline. All or nothing - see [MeshRefinementOps.knifeCut]. */
@@ -4018,6 +5252,11 @@ internal class CanvasEditor(
     }
 
     fun selectAll(invert: Boolean = false) {
+        // Paint selects pixels: Ctrl+A takes the whole layer, Ctrl+I turns the selection inside out.
+        if (hierarchyMode == EditHierarchyMode.PAINT) {
+            if (invert) invertPaintSelection() else selectAllPaint()
+            return
+        }
         if (objectMode) {
             objects = state.effectiveVisibleLayerIds.filter { (!invert || it !in objects) && target(model, it, null) != null }.toSet()
             selectLayer(objects.lastOrNull())
@@ -4061,6 +5300,18 @@ internal class CanvasEditor(
         val adjacency = MeshTopology.buildVertexAdjacency(t.count, t.indices)
         vertices = vertices.flatMap { MeshTopology.connectedVertices(adjacency, it) }.toSet()
     }
+
+    /** The interior tool's handles, guides and the line being drawn. */
+    val interiorTool = InteriorCanvasTool(this)
+
+    /** The feature tool's handles on the fitted eyes, brows and mouth. */
+    val featureTool = FeatureCanvasTool(this)
+
+    /** Esc with the feature tool: drops the handle held, leaving its move as it was. */
+    fun cancelFeature(): Boolean = featureTool.cancel().also { if (it) dragging = false }
+
+    /** Esc with the interior tool: its own gesture steps back first, without ending the audition the way [cancel] does. */
+    fun cancelInterior(): Boolean = interiorTool.cancel().also { if (it) dragging = false }
 
     /** The swing handle under a drag; the swing session itself lives on the view model. */
     var swingHandle by mutableStateOf<io.github.psd2live.core.SwingGizmo.Handle?>(null)
@@ -4174,7 +5425,7 @@ internal class CanvasEditor(
     private fun meshDrawableId(layerOrDrawableId: String): String? {
         val puppet = preview ?: state.previewModel?.rig?.puppet ?: return null
         val rig = state.previewModel?.rig ?: return null
-        val byLayer = puppet.drawables.firstOrNull { rig.layerIdByDrawableId[it.id.raw] == layerOrDrawableId && it.mesh != null }
+        val byLayer = puppet.drawables.firstOrNull { rig.ownLayerIdByDrawableId[it.id.raw] == layerOrDrawableId && it.mesh != null }
         if (byLayer != null) return byLayer.id.raw
         return puppet.drawables.firstOrNull { it.id.raw == layerOrDrawableId && it.mesh != null }?.id?.raw
     }
@@ -4838,7 +6089,7 @@ internal class CanvasEditor(
         val ring = mutableListOf<HierarchyPick>()
         val seen = mutableSetOf<String>()
         layerCandidates(pos, viewport).forEach { layerId ->
-            val drawable = source.drawables.firstOrNull { preview.rig.layerIdByDrawableId[it.id.raw] == layerId }
+            val drawable = source.drawables.firstOrNull { preview.rig.ownLayerIdByDrawableId[it.id.raw] == layerId }
             if (drawable != null && seen.add("mesh:$layerId")) ring += HierarchyPick(layerId = layerId)
             var parent = drawable?.parentDeformerId
             while (parent != null) {
@@ -4949,6 +6200,9 @@ internal class CanvasEditor(
         // Every point of every target, indexed by vertex index; [dragIndices] picks the ones that move.
         initialScreenPoints = targets.map { screen(it.geometry.points, it, viewport) }
         dragIndices = targets.map { gestureIndices(it) }
+        softWeightsAtPress = if (softSelectionActive()) targets.indices.map { i ->
+            softSelectionWeights(initialScreenPoints[i], dragIndices[i], (softRadius * viewport.scale).toFloat(), brushFalloff)
+        } else emptyList()
         currentDragBounds = bounds
         frameAngleAtPress = frame?.angleDeg ?: frameAngle
         framePivotAtPress = pivot
@@ -4964,7 +6218,7 @@ internal class CanvasEditor(
         if (space) return false
         if (viewModel.isSnappingParameters) return true
         this.viewport = viewport
-        error = null; gestureState = viewModel.currentWorkspaceState(); start = pos; previous = pos; dragStartPos = pos
+        error = null; gestureState = viewModel.currentWorkspaceState(); start = pos; previous = pos; dragStartPos = pos; snapAnchor = null
         moved = false; additive = shift; subtractive = alt; pressedObject = null
         ctrlAtPress = ctrl
 
@@ -4993,6 +6247,27 @@ internal class CanvasEditor(
             return true
         }
 
+        // The interior tool's handles and guides own its presses, and a press on its mesh or empty canvas starts a fold
+        // line. A press on another object picks it, as object mode does, so the handles move to it.
+        // The feature tool's handles own their presses; a press elsewhere does nothing.
+        if (tool == CanvasTool.FEATURE) {
+            dragging = featureTool.press(pos, viewport, alt) && featureTool.dragging
+            return true
+        }
+        if (tool == CanvasTool.INTERIOR) {
+            if (interiorTool.press(pos, viewport, ctrl, alt)) {
+                dragging = interiorTool.dragging
+                return true
+            }
+            val pick = objectPick(pos, viewport, ctrl = false)
+            if (pick == null) { error = interiorTool.missing(); return true }
+            deselectSkeleton()
+            applyObjectPick(pick, null)
+            return true
+        }
+        // A temporary warp owns the canvas until it ends: a press off its lattice does nothing.
+        if (pressTemporaryWarp(pos, viewport, shift, alt, ctrl)) return true
+
         // 0. The pose tool turns bones; a press off every bone does nothing, so a stray click cannot
         //    select or move points while the tool is armed.
         if (posing()) {
@@ -5003,7 +6278,7 @@ internal class CanvasEditor(
         // 0. Paint Mode (L1 raster paint engine). Paint has no select/transform tool — anything else
         //    that somehow stays armed is a no-op rather than falling into point-edit gestures.
         if (hierarchyMode == EditHierarchyMode.PAINT) {
-            if (tool !in PAINT_TOOLS) return true
+            if (tool !in PAINT_TOOLS || paintWorking) return true
             val layerId = paintSession?.layerId ?: state.selectedLayerId ?: targetLayerId(paintTarget()) ?: return true
             val session = ensurePaintSession(layerId) ?: return true
             val t = target(layerId = layerId, deformerId = null) ?: paintTarget()
@@ -5024,7 +6299,8 @@ internal class CanvasEditor(
                 // Picking a colour rather than drawing one: the eyedropper's own gesture, and what Alt
                 // does to every paint tool. The pick follows the pointer for as long as the button is
                 // down, so a colour can be scrubbed for instead of guessed at in one click.
-                tool == CanvasTool.PAINT_EYEDROPPER || alt -> {
+                tool == CanvasTool.PAINT_TRANSFORM -> pressPaintTransform(pos, viewport)
+                tool == CanvasTool.PAINT_EYEDROPPER || (alt && tool != CanvasTool.PAINT_SELECT) -> {
                     isSampling = true
                     // Alt means two different things here, as it does in Photoshop: on the eyedropper it
                     // fills in the secondary colour, while Alt over any other tool is the eyedropper
@@ -5034,8 +6310,9 @@ internal class CanvasEditor(
                 }
                 tool == CanvasTool.PAINT_BUCKET -> {
                     if (canvasPos != null) {
-                        session.bucket(canvasPos.first, canvasPos.second, paintColor, paintTolerance,
-                            tr("editor.paint.strokeFill"))
+                        val color = paintColor; val tolerance = paintTolerance; val name = tr("editor.paint.strokeFill")
+                        val contiguous = paintContiguous; val lockAlpha = paintLockAlpha
+                        paintInBackground { session.bucket(canvasPos.first, canvasPos.second, color, tolerance, name, contiguous, lockAlpha) }
                     }
                     isPainting = false
                     dragging = false
@@ -5047,8 +6324,13 @@ internal class CanvasEditor(
                     // is the one the user is watching for.
                     session.beginStroke()
                     lastPaintBitmapAt = 0L
-                    applyLiveSegment(pos, pos, erase = tool == CanvasTool.PAINT_ERASER)
+                    paintStabilizerInHand = io.github.psd2live.core.PaintStabilizer(paintStabilizer).also { it.add(pos.x, pos.y) }
+                    // Shift + click goes on in a straight line from where the last stroke ended, as in Photoshop.
+                    val lineFrom = paintLastEnd.takeIf { shift }
+                    if (lineFrom != null) paintCanvasSegment(lineFrom, canvasPoint(pos, viewport), erase = tool == CanvasTool.PAINT_ERASER)
+                    else applyLiveSegment(pos, pos, erase = tool == CanvasTool.PAINT_ERASER)
                 }
+                tool == CanvasTool.PAINT_SELECT -> pressPaintSelect(pos, viewport, shift, alt)
                 else -> {
                     // The shape tool: the live gesture is previewed on the overlay and lands on release,
                     // because a shape is committed when its second corner is.
@@ -5108,9 +6390,9 @@ internal class CanvasEditor(
             return true
         }
 
-        // 1b. The knife is a click tool, not a drag: each press drops one anchor and the polyline is
-        //     committed with Enter. It never sets `dragging`, so no stray move can commit anything.
-        if (tool == CanvasTool.KNIFE) {
+        // 1b. The point tool's line is a click gesture, not a drag: each press drops one anchor and the polyline
+        //     is committed with Enter. It never sets `dragging`, so no stray move can commit anything.
+        if (knifing) {
             val t = target()
             if (t != null && t.kind == "mesh") {
                 if (t.id != knifeDrawableId) {
@@ -5125,6 +6407,14 @@ internal class CanvasEditor(
                     knifeDraft = knifeDraft + anchor
                 }
             }
+            return true
+        }
+
+        // 1c. Hand placement. A press on a vertex grabs it as the select tool does; anywhere else it starts a stroke
+        //     that lays new vertices on release. Shift connects, Alt deletes, both on the spot under the pointer.
+        if (pointing) {
+            val t = target()
+            if (t != null && t.kind == "mesh" && editable) pressMeshPoint(pos, t, viewport, shift, alt)
             return true
         }
 
@@ -5396,8 +6686,16 @@ internal class CanvasEditor(
         weightAltHeld = alt
         if (!dragging || busy) return
         swingHandle?.let { handle -> dragSwing(handle, pos, viewport); previous = pos; return }
+        if (interiorTool.dragging) { interiorTool.move(pos, viewport); previous = pos; return }
+        if (featureTool.dragging) { featureTool.move(pos, viewport); previous = pos; return }
         moved = moved || (pos - start).getDistance() > 2f
         if (!moved) return
+
+        if (temporaryWarpHandle >= 0) {
+            moveTemporaryWarp(pos, viewport)
+            previous = pos
+            return
+        }
 
         if (poseDrag != null) {
             dragPose(pos, viewport, ik = shift)
@@ -5409,6 +6707,12 @@ internal class CanvasEditor(
             selectionFrame(viewport)?.let { frame ->
                 transformAnchor = frame.anchorDraggedTo(pos)?.let { anchorKey() to it }
             }
+            return
+        }
+
+        if (pointStroking) {
+            if ((pos - (pointStroke.lastOrNull() ?: pos)).getDistance() >= 2f) pointStroke = pointStroke + pos
+            previous = pos
             return
         }
 
@@ -5437,8 +6741,14 @@ internal class CanvasEditor(
             if (isSampling) {
                 pickColorAt(pos, viewport, secondary = samplingSecondary)
             } else if (tool in PAINT_BRUSH_TOOLS) {
-                applyLiveSegment(lastPaintPoint ?: pos, pos, erase = tool == CanvasTool.PAINT_ERASER)
-                lastPaintPoint = pos
+                // The stabilizer's tip trails the pointer; with it off the tip is the pointer.
+                val tipAt = paintStabilizerInHand?.add(pos.x, pos.y)?.let { Offset(it.first, it.second) } ?: pos
+                applyLiveSegment(lastPaintPoint ?: tipAt, tipAt, erase = tool == CanvasTool.PAINT_ERASER)
+                lastPaintPoint = tipAt
+            } else if (tool == CanvasTool.PAINT_SELECT) {
+                movePaintSelect(pos, viewport)
+            } else if (tool == CanvasTool.PAINT_TRANSFORM) {
+                movePaintTransform(pos, viewport, shift, alt)
             }
             return
         }
@@ -5516,6 +6826,7 @@ internal class CanvasEditor(
         }
 
         val t = targetAtPress ?: return; val source = original ?: return
+        @Suppress("NAME_SHADOWING") val pos = snappedDrag(pos, t, viewport)
 
         try {
             if (boxDrag) {
@@ -5546,6 +6857,18 @@ internal class CanvasEditor(
                         world[i * 2] = ((dest.x - viewport.offsetX) / viewport.scale).toFloat()
                         world[i * 2 + 1] = -((dest.y - viewport.offsetY) / viewport.scale).toFloat()
                         moved += i
+                    }
+                    // Soft selection: each point around the picked ones takes its share of the move its own place makes.
+                    softWeightsAtPress.getOrNull(itemIndex)?.let { weights ->
+                        for (i in pressPoints.indices) {
+                            val w = weights.getOrElse(i) { 0f }
+                            if (i in indices || w <= 0f) continue
+                            val full = result?.destination(pressPoints[i]) ?: (pressPoints[i] + delta)
+                            val dest = pressPoints[i] + (full - pressPoints[i]) * w
+                            world[i * 2] = ((dest.x - viewport.offsetX) / viewport.scale).toFloat()
+                            world[i * 2 + 1] = -((dest.y - viewport.offsetY) / viewport.scale).toFloat()
+                            moved += i
+                        }
                     }
                     moved
                 }
@@ -5618,14 +6941,17 @@ internal class CanvasEditor(
             // Brush gestures use the captured neutral session above. This is the select-tool translation.
             val base = t.geometry.points
             val points = screen(base, t, viewport); val world = t.mapping.localToWorld(base)
-            val affected = vertices.filter { it in points.indices }.toSet()
+            val picked = vertices.filter { it in points.indices }.toSet()
             val delta = pos - start
+            if (picked.isEmpty()) { previous = pos; return }
+            // Soft selection carries the points around the picked ones by their share of the move.
+            val weights = if (softSelectionActive()) softSelectionWeights(points, picked, (softRadius * viewport.scale).toFloat(), brushFalloff) else null
+            val affected = if (weights == null) picked else points.indices.filterTo(HashSet()) { weights[it] > 0f }
             for (i in affected) {
-                val destination = points[i] + delta
+                val destination = points[i] + delta * (weights?.get(i) ?: 1f)
                 world[i * 2] = ((destination.x - viewport.offsetX) / viewport.scale).toFloat()
                 world[i * 2 + 1] = -((destination.y - viewport.offsetY) / viewport.scale).toFloat()
             }
-            if (affected.isEmpty()) { previous = pos; return }
             val cmd = geometryCommand(t, t.mapping.worldToLocal(world, base, affected), effectiveCtrl)
             preview = RigAuthoringJournal.apply(source, cmd); pending = cmd; previous = pos
         } catch (e: Exception) { error = e.message }
@@ -5639,9 +6965,23 @@ internal class CanvasEditor(
             activeHandle = BoundingHandle.NONE
             return
         }
+        if (temporaryWarpHandle >= 0) {
+            releaseTemporaryWarp()
+            return
+        }
         if (swingHandle != null) {
             swingHover = swingHandle
             swingHandle = null
+            dragging = false
+            return
+        }
+        if (interiorTool.dragging) {
+            interiorTool.release()
+            dragging = false
+            return
+        }
+        if (featureTool.dragging) {
+            featureTool.release()
             dragging = false
             return
         }
@@ -5650,6 +6990,16 @@ internal class CanvasEditor(
             dragging = false
             return
         }
+        if (pointStroking) {
+            pointStroking = false
+            dragging = false
+            val stroke = pointStroke
+            pointStroke = emptyList()
+            targetAtPress = null; original = null
+            commitPointStroke(stroke)
+            return
+        }
+
         if (subdividing) {
             subdividing = false
             dragging = false
@@ -5690,7 +7040,8 @@ internal class CanvasEditor(
             val session = paintSession
             val vp = viewport
 
-            if (session != null && vp != null) {
+            // The gesture ends here whatever landing it throws: the error is shown and the tool is free again.
+            try { if (session != null && vp != null) {
                 val clip = java.awt.Rectangle(0, 0, session.docWidth, session.docHeight)
                 when {
                     isSampling -> Unit // a pick draws nothing, so there is no stroke to record
@@ -5700,10 +7051,21 @@ internal class CanvasEditor(
                         val toolName = when (tool) {
                             CanvasTool.PAINT_ERASER -> tr("editor.paint.strokeEraser")
                             CanvasTool.PAINT_PENCIL -> tr("editor.paint.strokePencil")
+                            CanvasTool.PAINT_BLUR -> tr("editor.paint.strokeBlur")
                             else -> tr("editor.paint.strokeBrush")
                         }
+                        // The stabilized tip catches up with where the pointer came up.
+                        paintStabilizerInHand?.finish()?.forEach { (x, y) ->
+                            val tipAt = Offset(x, y)
+                            applyLiveSegment(lastPaintPoint ?: tipAt, tipAt, erase = tool == CanvasTool.PAINT_ERASER)
+                            lastPaintPoint = tipAt
+                        }
+                        paintStabilizerInHand = null
                         session.recordStroke(toolName)
                     }
+                    tool == CanvasTool.PAINT_SELECT -> releasePaintSelect(vp)
+                    tool == CanvasTool.PAINT_TRANSFORM -> paintTransformHandle = null
+                    tool == CanvasTool.PAINT_GRADIENT -> releasePaintGradient(vp)
                     tool == CanvasTool.PAINT_SHAPE -> {
                         val s = paintStrokeStart
                         val c = paintStrokeCurrent
@@ -5719,20 +7081,21 @@ internal class CanvasEditor(
                             val y1 = floor(p1.second).toInt()
                             val shapeStrokeWidth = (paintSize / paintPixelsPerUnit).coerceIn(1f, 512f)
                             session.shape(x0, y0, x1, y1, shape, paintColor, paintOpacity,
-                                shapeStrokeWidth, paintShapeFilled && shape.canFill, tr(shape.strokeLabelKey))
+                                shapeStrokeWidth, paintShapeFilled && shape.canFill, tr(shape.strokeLabelKey), paintLockAlpha)
                         }
                     }
                     else -> {}
                 }
+            } } finally {
+                isSampling = false
+                isPainting = false
+                paintStrokeStart = null
+                paintStrokeCurrent = null
+                paintStabilizerInHand = null
+                dragging = false
+                targetAtPress = null
+                original = null
             }
-
-            isSampling = false
-            isPainting = false
-            paintStrokeStart = null
-            paintStrokeCurrent = null
-            dragging = false
-            targetAtPress = null
-            original = null
             return
         }
 
@@ -5741,7 +7104,7 @@ internal class CanvasEditor(
         dragging = false; ctrlAtPress = false; axis = null; activeHandle = BoundingHandle.NONE
         initialBounds = null
         initialScreenPoints = emptyList()
-        boxDrag = false; dragIndices = emptyList()
+        boxDrag = false; dragIndices = emptyList(); softWeightsAtPress = emptyList()
         activeBrushWeights = null; activeBrushCenter = null; endMeshStroke()
         endPathDrag()
 
@@ -5916,6 +7279,22 @@ internal class CanvasEditor(
     }
 }
 
+/**
+ * Soft selection's share of a move for each of [points] (on screen): 1 for the [picked] ones, and for the rest the
+ * [falloff] of their distance to the nearest picked point over [radius], 0 beyond it.
+ */
+internal fun softSelectionWeights(points: List<Offset>, picked: Set<Int>, radius: Float, falloff: BrushFalloff): FloatArray {
+    val anchors = picked.filter { it in points.indices }.map { points[it] }
+    return FloatArray(points.size) { i ->
+        if (i in picked) 1f
+        else if (anchors.isEmpty() || radius <= 0f) 0f
+        else {
+            val distance = anchors.minOf { (it - points[i]).getDistance() }
+            if (distance >= radius) 0f else brushWeight(distance, radius, 0f, falloff, i)
+        }
+    }
+}
+
 internal fun brushWeight(distance: Float, radius: Float, hardness: Float, falloff: BrushFalloff = BrushFalloff.SMOOTH, seed: Int = 0): Float {
     val x = ((distance / radius.coerceAtLeast(1f) - hardness) / (1f - hardness.coerceAtMost(0.95f))).coerceIn(0f, 1f)
     return falloff.weight(1f - x, seed)
@@ -5923,6 +7302,18 @@ internal fun brushWeight(distance: Float, radius: Float, hardness: Float, fallof
 
 /** Travel in raw px that equals one `]` press (one 1.2x step) in the Alt + right-drag radius gesture. */
 private const val BRUSH_RADIUS_STEP_PX = 12f
+
+/** How near the first point, in screen pixels, a click closes the polygon lasso. */
+private const val POLYGON_CLOSE_PX = 8f
+
+/** The most points a lasso request carries ([io.github.psd2live.application.WorkspacePaintSessionSchemas.selection]). */
+private const val LASSO_MAX_POINTS = 4096
+
+/** How near, in screen pixels, a press must come to a free transform handle to take it. */
+private const val PAINT_TRANSFORM_HANDLE_PX = 8f
+
+/** How far, in screen pixels, the quick selection brush moves before the stretch since the last piece is selected. */
+private const val QUICK_SELECT_STEP_PX = 12f
 
 /** The brush size limit on documents smaller than this. */
 private const val MIN_BRUSH_SIZE_LIMIT = 512f

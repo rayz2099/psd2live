@@ -20,10 +20,11 @@ internal object RigGenerationChange {
     }
 
     private fun settingsChanged(before: PipelineConfig, after: PipelineConfig): Boolean =
+        before.deferRig != after.deferRig || before.rigPendingLayerIds != after.rigPendingLayerIds ||
         before.meshOnly != after.meshOnly || (!before.meshOnly && before.generateDeformers) != (!after.meshOnly && after.generateDeformers) ||
             before.featureDisplacementEnabled != after.featureDisplacementEnabled || before.mouthOutlineEnabled != after.mouthOutlineEnabled ||
             before.mouthShape != after.mouthShape || before.mouthCurve != after.mouthCurve || before.mouthColor != after.mouthColor ||
             before.mouthThickness != after.mouthThickness ||
             ((!before.meshOnly || !after.meshOnly) && (before.headTurnStrength != after.headTurnStrength || before.bodyStrength != after.bodyStrength)) ||
-            before.rigTuning != after.rigTuning
+            before.rigTuning != after.rigTuning || before.recipe != after.recipe
 }

@@ -8,7 +8,8 @@ home: project_import_psd project_create project_import_cmo3 project_open
 target-version-selection: project_export_model settings_update
 file-menu: project_open project_save project_save_as project_import_psd project_export_model project_export_target
 modeling-menu: rig_update_generation workspace_preview_regeneration project_import_cmo3 source_split_components rig_generate
-mesh-edit-menu: canvas_topology layer_mesh_rebuild layer_mesh_update source_split_components source_split_depth
+mesh-edit-menu: canvas_topology mesh_get_topology layer_mesh_rebuild layer_mesh_update source_split_components source_split_depth
+hittest: hit_area_put hit_area_delete hit_area_preset hit_area_list hit_area_test
 about-viewarea: view_render_model view_render_context
 preview-canvas: preview_set preview_playback preview_playback_get preview_physics view_sample_motion
 solo: canvas_visibility canvas_visibility_get
@@ -20,6 +21,7 @@ palametorpalatte: parameter_create parameter_update parameter_delete preview_set
 layers-palette: layer_classify layer_tag layer_set_variant layer_mark_reference layer_reorder layer_restore
 timelinepalatte: motion_list motion_get motion_create motion_set_key motion_pose motion_put
 history-palette: history_list history_checkout history_annotation_put history_checkpoint view_compare_history
+convert-id: object_convert_id object_find object_rename
 divide-the-material: layer_tag layer_classify source_split_components
 reimport-psd: project_import_psd layer_classify layer_tag layer_set_variant
 precautions-for-psd-data: layer_classify layer_tag
@@ -39,15 +41,20 @@ parts: workspace_overview workspace_inspect rig_edit_structure
 edit-parts: rig_edit_structure object_edit_appearance
 edit-parts-sketch: layer_mark_reference layer_pin_reference
 variants: layer_set_variant
+copy-and-paste: object_paste rig_edit_structure
+search-and-replace: object_find object_rename
 draworder: layer_draw_order rig_edit_structure
 concept-of-artmesh: workspace_inspect view_render_layer
 mesh-edit: layer_mesh_update layer_mesh_rebuild
-mesh-edit-manual: canvas_topology
+mesh-edit-manual: canvas_topology mesh_get_topology layer_mesh_structure
+random-pose: preview_set preview_reset
+guide-function: canvas_guides_get canvas_guides_set
+mesh-duplication: mesh_duplicate layer_mesh_rebuild
 clipping-mask: rig_edit_structure
 reversed-mask: rig_edit_structure
-sketch: material_mark_reference layer_place layer_mark_reference layer_pin_reference reference_place_grid layout_set_reference
+sketch: material_mark_reference layer_place layer_mark_reference layer_pin_reference reference_place_grid layout_set_reference layout_add_reference layout_order_reference reference_set_mode reference_set_opacity
 blend-mode: rig_edit_structure
-interior-shape: interior_put interior_delete
+interior-shape: interior_put interior_delete layer_mesh_structure layer_mesh_structure_preview
 deformer: workspace_overview workspace_inspect canvas_warp canvas_rotation
 making-and-placement-of-warp-deformer: canvas_warp rig_create_warp warp_set_topology warp_get_controls warp_bezier_divisions warp_bezier_reset
 making-and-rotation-of-rotationdeformer: canvas_rotation rig_deform workspace_inspect
@@ -60,6 +67,7 @@ parameter: workspace_inspect preview_set preview_reset parameter_create
 edit-parameters: parameter_update author_axis keyform_apply parameter_create
 parameter-modifyication: parameter_update parameter_create parameter_delete rig_edit_structure
 standard-parameter-list: workspace_overview workspace_inspect
+repeat: parameter_update parameter_create motion_sample
 copy-and-paste-parameter-values: snapshot_create snapshot_apply snapshot_list snapshot_update snapshot_delete snapshot_get
 how-to-choose: workspace_inspect workspace_overview
 how-to-edit: rig_deform canvas_deform_stroke keyform_apply author_axis
@@ -74,6 +82,12 @@ skinning: skeleton_draft_open skeleton_draft_edit skeleton_draft_preview_transfe
 skeleton: skeleton_auto skeleton_get skeleton_draft_open skeleton_draft_commit skeleton_pose preview_pose
 generated-overrides: workspace_inspect rig_update_generation workspace_preview_regeneration swing_delete
 motion-mirroring: keyform_apply author_axis
+copy-and-blend-shape: keyform_apply
+paste-form-special: keyform_apply
+confirm-target-for-pasting-multiple-forms: keyform_apply
+restore-deformer-shape: keyform_apply
+multi-key: keyform_apply
+temporary-deform-tool: rig_deform
 deform-brush: canvas_deform_stroke
 blend-shape: parameter_create keyform_apply rig_deform
 multiply-color-screen-color: rig_edit_structure keyform_apply workspace_inspect
@@ -82,14 +96,20 @@ builtin-motions: motion_preset motion_seed_builtin motion_duplicate motion_list
 eye-blink-settings: motion_preset settings_update
 timeline-basic-operation-timelinepalette: motion_pose motion_set_key motion_properties motion_remove_curve preview_pose preview_playback
 timeline-basic-operation-dopesheet: motion_move_keys motion_delete_keys motion_paste_keys motion_set_key motion_delete_key
+parameter-bookmark: timeline_bookmark_set timeline_aids_get
+timeline-basic-operation-shy: timeline_shy_set timeline_aids_get
+freeze: timeline_freeze_set timeline_aids_get
+timeline-basic-operation-repeat: parameter_update motion_set_key motion_sample
 grapheditor: motion_replace_keys motion_set_key motion_sample motion_get
+marker: timeline_marker_put timeline_marker_delete timeline_aids_get
 about-fade: motion_properties
 fade-setting: motion_properties
 notes-for-sdk: project_export_model view_sample_motion motion_list
+loop-editing-support: motion_close_loop motion_properties motion_get
 exporting-images: project_export_target view_sample_motion
 export-moc3-motion3-files: project_export_model settings_update job_wait
 other-formats: project_export_target project_export_psd job_wait
-userdata: rig_edit_structure workspace_inspect project_export_model
+userdata: rig_edit_structure workspace_inspect motion_set_event motion_delete_event project_export_model
 switch-viewer-setting: physics_config preview_physics
 physics-operation: physics_simulate preview_physics workspace_overview
 physical-operation-setting: physics_put physics_fit author_physics physics_apply_preset physics_audition physics_preset_list
@@ -98,6 +118,11 @@ simulation: simulation_put simulation_bake model_apply_preset vertex_group_paint
 external-application-integration: workspace_inspect workspace_overview workspace_list_operations
 external-application-integration-api: workspace_list_operations workspace_get_operation workspace_apply_edits workspace_preview_edits job_wait job_get
 external-application-integration-api-list: workspace_list_operations workspace_get_operation
+pose-setting: pose_get pose_add_group pose_set_group pose_delete_group pose_update pose_put pose_clear
+facial-expression-system: expression_list expression_get expression_set_entries expression_reset expression_put
+create-facial-expressions: expression_create expression_capture snapshot_list preview_set
+setting-and-exporting-facial-expressions: expression_update expression_set_entries expression_move expression_duplicate expression_delete project_export_model
+userdata-event-information: motion_events motion_set_event rig_edit_structure
 t-eye-blink: settings_update rig_deform canvas_deform_stroke keyform_apply layer_tag preview_set
 t-mouth-aiueo: settings_update rig_deform canvas_deform_stroke keyform_apply preview_set
 t-psd: project_import_psd layer_tag layer_classify source_split_components

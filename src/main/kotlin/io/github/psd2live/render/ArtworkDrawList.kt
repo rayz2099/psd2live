@@ -3,6 +3,9 @@ package io.github.psd2live.render
 import io.github.psd2live.core.RigPreviewModel
 import io.github.psd2live.core.RigCanvasSupport
 import org.umamo.render.eval.DeformedGeometry
+import org.umamo.runtime.model.AlphaBlendMode
+import org.umamo.runtime.model.BlendMode
+import org.umamo.runtime.model.ColorRgb
 import org.umamo.runtime.model.DrawableId
 
 /**
@@ -12,7 +15,13 @@ import org.umamo.runtime.model.DrawableId
  * @property opacity     Final opacity, the drawable's own times the pass alpha and any dimming.
  * @property tintColor   ARGB colour washed over the mesh's triangles after it is drawn, 0 for none.
  * @property tintAlpha   Strength of that wash.
- * @property maskIds     Meshes whose triangles clip this one; empty draws it unclipped.
+ * @property maskIds     Meshes whose opaque texels (alpha at least one half) clip this one; empty draws it unclipped.
+ * @property maskPages   The atlas page of each of [maskIds].
+ * @property invertMask  The part shows only outside its masks instead of inside them.
+ * @property blendMode   Colour blend with what is under the mesh.
+ * @property alphaBlend  Alpha blend with what is under the mesh.
+ * @property multiply    Multiply colour, applied to the texels' straight colour before [screen].
+ * @property screen      Screen colour.
  */
 internal class ArtworkDraw(
 	val drawableId: DrawableId,
@@ -21,7 +30,21 @@ internal class ArtworkDraw(
 	val tintColor: Int,
 	val tintAlpha: Float,
 	val maskIds: List<DrawableId>,
-)
+	val maskPages: IntArray = IntArray(0),
+	val invertMask: Boolean = false,
+	val blendMode: BlendMode = BlendMode.Normal,
+	val alphaBlend: AlphaBlendMode = AlphaBlendMode.Over,
+	val multiply: ColorRgb = ColorRgb.MultiplyIdentity,
+	val screen: ColorRgb = ColorRgb.ScreenIdentity,
+) {
+	/**
+	 * Whether premultiplied fixed-function blending draws the mesh exactly: normal over, and the pre-5.3 add and
+	 * multiply under any alpha blend. Every other pair composites against a copy of what is under it.
+	 */
+	val fixedFunction: Boolean get() = (alphaBlend == AlphaBlendMode.Over && blendMode.isLegacy) || blendMode.ignoresAlphaBlend
+
+	val tinted: Boolean get() = multiply != ColorRgb.MultiplyIdentity || screen != ColorRgb.ScreenIdentity
+}
 
 /** How strongly a hovered part is washed with its component colour. */
 const val HOVER_TINT_STRENGTH = 0.35f
@@ -61,13 +84,16 @@ internal object ArtworkDrawList {
 			val page = model.rig.pageByDrawableId[drawable.id.raw] ?: drawable.texturePage
 			val tinted = options.tintColor != 0 && options.tintLayerIds != null &&
 				((layerId != null && layerId in options.tintLayerIds) || drawable.id.raw in options.tintLayerIds)
-			// An inverted mask has always drawn unclipped on the editing canvas; the preview shows it exactly.
-			val masks = if (drawable.maskedBy.isEmpty() || drawable.invertMask) emptyList()
+			val masks = if (drawable.maskedBy.isEmpty()) emptyList()
 				else drawable.maskedBy.filter { id ->
 					val source = byId[id]
 					source != null && source.isVisible && source.mesh != null && id in geometry.worldPositions
 				}
-			out += ArtworkDraw(drawable.id, page, opacity, if (tinted) options.tintColor else 0, options.tintAlpha, masks)
+			val maskPages = IntArray(masks.size) { model.rig.pageByDrawableId[masks[it].raw] ?: byId.getValue(masks[it]).texturePage }
+			out += ArtworkDraw(drawable.id, page, opacity, if (tinted) options.tintColor else 0, options.tintAlpha, masks, maskPages,
+				invertMask = masks.isNotEmpty() && drawable.invertMask, blendMode = drawable.blendMode, alphaBlend = drawable.alphaBlendMode,
+				multiply = geometry.multiplyColor[drawable.id] ?: ColorRgb.MultiplyIdentity,
+				screen = geometry.screenColor[drawable.id] ?: ColorRgb.ScreenIdentity)
 		}
 		return out
 	}

@@ -54,6 +54,8 @@ data class LayerSemantic(
 	val type: LayerType = LayerType.PRESET,
 	val parameter: String = "",
 	val switchId: Int = 0,
+	/** What the layer is within its part - a highlight, a shadow, a lower lash ([PartRole]); null when it is the part itself. */
+	val role: PartRole? = null,
 )
 
 data class ClassifiedLayer(
@@ -209,6 +211,12 @@ data class PipelineConfig(
 	val bodyStrength: Float = 1f,
 	/** How far the body parameters move the body at their full values (see [RigTuning]). */
 	val rigTuning: RigTuning = RigTuning(),
+	/**
+	 * How the rig is built area by area: each area's base and the modules switched off or adjusted
+	 * ([io.github.psd2live.core.recipe.RigModules]). A new project is modern; one saved before the registry reads as
+	 * legacy and generates as it did.
+	 */
+	val recipe: io.github.psd2live.core.recipe.RigRecipe = io.github.psd2live.core.recipe.RigRecipe.Modern,
 	val meshOnly: Boolean = false,
 	val generateDeformers: Boolean = true,
 	val featureDisplacementEnabled: Boolean = false,
@@ -217,6 +225,19 @@ data class PipelineConfig(
     val mouthCurve: io.github.psd2live.core.MouthCurve = io.github.psd2live.core.MouthCurve.preset("smile"),
     val mouthColor: Int? = null,
     val mouthThickness: Float = 1.5f,
+	/**
+	 * Copy the eyebrows over the bangs, half seen through the hair ([SeeThroughLayers]). A document saved before the
+	 * setting copies nothing.
+	 */
+	val seeThroughBrows: Boolean = true,
+	/**
+	 * Show every part of the eyes through the bangs as well - whites, irides and highlights, lashes, closed-eye lines
+	 * ([SeeThroughLayers]). A document saved before the setting, or by 3.6.5 when it named only the eye lines and was
+	 * off by default, keeps what it saved.
+	 */
+	val seeThroughEyes: Boolean = true,
+	/** The opacity of the copies over the bangs. */
+	val seeThroughOpacity: Float = SeeThroughLayers.DEFAULT_OPACITY,
 	val exportMotions: Boolean = true,
 	/** The basic motions (idle, blink, nod, shake) as a group: off, the model has none of them. */
 	val motionBasic: Boolean = true,
@@ -263,8 +284,12 @@ data class PipelineConfig(
 	val layerVisibility: Map<String, Boolean> = emptyMap(),
 	/** Layers deleted by the user, excluded from atlas packing and rigging. */
 	val deletedLayerIds: Set<String> = emptySet(),
-	/** Builds art without a visible pixel too, as the placement preview of a project not yet generated does. */
+	/** Editable workspaces may have no artwork or visible pixels. */
 	val allowEmptyArt: Boolean = false,
+	/** Layers with editable meshes whose semantic rig has not been generated yet. */
+	val rigPendingLayerIds: Set<String> = emptySet(),
+	/** An empty Layout workspace also has no automatic rig until generation is requested. */
+	val deferRig: Boolean = false,
 	/** Manual parent deformer overrides (layerId or deformerId -> parentDeformerId or null for root). */
 	val parentOverrides: Map<String, String?> = emptyMap(),
 	/** Manual draw order overrides (layerId or drawableId -> drawOrder within 0..1000). */
@@ -326,6 +351,11 @@ data class LayerClassificationOverride(
 	val side: Side = Side.NONE,
 	val parameter: String = "",
 	val switchId: Int = 0,
+	/**
+	 * The layer's [PartRole] as the user set it: null leaves it to the analysis ([PartRoles]), [PartRole.PLAIN] says it
+	 * has none.
+	 */
+	val role: PartRole? = null,
 ) {
 	constructor(tag: SemanticTag, side: Side) : this(
 		type = LayerType.PRESET,
@@ -334,6 +364,10 @@ data class LayerClassificationOverride(
 		parameter = "",
 		switchId = 0,
 	)
+
+	/** Written into revision identities: an override without a role reads as it did before roles existed. */
+	override fun toString(): String = "LayerClassificationOverride(type=$type, tag=$tag, side=$side, parameter=$parameter, switchId=$switchId" +
+		(role?.let { ", role=$it" } ?: "") + ")"
 
 	/** Factories over semantic tags live beside [LayerTags]. */
 	companion object
@@ -505,26 +539,26 @@ data class RigPreviewModel(
 	 */
 	val generationAtlas: PackedAtlas? = null,
 	/**
-	 * The model of the generated layers alone, when this one also shows layers placed since the last generation as
-	 * plain meshes ([io.github.psd2live.project.WorkspaceGeneration]); generation, replay and export read it.
-	 */
-	val layoutBase: RigPreviewModel? = null,
-	/** A placement preview of a project not yet generated: plain meshes, no rig to edit or export. */
-	val layoutPreview: Boolean = false,
-	/**
 	 * The reference layers this model shows as bare quads: the artwork pass skips them and the canvas draws their
-	 * pixels on their own, under or over the model. Never in [layoutBase], so never generated or exported.
+	 * pixels on their own, under or over the model.
 	 */
 	val referenceLayerIds: Set<String> = emptySet(),
 ) {
-	/** The model generation and export read: [layoutBase] when this one shows pending layers, else this one. */
-	val generated: RigPreviewModel get() = layoutBase ?: this
-
 	/**
 	 * The generated rig the document's edits replay onto. A model built from a stored authored rig generates it only
 	 * when something asks for it.
 	 */
 	val baseRig: BuiltRig get() = sources.base
+
+	/**
+	 * [BuiltRig.layerIdByDrawableId] keyed by the IDs base generation gives the meshes: the journal's ID conversions
+	 * ([RigIdConversion]) rename them again where they replay, so what pins a mesh's ID for a regeneration names it
+	 * as it was before them.
+	 */
+	val stableLayerIdByDrawableId: Map<String, String> get() {
+		val back = config.rigEdits.idRenames.of("mesh").entries.associate { (from, to) -> to to from }
+		return if (back.isEmpty()) rig.ownLayerIdByDrawableId else rig.ownLayerIdByDrawableId.mapKeys { (id, _) -> back[id] ?: id }
+	}
 
 	/** The authored state of [config]'s edits ([AuthoredRig]): stored, or replayed from [baseRig]. */
 	internal val authored: AuthoredRig get() = sources.authored(config.rigEdits)

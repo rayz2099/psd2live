@@ -1,5 +1,7 @@
 package io.github.psd2live.ui.views
 
+import io.github.psd2live.ui.components.AppDropdownMenu
+import io.github.psd2live.ui.theme.Spacing
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -32,6 +34,7 @@ import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.graphics.toArgb
 import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -108,6 +111,7 @@ import io.github.psd2live.ui.tutorial.tutorialTarget
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.material.DropdownMenu
 import io.github.psd2live.ui.state.AppSettings
+import io.github.psd2live.ui.state.WindowMode
 import io.github.psd2live.ui.state.AppPrompt
 import io.github.psd2live.ui.components.ModalDialogFrame
 import io.github.psd2live.ui.components.ModalMessage
@@ -135,7 +139,11 @@ import javax.swing.JOptionPane
 import androidx.compose.ui.input.key.Key
 import io.github.psd2live.ui.theme.Motion
 import io.github.psd2live.ui.theme.handCursor
-@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+/**
+ * The editor in this window. The canvases find their window's GPU through [LocalAwtWindow]; this window provides it
+ * unless an enclosing one already did (the app's main window does), so a window made elsewhere (the development
+ * tools' own) draws its canvases on the GPU as the app does instead of quietly in software.
+ */
 @Composable
 fun FrameWindowScope.PSD2LiveApp(
 	viewModel: PSD2LiveViewModel,
@@ -147,6 +155,20 @@ fun FrameWindowScope.PSD2LiveApp(
 		window?.dispose()
 	},
 ) {
+	androidx.compose.runtime.CompositionLocalProvider(LocalAwtWindow provides (LocalAwtWindow.current ?: this.window)) {
+		PSD2LiveAppContent(viewModel, window, windowState, agentMcp, onCloseRequest)
+	}
+}
+
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+private fun FrameWindowScope.PSD2LiveAppContent(
+	viewModel: PSD2LiveViewModel,
+	window: ComposeWindow?,
+	windowState: WindowState?,
+	agentMcp: AgentMcpController?,
+	onCloseRequest: () -> Unit,
+) {
 	val state by viewModel.uiState
 	val baking by viewModel.simulationBaking.collectAsState()
 	val download by viewModel.modelDownloadState.collectAsState()
@@ -154,6 +176,13 @@ fun FrameWindowScope.PSD2LiveApp(
 	val task = io.github.psd2live.ui.state.taskProgress(state, baking, download, projectProgress)
 	var tutorial by remember { mutableStateOf(InteractiveTutorialState()) }
 	val tutorialTargets = rememberTutorialTargetRegistry()
+	// The performance overlay draws outside Compose, in the theme's colours.
+	val overlayColors = LocalToolColors.current
+	LaunchedEffect(overlayColors) {
+		io.github.psd2live.render.PerformanceOverlay.palette = io.github.psd2live.render.PerformanceOverlay.Palette(
+			overlayColors.panelElevated.copy(alpha = 0.92f).toArgb(), overlayColors.border.toArgb(), overlayColors.textPrimary.toArgb(),
+			overlayColors.textMuted.toArgb(), overlayColors.accent.toArgb(), overlayColors.warning.toArgb())
+	}
 
 	fun startInteractiveTutorial(id: TutorialId = TutorialId.BASIC, path: TutorialPath = TutorialPath.defaultFor(id)) {
 		// The steps point into the dock, which the pages cover.
@@ -189,9 +218,11 @@ fun FrameWindowScope.PSD2LiveApp(
     val recovery by viewModel.recoveryOffer.collectAsState()
     LaunchedEffect(recovery) {
         val session = recovery ?: return@LaunchedEffect
-        val choice = JOptionPane.showOptionDialog(window, tr("recovery.message", session.name), tr("recovery.title"),
-            JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, arrayOf(tr("recovery.restore"), tr("recovery.discard")),
-            tr("recovery.restore"))
+        val choice = outsideFrame {
+            JOptionPane.showOptionDialog(window, tr("recovery.message", session.name), tr("recovery.title"),
+                JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null, arrayOf(tr("recovery.restore"), tr("recovery.discard")),
+                tr("recovery.restore"))
+        }
         // Closing the prompt throws nothing away: the marker stays until this session's own unsaved edits replace it.
         when (choice) {
             0 -> viewModel.restoreRecoveredSession(session)
@@ -199,7 +230,10 @@ fun FrameWindowScope.PSD2LiveApp(
             else -> viewModel.recoveryOffer.value = null
         }
     }
-    LaunchedEffect(state.projectFile, state.projectDirty) { window?.title = "PSD2Live — " + (state.projectFile ?: tr("project.untitled")) + if (state.projectDirty) " *" else "" }
+    LaunchedEffect(state.projectFile, state.projectDirty) {
+        window?.title = "PSD2Live — " + (state.projectFile ?: tr("project.untitled")) + if (state.projectDirty) " *" else ""
+        window?.let { io.github.psd2live.ui.utils.MacShell.setDocumentEdited(it, state.projectDirty) }
+    }
     // Language key tracking for recomposition
 	val currentLanguage = state.currentLanguage
 
@@ -211,7 +245,10 @@ fun FrameWindowScope.PSD2LiveApp(
 		// Canvases draw on the GPU in this window's Skia context when it draws with OpenGL.
 		window?.let(io.github.psd2live.render.SkiaGpu::capturePrimary)
 		val api = window?.let { runCatching { it.renderApi.name }.getOrNull() } ?: return@LaunchedEffect
-		viewModel.addLog(tr("log.renderer.window", api), level = if (api == "SOFTWARE") LogLevel.WARNING else LogLevel.INFO, tag = "Render")
+		viewModel.addLog(tr("log.renderer.window", api), level = if (api.startsWith("SOFTWARE")) LogLevel.WARNING else LogLevel.INFO, tag = "Render")
+		io.github.psd2live.render.GraphicsSettings.appliedEnvironment.takeIf { it.isNotEmpty() }?.let { environment ->
+			viewModel.addLog(tr("log.renderer.environment", environment.entries.joinToString(" ") { "${it.key}=${it.value}" }), tag = "Render")
+		}
 	}
 	val canvasRenderer by io.github.psd2live.render.SkiaGpu.status.collectAsState()
 	LaunchedEffect(canvasRenderer) {
@@ -456,6 +493,7 @@ fun FrameWindowScope.PSD2LiveApp(
 				ShortcutAction.ZOOM_RESET -> { viewModel.resetZoom(); true }
 				ShortcutAction.OPEN_SETTINGS -> { viewModel.togglePage(AppPage.SETTINGS); true }
 				ShortcutAction.OPEN_HELP -> { viewModel.togglePage(AppPage.HELP); true }
+				ShortcutAction.TOGGLE_FULLSCREEN -> { AppSettings.toggleFullscreen(); true }
 				else -> {
 					// The nine tab-jump actions share one body. A null index means this is a
 					// canvas action, which this handler does not own.
@@ -465,12 +503,14 @@ fun FrameWindowScope.PSD2LiveApp(
 			}
 		}
 
+		val windowMode by AppSettings.windowModeFlow.collectAsState()
 		Box(Modifier.fillMaxSize()) {
 		CompositionLocalProvider(LocalTutorialTargets provides tutorialTargets, LocalAgentMcp provides agentMcp) {
 		Box(
 			modifier = Modifier
 				.fillMaxSize()
-				.border(BorderStroke(1.dp, colors.border))
+				// The outline marks a window's edge on the desktop; filling the screen, it would draw a line along it.
+				.then(if (windowMode == WindowMode.WINDOWED) Modifier.border(BorderStroke(1.dp, colors.border)) else Modifier)
 				.onPreviewKeyEvent { event ->
 					if (tutorialShown && event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
 						stopInteractiveTutorial()
@@ -530,6 +570,34 @@ fun FrameWindowScope.PSD2LiveApp(
 							hostsHierarchy = "hierarchy" in modules,
 						)
 					}
+					if (io.github.psd2live.ui.utils.MacShell.active && window != null) {
+						io.github.psd2live.ui.utils.MacShell.Host(
+							window = window,
+							isBusy = isBusy,
+							hasInput = hasInput,
+							recentFiles = state.recentFiles,
+							darkTheme = state.darkTheme,
+							onStartScreen = { viewModel.showStartPage(StartSection.GENERATE) },
+							onOpenProject = onOpenProjectAction,
+							onOpenPsd = onOpenPsdAction,
+							onOpenRecent = viewModel::openRecentFile,
+							onClearRecent = viewModel::clearRecentFiles,
+							onSave = { viewModel.requestProjectSave() },
+							onSaveAs = { viewModel.requestProjectSave(true) },
+							onExport = { if (hasInput && !isBusy) viewModel.openExportDialog() },
+							onExportUnity = { if (hasInput && !isBusy) viewModel.openOtherExport("unity") },
+							onNewLayout = { viewModel.showStartPage(StartSection.LAYOUT) },
+								onUndo = { runAppAction(ShortcutAction.UNDO) },
+								onRedo = { runAppAction(ShortcutAction.REDO) },
+							onZoomIn = { viewModel.zoomIn() },
+							onZoomOut = { viewModel.zoomOut() },
+							onResetZoom = { viewModel.resetZoom() },
+							onToggleTheme = { viewModel.toggleDarkTheme() },
+							onShowSettings = { viewModel.togglePage(AppPage.SETTINGS) },
+							onOpenHelp = { viewModel.showPage(AppPage.HELP, HELP_CONTENT) },
+							onShowHistory = { viewModel.showHistoryModule() },
+						)
+					}
 					AppTitleBar(
 						window = window,
 						windowState = windowState,
@@ -568,6 +636,8 @@ fun FrameWindowScope.PSD2LiveApp(
 						onShowTextureUpscale = { viewModel.openTextureUpscaleDialog() },
 						onStartScreen = { viewModel.showStartPage(StartSection.GENERATE) },
 						onMeshSplitScan = { viewModel.requestMeshSplitScan() },
+						onFindReplace = { viewModel.openObjectDialog(PSD2LiveViewModel.ObjectDialog.FIND_REPLACE) },
+						onConvertIds = { viewModel.openObjectDialog(PSD2LiveViewModel.ObjectDialog.CONVERT_IDS) },
 						canUpdateGeneration = viewModel.canUpdateGeneration(state),
 						onUpdateGeneration = { viewModel.updateGeneration() },
 						onPreviewGenerationUpdate = { viewModel.previewGenerationUpdate() },
@@ -604,12 +674,12 @@ fun FrameWindowScope.PSD2LiveApp(
 					modifier = Modifier
 						.weight(1f)
 						.fillMaxWidth()
-						.padding(horizontal = 8.dp),
+						.padding(start = Spacing.Margin, end = Spacing.Margin, bottom = Spacing.Gap),
 				) {
 					DockWorkspaceView(
 						state,
 						viewModel,
-						Modifier.weight(1f).fillMaxWidth().padding(top = 2.dp),
+						Modifier.weight(1f).fillMaxWidth(),
 						window,
 						onOpenTutorialCatalog = { openTutorialCatalog() },
 						onStartTutorial = { startInteractiveTutorial(it) },
@@ -853,13 +923,10 @@ private fun StatusBar(
 				)
 			}
 
-			DropdownMenu(
+			AppDropdownMenu(
 				expanded = showZoomMenu,
 				onDismissRequest = { showZoomMenu = false },
-				modifier = Modifier
-					.background(colors.panelElevated)
-					.border(BorderStroke(1.dp, colors.border))
-					.widthIn(min = 210.dp, max = 280.dp),
+				modifier = Modifier.widthIn(min = 210.dp, max = 280.dp),
 			) {
 				AppMenuHeader(tr("menu.view.category.zoom"))
 				AppMenuItem(
@@ -939,3 +1006,15 @@ private fun copyToClipboard(text: String) {
 	DesktopUtils.copyToClipboard(text)
 }
 
+/**
+ * Runs [prompt] (a modal dialog) as its own event, after the frame this coroutine resumed in. Effects run inside
+ * Skiko's render of a frame, and on Linux it holds the window's drawing-surface lock (the AWT lock) there: a modal
+ * loop entered there leaves the dialog blank and the whole application frozen.
+ */
+private suspend fun <T> outsideFrame(prompt: () -> T): T = kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+    javax.swing.SwingUtilities.invokeLater {
+        if (!continuation.isActive) return@invokeLater
+        val result = runCatching(prompt)
+        continuation.resumeWith(result)
+    }
+}

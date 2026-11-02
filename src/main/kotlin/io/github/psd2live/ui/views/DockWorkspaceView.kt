@@ -1,5 +1,7 @@
 package io.github.psd2live.ui.views
 
+import io.github.psd2live.ui.theme.Spacing
+import io.github.psd2live.ui.theme.Corners
 import io.github.psd2live.ui.views.physics.PhysicsPanelView
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -46,7 +48,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.*
 import io.github.psd2live.i18n.tr
-import io.github.psd2live.ui.components.ViewOptionsMenuItems
+import io.github.psd2live.ui.state.AppSettings
+import io.github.psd2live.ui.state.CanvasViewContent
 import io.github.psd2live.ui.state.*
 import io.github.psd2live.ui.theme.*
 import io.github.psd2live.ui.tutorial.TutorialTargetId
@@ -347,7 +350,7 @@ internal fun DockWorkspaceView(
     Box(modifier) {
         Column(Modifier.fillMaxSize().background(colors.windowBackground)) {
             Row(
-				Modifier.fillMaxWidth().height(28.dp).tutorialTarget(TutorialTargetId.WORKSPACE_STRIP),
+				Modifier.fillMaxWidth().height(26.dp).tutorialTarget(TutorialTargetId.WORKSPACE_STRIP),
 				verticalAlignment = Alignment.CenterVertically,
 			) {
                 // The strip shows no pose; its chips' positioning callbacks would ask for the whole window on each.
@@ -372,6 +375,8 @@ internal fun DockWorkspaceView(
                 )
                 Spacer(Modifier.width(4.dp))
             }
+            // The tabs (22 dp in the 26 dp strip) end 2 dp above the strip's edge: the rest of the margin to the panels.
+            Spacer(Modifier.height(Spacing.Margin - 2.dp))
             if (page != null) key(page) {
                 val pageSession = pageSessions.getOrPut(page) { DockSession(pageDockRoot(page, viewModel.pageArrangement(page))) }
                 PageDock(page, pageSession, Modifier.weight(1f).fillMaxWidth(), mainWindow, state, viewModel, pageActions)
@@ -401,6 +406,12 @@ internal fun DockWorkspaceView(
         viewModel.pendingDepthSplit?.takeIf { it.workspaceId == workspace.id }?.let { offer ->
             io.github.psd2live.ui.components.DepthSplitDialog(offer,
                 onConfirm = viewModel::confirmDepthSplit, onDismiss = viewModel::dismissDepthSplit)
+        }
+        io.github.psd2live.ui.components.KeyformDialogHost()
+        if (state.activeWorkspace.id == workspace.id) when (viewModel.objectDialog) {
+            PSD2LiveViewModel.ObjectDialog.FIND_REPLACE -> io.github.psd2live.ui.components.FindReplaceDialog(state, viewModel)
+            PSD2LiveViewModel.ObjectDialog.CONVERT_IDS -> io.github.psd2live.ui.components.ConvertIdsDialog(state, viewModel)
+            null -> Unit
         }
         viewModel.pendingMeshSplit?.let { offer ->
             io.github.psd2live.ui.components.MeshSplitDialog(
@@ -560,16 +571,16 @@ private fun DockTree(node: DockNode, session: DockSession, modifier: Modifier, w
                 ) { change, delta ->
                     change.consume()
                     val movement = if (node.horizontal) delta.x else delta.y
-                    session.resizeDividers(mapOf(node.id to movement), window, with(density) { 4.dp.toPx() })
+                    session.resizeDividers(mapOf(node.id to movement), window, with(density) { Spacing.Gap.toPx() })
                 }
             }
             if (node.horizontal) Row(Modifier.fillMaxSize()) {
                 DockTree(node.first, session, Modifier.weight(node.ratio).fillMaxHeight(), window, state, viewModel, content)
-                Box(splitter.width(4.dp).fillMaxHeight())
+                Box(splitter.width(Spacing.Gap).fillMaxHeight())
                 DockTree(node.second, session, Modifier.weight(1f - node.ratio).fillMaxHeight(), window, state, viewModel, content)
             } else Column(Modifier.fillMaxSize()) {
                 DockTree(node.first, session, Modifier.weight(node.ratio).fillMaxWidth(), window, state, viewModel, content)
-                Box(splitter.height(4.dp).fillMaxWidth())
+                Box(splitter.height(Spacing.Gap).fillMaxWidth())
                 DockTree(node.second, session, Modifier.weight(1f - node.ratio).fillMaxWidth(), window, state, viewModel, content)
             }
         }
@@ -604,9 +615,9 @@ private fun DockTree(node: DockNode, session: DockSession, modifier: Modifier, w
             }
         }
     }) {
-        Column(Modifier.fillMaxSize().clipWithoutLayer(RoundedCornerShape(3.dp))
+        Column(Modifier.fillMaxSize().clipWithoutLayer(RoundedCornerShape(Corners.Panel))
             .background(colors.panelBackground)
-            .border(.5.dp, colors.divider, RoundedCornerShape(3.dp))) {
+            .border(1.dp, colors.divider, RoundedCornerShape(Corners.Panel))) {
             val single = node.modules.size == 1
             if (single) {
                 DockHeader(node.selected, session, Modifier.fillMaxWidth(), state, viewModel, standalone = true)
@@ -626,9 +637,9 @@ private fun DockTree(node: DockNode, session: DockSession, modifier: Modifier, w
                 DockSide.CENTER -> if (node.modules.size == 1) Modifier.fillMaxWidth().height(22.dp).align(Alignment.TopCenter) else null
             }
             if (highlight != null) {
-                Box(highlight.padding(3.dp).clip(RoundedCornerShape(3.dp))
+                Box(highlight.padding(3.dp).clip(RoundedCornerShape(Corners.Control))
                     .background(colors.accent.copy(alpha = .14f))
-                    .border(1.dp, colors.accent.copy(alpha = .85f), RoundedCornerShape(3.dp)))
+                    .border(1.dp, colors.accent.copy(alpha = .85f), RoundedCornerShape(Corners.Control)))
             }
         }
     }
@@ -868,7 +879,7 @@ private fun DockJunctionOverlay(root: DockNode, session: DockSession, window: ja
     val density = LocalDensity.current
     val colors = LocalToolColors.current
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        val gap = with(density) { 4.dp.roundToPx().toFloat() }
+        val gap = with(density) { Spacing.Gap.roundToPx().toFloat() }
         val handle = 12.dp
         val halfHandle = with(density) { handle.toPx() / 2 }
         val junctions = dockJunctions(root, constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat(), gap)
@@ -968,7 +979,7 @@ private fun DockHeader(id: String, session: DockSession, modifier: Modifier,
     val tab = !standalone && !floating
     Row(modifier.height(22.dp)
         .then(if (id == "history") Modifier.tutorialTarget(TutorialTargetId.HISTORY_TAB) else Modifier)
-        .clip(if (standalone) RoundedCornerShape(0.dp) else RoundedCornerShape(topStart = 3.dp, topEnd = 3.dp))
+        .clip(if (standalone) RoundedCornerShape(0.dp) else RoundedCornerShape(topStart = Corners.Control, topEnd = Corners.Control))
         .hoverable(interaction)
         .background(when {
             standalone -> if (hovered) colors.controlHover else colors.panelElevated
@@ -1023,13 +1034,18 @@ private fun DockHeader(id: String, session: DockSession, modifier: Modifier,
                     },
                 )
                 TabStripDropdown(expanded = viewMenu, onDismissRequest = { viewMenu = false }) {
-                    ViewOptionsMenuItems(
+                    val editor = viewModel.canvasEditorFor(canvas.id)
+                    val pins by AppSettings.canvasRailFlow.collectAsState()
+                    CanvasViewMenuItems(
                         options = canvas.view,
                         onOptionsChange = { viewModel.setCanvasViewOptions(canvas.id, it, canvas.mode) },
                         onDismiss = { viewMenu = false },
-                        showHeaders = true,
-                        showPathGuides = canvas.mode == CanvasMode.EDIT,
-                        showSelectionFocus = canvas.mode == CanvasMode.EDIT,
+                        content = CanvasViewContent.of(state, canvas.mode,
+                            skeleton = canvas.mode == CanvasMode.EDIT && editor.committedSkeleton != null),
+                        pins = pins,
+                        onPinsChange = { AppSettings.canvasRail = it },
+                        skinWeights = editor.showSkeletonWeights,
+                        onSkinWeightsChange = { editor.showSkeletonWeights = it },
                         onReset = {
                             viewMenu = false
                             viewModel.resetCanvasViewOptions(canvas.id, canvas.mode)

@@ -57,9 +57,11 @@ internal object RigGenerationSource {
      */
     internal fun createdCoverage(overlay: RigEditOverlay): Map<String, LayerBounds> {
         val coverage = LinkedHashMap<String, LayerBounds>()
+        val adopted = RigMeshSeed.adopted(overlay)
         for (command in overlay.authoringJournal) {
             if (command["op"]?.jsonPrimitive?.contentOrNull != RasterMeshCreation.OP) continue
             val layer = command.getValue("layer_id").jsonPrimitive.content
+            if (layer in adopted) continue
             val bounds = RasterMeshCreation.sourceBounds(command)
             coverage[layer] = coverage[layer]?.let { union(it, bounds) } ?: bounds
         }
@@ -283,7 +285,7 @@ internal object RigGenerationSource {
         val pages = rig.pageByDrawableId.toMutableMap()
         val drawables = rig.puppet.drawables.map { drawable ->
             val mesh = drawable.mesh ?: return@map drawable
-            val layerId = rig.layerIdByDrawableId.getValue(drawable.id.raw)
+            val layerId = requireNotNull(rig.layerOf(drawable.id.raw)) { "Mesh without a layer: ${drawable.id.raw}" }
             val old = requireNotNull(from.placementByLayerId[layerId]) { "Generation atlas layer is missing" }
             val next = requireNotNull(to.placementByLayerId[layerId]) { "Current atlas layer is missing" }
             val oldBounds = oldLayers.getValue(layerId).source.bounds

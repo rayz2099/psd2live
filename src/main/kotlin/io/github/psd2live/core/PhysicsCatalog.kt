@@ -19,15 +19,23 @@ object PhysicsCatalog {
 		val inactiveInteriorGroups = overlay.interiorEffects.filter { effect ->
 			!effect.enabled || (model != null && effect.issue(model) != null) || effect.parameterIds.any { it !in available }
 		}.flatMapTo(HashSet()) { effect -> effect.groups.map { it.id } }
-		val generated = PhysicsGenerator.presetRules(present, available).map { it to PhysicsOrigin.PRESET } +
-			PhysicsGenerator.skeletonRules(overlay.skeleton, available).map { it to PhysicsOrigin.SKELETON } +
-			PhysicsGenerator.swingRules(overlay.swingEdits, available).map { it to PhysicsOrigin.SWING } +
-			io.github.psd2live.core.sim.SimGenerator.physicsRules(overlay.simEdits, available).map { it to PhysicsOrigin.SIMULATION } +
-            overlay.interiorEffects.filter { it.enabled }.flatMap { it.groups }.filterNot { it.id in inactiveInteriorGroups }.map { it to PhysicsOrigin.INTERIOR }
+		// Generators name standard parameters by their standard IDs; an ID conversion gave them others.
+		val renames = overlay.idRenames.parameters
+		val standard = if (renames.isEmpty()) available else {
+			val original = renames.entries.associate { it.value to it.key }
+			available.mapTo(HashSet()) { original[it] ?: it }
+		}
+		val generated = (PhysicsGenerator.presetRules(present, standard).map { it to PhysicsOrigin.PRESET } +
+			PhysicsGenerator.moduleRules(standard, present.hairSoftness, present.impulses).map { it to PhysicsOrigin.PRESET } +
+			PhysicsGenerator.skeletonRules(overlay.skeleton, standard).map { it to PhysicsOrigin.SKELETON } +
+			PhysicsGenerator.swingRules(overlay.swingEdits, standard).map { it to PhysicsOrigin.SWING } +
+			io.github.psd2live.core.sim.SimGenerator.physicsRules(overlay.simEdits, standard).map { it to PhysicsOrigin.SIMULATION } +
+            overlay.interiorEffects.filter { it.enabled }.flatMap { it.groups }.filterNot { it.id in inactiveInteriorGroups }.map { it to PhysicsOrigin.INTERIOR })
+			.map { (rule, origin) -> RigIdConversion.forward(rule, renames) to origin }
 		val generatedIds = generated.mapTo(HashSet()) { it.first.id }
 		val authored = overlay.physicsEdits.associateBy { it.id }
 		fun enabled(id: String, origin: PhysicsOrigin) =
-			if (origin == PhysicsOrigin.PRESET) enabledPresets[id] else id !in overlay.disabledPhysicsIds
+			if (origin == PhysicsOrigin.PRESET && id in PhysicsGenerator.presetIds) enabledPresets[id] else id !in overlay.disabledPhysicsIds
 		val rows = ordered(generated.map { (rule, origin) ->
 			val setting = authored[rule.id] ?: rule
 			PhysicsGroup(setting, origin, rule, enabled(rule.id, origin), issueOf(setting, available))
@@ -53,7 +61,7 @@ object PhysicsCatalog {
 
 	fun groups(analysis: PipelineAnalysis?, config: PipelineConfig, available: Set<String>, model: org.umamo.runtime.model.PuppetModel? = null): List<PhysicsGroup> =
 		groups(if (config.rigEdits.importedCmo3 != null) PhysicsGenerator.Presets(false, false, false)
-			else PhysicsGenerator.Presets.present(analysis, config.hairSimulationFront, config.hairSimulationBack), PhysicsGenerator.Presets.enabled(config), config.rigEdits, available, model)
+			else PhysicsGenerator.Presets.present(analysis, config), PhysicsGenerator.Presets.enabled(config), config.rigEdits, available, model)
 
 	/** What exports, in evaluation order: nothing when physics is off or the model is mesh-only. */
 	fun active(analysis: PipelineAnalysis?, config: PipelineConfig, available: Set<String>, model: org.umamo.runtime.model.PuppetModel? = null): List<RigPhysicsEdit> =

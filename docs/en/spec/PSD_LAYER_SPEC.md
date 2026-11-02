@@ -8,6 +8,8 @@ This page covers source preparation. Automatic classification is a starting poin
 
 Use a layered RGB, 8-bit PSD with transparency. Rasterize text, vectors and layer effects you need, and merge adjustment effects into the relevant pixels. Keep the body approximately upright. A small initial head tilt is supported by estimation, but inspect the result.
 
+Layer blend modes: Linear Dodge (Add), Add Glow and Linear Light become Cubism's Add; Multiply, Linear Burn and Color Burn become Multiply; Screen stays Screen (a Cubism 5.3 blend mode: exporting for an earlier runtime version draws it as Add and says so in the loss report). Other modes are drawn as Normal. A group's blend mode has no effect; merge the group into one layer if it matters.
+
 ## Without a PSD: layout manifests
 
 Parts split by a program, such as AI layer decomposition, can reach PSD2Live without a PSD, as a [layout manifest](LAYOUT_MANIFEST.md): a JSON file, or a zip holding it at its root, that lists each layer's image, canvas rectangle, stacking order, group, tags and variant, and whether it is only a reference (such as the picture the parts were split from: shown on the canvas, never generated or exported). Small parts may carry more pixels than the canvas gives them; opening the manifest gives a laid-out project that is not generated yet. Layers without tags are recognised by the naming rules on this page.
@@ -16,7 +18,13 @@ Parts split by a program, such as AI layer decomposition, can reach PSD2Live wit
 
 Separate eye whites, irises and upper lashes. Preserve the hidden part of each iris. The upper-lash rig is not intended for combined lower eyelid lines, even if a lower-lash name is recognized; inspect or classify such details separately.
 
-Supply the mouth fully open, either as one image or with separate upper teeth, lower teeth and tongue. Geometry cannot reconstruct an unseen mouth interior from closed-mouth pixels. Separate front and back hair and preserve overlap behind occluding parts.
+Supply the mouth fully open, either as one image or with separate upper teeth, lower teeth and tongue. Geometry cannot reconstruct an unseen mouth interior from closed-mouth pixels.
+
+For painted lips, or a cleaner open and close, split the mouth into two groups as hand riggers do. The inside: `mouth inside` (`口腔`; the opening's shape at its widest, one filled shape that clips the inside's other layers - it may be an invisible shape, at layer opacity 0 - its edge drawn to the middle of the lip lines and never past their outer edge unless lip layers cover it), the inside's base colour (say `口腔底`, drawn larger than the mouth can ever open and clipped onto `口腔` in the PSD, so nothing behind the mouth shows in any mouth shape), `upper teeth`, `lower teeth` and `tongue` (also drawn larger than the opening, for the inside to clip; draw the teeth as a real row of teeth, flat or a gentle U with the ends a little higher, the upper and lower rows of similar curvature - not cut to the opening's shape as a ∩ arch, which runs against the upper lip dipping in a smile; a row may run past the corners or fill only the middle), with any dark inside the mouth as a layer named as a shadow. The lips: `upper lip` and `lower lip` (each lip with a band of face-coloured skin about it, its colour, gloss and shading painted in), and, where the art has line work, `upper lip line` and `lower lip line` (together one closed outline of even weight, the two meeting at the same point at each corner). A lip rides its edge whole without squashing and covers the inside when the mouth shuts, so a mouth with lip layers closes its inside only by the "Inside behind the lips" setting. A line follows its edge at its own thickness, and the two meet in one line when shut. A mouth with its own lips or lines gets no generated outline. Separate front and back hair and preserve overlap behind occluding parts.
+
+A layered mouth keeps the original drawing at its neutral open pose. Painted lip skin shares its outer motion with the face. Teeth and tongue are clipped by the mouth opening rather than faded in with openness. Tongue-out automatically creates a transparent-at-rest, unclipped tongue copy above the lower lip and below the upper lip; no extra protruding-tongue artwork is required.
+
+When the head turns, the face, its features and the front hair are reshaped from feature points read off the art, so the art must let those points be read: draw the face skin as one piece (an outline band alone also works), its outline - the chin, both jaw angles, the cheeks, the temples - being the character's face shape and drawn clearly, a square face square and a pointed chin pointed, which they stay when turned. Split an eye into the upper lash line (the lash's outer wing may be its own layer), the eye white (drawn large, its edge under the lashes), the iris (a full circle, clipped by the white), the pupil and the highlights: turning, the iris and highlights barely change shape while the lid opening reshapes about them. The nose may be left out, drawn on the skin, drawn as a dot, a short line or a small shade, or kept on its own layer (a detailed nose may split further into bridge line, underside and side shade); a nose on its own layer leads the turn most. Draw ears whole (the far one tucks behind the hair). Separate front hair, side locks (`side`) and back hair, and draw the back hair on behind the face where the face hides it.
 
 ## Name reference
 
@@ -38,7 +46,7 @@ The table lists known classifier tags and selected aliases, excluding UNKNOWN. T
 | `EARS` | `ears`, `耳朵`, `耳`, `みみ`, `귀` |
 | `EARWEAR` | `earwear`, `耳环`, `耳環`, `耳饰`, `귀걸이` |
 | `NOSE` | `nose`, `鼻子`, `鼻`, `はな`, `코` |
-| `MOUTH` | `mouth`, `口`, `嘴`, `嘴巴`, `입` |
+| `MOUTH` | `mouth`, `口`, `嘴`, `嘴巴`, `입`, `上唇`, `下唇`, `上唇线`, `下唇线`, `upper lip`, `lower lip line` |
 | `MOUTH_OPEN` | `mouth open`, `张嘴`, `張嘴`, `开口`, `벌린 입` |
 | `MOUTH_CLOSE` | `mouth close`, `闭嘴`, `閉嘴`, `闭口`, `다문 입` |
 | `TOOTH_T` | `tooth-t`, `上牙`, `上歯`, `上齿`, `윗니` |

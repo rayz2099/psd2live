@@ -21,7 +21,7 @@ import java.security.MessageDigest
  * | `document/nodes/<kind>/<sha256>.json` | document nodes, `{schema, kind, value}` |
  * | `document/nodes/payload/<sha256>.json` | large journal entries a schema-2 revision lists under `payloads` |
  * | `document/overrides/<sha256>.json` | generator overrides with their place in the journal |
- * | `document/clips/<sha256>.json` | motion clips and generated-motion settings |
+ * | `document/clips/<sha256>.json` | motion clips, generated-motion settings, expressions and the pose |
  * | `document/bakes/<sha256>.bin` | simulation bakes ([PackedJson]) a schema-4 revision lists under `bakes` |
  * | `assets/` | deduplicated rasters (PNG) |
  * | `auxiliary/` | staged assets, views, workflow records and tasks |
@@ -42,6 +42,19 @@ internal object ProjectFormatV2 {
 	const val NODE_SCHEMA_TEXTURES = 2
 	/** A node with a layer moved as a whole ([LayerTransform], `transform`), which schema-2 readers would drop. */
 	const val NODE_SCHEMA_TRANSFORMS = 3
+	/**
+	 * A layout or materials node holding a field older layout readers would drop: reference images and layers, their
+	 * pins, drawings, or a material's canvas and reference mark. Layout nodes themselves were introduced after
+	 * [NODE_SCHEMA] was fixed, so their original field set is the schema-1 baseline.
+	 */
+	const val NODE_SCHEMA_LAYOUT = 4
+	/**
+	 * A clips node holding what older readers would drop: the document's expressions or pose, or motion events. Only
+	 * clips nodes take it ([NODE_SCHEMA_HIT_AREAS] is the same number for rig nodes); one without these fields keeps schema 1.
+	 */
+	const val NODE_SCHEMA_SIDECARS = 5
+	/** A rig node holding hit areas (`rigEdits.hitAreas`), which older readers would drop. */
+	const val NODE_SCHEMA_HIT_AREAS = 5
 	/** Schema of a revision index whose journal names no payload node. */
 	const val REVISION_SCHEMA = 1
 	/** Schema of a revision index whose journal names payload nodes (listed under `payloads`). */
@@ -80,7 +93,11 @@ internal object ProjectFormatV2 {
 	 * rather than open the document without its materials.
 	 */
 	private val layoutParts = mapOf(WorkspaceLayoutCodec.LAYOUT to "layout", WorkspaceLayoutCodec.MATERIALS to "materials")
-	private val clipKeys = listOf("motions", "motionPresets")
+	/** What a layout node held when layout nodes were introduced: fields outside these sets need [NODE_SCHEMA_LAYOUT]. */
+	private val layoutV1Keys = setOf("layerTags", "layerMaterials", "generation")
+	private val materialV1Keys = setOf("id", "name", "folderId", "kind", "rasterWidth", "rasterHeight", "rgbaBlob", "placement", "svg", "tags", "origin", "opacity", "visible")
+	private val materialFolderV1Keys = setOf("id", "name", "parentId", "tags")
+	private val clipKeys = listOf("motions", "motionPresets", "expressions", "pose")
 	private const val JOURNAL = "authoringJournal"
 	private const val SIMULATIONS = "simulations"
 	private const val OVERRIDE = "generated_override"
@@ -90,40 +107,20 @@ internal object ProjectFormatV2 {
 	class Packed(val index: JsonObject, val rasters: Collection<String>)
 
 	/**
-	 * Moves the working-store layout under [root]/workspace/[projectId] into the v2 layout under [root]. Revisions
-	 * staged already (their index in `history/revisions/`) are left as they are. Returns the revisions it split, by
-	 * snapshot key.
+	 * Moves what a save staged in working-store form under [root]/workspace/[projectId] into the v2 layout under [root]:
+	 * the rasters, and the auxiliary records and tasks. The history is staged in the archive layout already
+	 * ([WorkspaceStore.packHistory]).
 	 */
-	fun pack(root: Path, projectId: String): Map<String, Packed> {
+	fun pack(root: Path, projectId: String) {
 		val workspace = root.resolve("workspace")
 		val store = workspace.resolve(projectId)
-		require(Files.isRegularFile(store.resolve("HEAD.json"))) { "Project has no history" }
-		val history = root.resolve("history")
-		move(store.resolve("HEAD.json"), history.resolve("HEAD.json"))
-		moveTree(store.resolve("history/nodes"), history.resolve("nodes"))
-		val snapshots = store.resolve("history/snapshots")
-		val shared = WorkspaceStore.SharedContent()
-		val payloads = PayloadHashes()
-		val packed = LinkedHashMap<String, Packed>()
-		if (Files.isDirectory(snapshots)) Files.list(snapshots).use { paths -> paths.sorted().toList() }.forEach { file ->
-			val snapshot = WorkspaceStore.expandSnapshot(store, json.parseToJsonElement(Files.readString(file)).jsonObject, shared)
-			// Revisions shared chunks, so their entries are the same objects: each payload is written and hashed once.
-			val index = split(root, snapshot, PAYLOAD_MIN_CHARS.takeIf { needsNewerSchema(snapshot) }, payloads)
-			val key = file.fileName.toString().removeSuffix(".json")
-			writeRevision(root, key, index)
-			packed[key] = Packed(index, WorkspaceStore.rasterFiles(snapshot))
-			Files.delete(file)
-		}
-		// Journal chunks and payloads shared by working snapshots are now inside the document nodes.
-		WorkspaceStore.sharedContentFolders.forEach { deleteTree(store.resolve(it)) }
+		if (!Files.isDirectory(store)) return deleteTree(workspace)
 		moveTree(store.resolve("blobs"), root.resolve("assets"))
-		moveTree(store.resolve(WORKING_RIG_OBJECTS), root.resolve(RIG_OBJECTS))
 		for (folder in auxiliaryFolders) moveTree(store.resolve(folder), root.resolve("auxiliary").resolve(folder))
 		if (Files.isRegularFile(store.resolve("tasks.json"))) move(store.resolve("tasks.json"), root.resolve("auxiliary/tasks.json"))
 		val left = Files.walk(store).use { paths -> paths.filter(Files::isRegularFile).map { store.relativize(it).toString() }.toList() }
 		require(left.isEmpty()) { "Unknown project store entries: $left" }
 		deleteTree(workspace)
-		return packed
 	}
 
 	/** Writes revision [key]'s [index] into the archive layout under [root]. */
@@ -235,7 +232,7 @@ internal object ProjectFormatV2 {
 				})
 			}
 			JsonObject(rig.filterKeys { it in clipKeys }).takeIf { it.isNotEmpty() }?.let { value ->
-				clips = content(root, "document/clips", buildJsonObject { put("schema", NODE_SCHEMA); put("kind", "clips"); put("value", value) })
+				clips = content(root, "document/clips", buildJsonObject { put("schema", clipsSchema(value)); put("kind", "clips"); put("value", value) })
 			}
 		}
 		val known = sourceKeys + layerKeys + "settings" + sourceParts.keys + layoutParts.keys + "rigEdits"
@@ -295,9 +292,10 @@ internal object ProjectFormatV2 {
 
 	/**
 	 * The schema a node of [kind] needs: 2 when it holds a field schema-1 readers would drop (a layer's float
-	 * `rect`, `textureOverrides`, the `atlas` setting), so those builds reject it instead of losing data.
+	 * `rect`, `textureOverrides`, the `atlas` setting), 3 for a layer's `transform`, and 4 for layout fields added
+	 * after layout nodes were introduced, so those builds reject it instead of losing data.
 	 */
-	private fun schemaOf(kind: String, value: JsonObject): Int {
+	internal fun schemaOf(kind: String, value: JsonObject): Int {
 		fun layersHaveRect(source: JsonObject?) = source?.get("layers")?.jsonArray.orEmpty().any { (it as? JsonObject)?.containsKey("rect") == true }
 		fun layersHaveTransform(source: JsonObject?) = source?.get("layers")?.jsonArray.orEmpty().any { (it as? JsonObject)?.containsKey("transform") == true }
 		val transformed = when (kind) {
@@ -306,6 +304,21 @@ internal object ProjectFormatV2 {
 			else -> false
 		}
 		if (transformed) return NODE_SCHEMA_TRANSFORMS
+		if (kind == "rig" && (value["rigEdits"] as? JsonObject)?.containsKey("hitAreas") == true) return NODE_SCHEMA_HIT_AREAS
+		// Layout nodes hold their state under one key ([layoutParts]), as source parts do.
+		val layoutValue = value[kind] as? JsonObject
+		val layout = when (kind) {
+			"layout" -> layoutValue?.keys?.any { it !in layoutV1Keys } == true
+			"materials" -> layoutValue?.let { materials ->
+				materials["folders"]?.jsonArray.orEmpty().any { element ->
+					(element as? JsonObject)?.keys?.any { it !in materialFolderV1Keys } == true
+				} || materials["items"]?.jsonArray.orEmpty().any { element ->
+					(element as? JsonObject)?.keys?.any { it !in materialV1Keys } == true
+				}
+			} == true
+			else -> false
+		}
+		if (layout) return NODE_SCHEMA_LAYOUT
 		val newer = when (kind) {
 			"source" -> layersHaveRect(value)
 			in sourceParts.values -> value.values.any { layersHaveRect(it as? JsonObject) }
@@ -314,6 +327,12 @@ internal object ProjectFormatV2 {
 			else -> false
 		}
 		return if (newer) NODE_SCHEMA_TEXTURES else NODE_SCHEMA
+	}
+
+	/** The schema of a clips node holding [value]: [NODE_SCHEMA_SIDECARS] with expressions, a pose or motion events. */
+	internal fun clipsSchema(value: JsonObject): Int {
+		val events = (value["motions"] as? JsonArray).orEmpty().any { (it as? JsonObject)?.containsKey("events") == true }
+		return if ("expressions" in value || "pose" in value || events) NODE_SCHEMA_SIDECARS else NODE_SCHEMA
 	}
 
 	/** The snapshot a revision [index] names, read from the nodes under [root]. */
@@ -340,7 +359,8 @@ internal object ProjectFormatV2 {
 		}
 		fun load(folder: String, kind: String, hash: String): JsonObject {
 			val value = cache.getOrPut("$folder/$hash") { read(root, folder, hash) }
-			require(value["schema"]?.jsonPrimitive?.intOrNull in NODE_SCHEMA..NODE_SCHEMA_TRANSFORMS && value["kind"]?.jsonPrimitive?.contentOrNull == kind) {
+			val newest = if (kind == "clips" || kind == "rig") NODE_SCHEMA_SIDECARS else NODE_SCHEMA_LAYOUT
+			require(value["schema"]?.jsonPrimitive?.intOrNull in NODE_SCHEMA..newest && value["kind"]?.jsonPrimitive?.contentOrNull == kind) {
 				"Unsupported document node: $kind $hash"
 			}
 			return value

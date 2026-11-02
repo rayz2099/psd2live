@@ -5,6 +5,7 @@ import io.github.psd2live.project.WorkspaceSourceLayer
 import io.github.psd2live.project.WorkspaceDocument
 
 import io.github.psd2live.core.LayerSpace
+import io.github.psd2live.core.MouthLipLayer
 import io.github.psd2live.core.PaintSpace
 import io.github.psd2live.core.RasterPaintEngine
 import io.github.psd2live.core.RasterPaintShape
@@ -71,11 +72,15 @@ internal fun WorkspaceDocument.paintSourceImage(arguments: JsonObject,
  */
 internal class LayerPaintImage(val space: PaintSpace, val image: BufferedImage)
 
+/** A lip outline ([MouthLipLayer]) is drawn again from its mouth layer and the mouth settings on every build: no pixels to paint. */
+internal const val GENERATED_LIP_PAINT = "Lip outlines are generated from the mouth layer and cannot be painted: change them with " +
+    "the settings mouthColor, mouthThickness and mouthShape, or turn mouthOutlineEnabled off and paint the mouth layer"
+
 /** Seeds a paint image of layer [id] in its own raster space ([PaintSpace.of]). */
 internal fun WorkspaceDocument.layerPaintImage(id: String, checkpoint: () -> Unit = {}): LayerPaintImage {
     checkpoint()
     val layer = source.layers.singleOrNull { it.id.raw == id && id !in deletedLayerIds }
-        ?: throw IllegalArgumentException("Source layer not found: $id")
+        ?: throw IllegalArgumentException(if (MouthLipLayer.isLipId(id)) GENERATED_LIP_PAINT else "Source layer not found: $id")
     val space = PaintSpace.of(layer, source.widthPx, source.heightPx)
     return LayerPaintImage(space, space.image(layer, checkpoint))
 }
@@ -92,12 +97,33 @@ internal fun WorkspaceDocument.paintLayerImage(arguments: JsonObject,
 }
 
 /**
+ * A `transform` gesture's `matrix`, in canvas units, as the map it makes of [space]'s raster pixels: the same map
+ * seen through the canvas-to-raster scale.
+ */
+internal fun rasterTransformMatrix(arguments: JsonObject, space: PaintSpace): FloatArray {
+    val m = arguments.getValue("matrix").jsonArray.map { it.jsonPrimitive.float }
+    require(m.size == 6 && m.all(Float::isFinite)) { "matrix must be six numbers a b c d e f" }
+    fun mapped(x: Float, y: Float): Pair<Float, Float> {
+        val cx = space.imageToCanvasX(x); val cy = space.imageToCanvasY(y)
+        return space.canvasToImageX(m[0] * cx + m[2] * cy + m[4]) to space.canvasToImageY(m[1] * cx + m[3] * cy + m[5])
+    }
+    val (ox, oy) = mapped(0f, 0f); val (ux, uy) = mapped(1f, 0f); val (vx, vy) = mapped(0f, 1f)
+    return floatArrayOf(ux - ox, uy - oy, vx - ox, vy - oy, ox, oy)
+}
+
+/**
  * A private session and a durable single gesture use the same raster processor. Gesture coordinates, radii and
  * widths are canvas units; [space] maps them onto [image]'s pixels, so a dense layer paints at its own density.
  */
 internal fun paintRasterGesture(image: BufferedImage, arguments: JsonObject,
     work: WorkspaceRasterWork = WorkspaceRasterWork.Direct, before: (java.awt.Rectangle) -> Unit = {},
-    space: PaintSpace = PaintSpace.canvas(image.width, image.height)) {
+    space: PaintSpace = PaintSpace.canvas(image.width, image.height),
+    /** What `clear`, `fill` and `gradient` cover, and what `transform` lifts, in raster pixels; the whole raster when null. */
+    area: java.awt.Rectangle? = null,
+    /** The share of each pixel a `transform` lifts; all of [area] when null. */
+    selection: io.github.psd2live.core.PaintSelection? = null,
+    /** Where a stroke's `symmetry` mirrors it, in canvas units: the middle of the canvas the session paints on. */
+    symmetryAxes: Pair<Float, Float>? = null) {
     val width = image.width; val height = image.height
     work.progress(0.05f, "Rasterizing paint gesture")
     val mode = arguments.getValue("mode").jsonPrimitive.content
@@ -111,26 +137,87 @@ internal fun paintRasterGesture(image: BufferedImage, arguments: JsonObject,
         require(numbers.size == 2 && numbers.all(Float::isFinite)) { "point must be [x,y]" }
         return space.canvasToImageX(numbers[0]) to space.canvasToImageY(numbers[1])
     }
+    /**
+     * The stroke's points and, with `symmetry`, their mirror images across the canvas middle, each a path of raster
+     * points. They go into one stroke, so where they overlap they land once, as a stroke crossing itself does.
+     */
+    fun paths(): List<List<Pair<Float, Float>>> {
+        val raw = arguments.getValue("points").jsonArray.map { value ->
+            value.jsonArray.map { it.jsonPrimitive.float }.also { require(it.size == 2 && it.all(Float::isFinite)) { "point must be [x,y]" } }
+        }
+        require(raw.size in 1..512) { "Use 1..512 stroke points" }
+        val symmetry = arguments["symmetry"]?.jsonPrimitive?.content?.let { io.github.psd2live.core.PaintSymmetry.valueOf(it.uppercase()) }
+            ?: io.github.psd2live.core.PaintSymmetry.OFF
+        val (ax, ay) = if (symmetry == io.github.psd2live.core.PaintSymmetry.OFF) 0f to 0f
+            else requireNotNull(symmetryAxes) { "symmetry needs a paint session" }
+        val images = raw.map { (x, y) -> symmetry.images(x, y, ax, ay) }
+        return images.first().indices.map { image ->
+            images.map { space.canvasToImageX(it[image].first) to space.canvasToImageY(it[image].second) }
+        }
+    }
+    fun RasterPaintEngine.Stroke.trace(tip: RasterPaintEngine.Tip) = paths().forEach { points ->
+        if (points.size == 1) addSegment(points[0].first, points[0].second, points[0].first, points[0].second, tip, work::checkpoint)
+        else points.zipWithNext().forEach { (a, b) -> addSegment(a.first, a.second, b.first, b.second, tip, work::checkpoint) }
+    }
     when (mode) {
-        "clear" -> { before(java.awt.Rectangle(0, 0, width, height)); RasterPaintEngine.clear(image) }
+        "clear" -> {
+            val region = (area ?: java.awt.Rectangle(0, 0, width, height)).intersection(java.awt.Rectangle(0, 0, width, height))
+            if (!region.isEmpty) {
+                before(region)
+                image.setRGB(region.x, region.y, region.width, region.height, IntArray(region.width * region.height), 0, region.width)
+            }
+        }
         "brush", "pencil", "eraser" -> {
-            val points = arguments.getValue("points").jsonArray.map(::point)
-            require(points.size in 1..512) { "Use 1..512 stroke points" }
             val radius = arguments["radius"]?.jsonPrimitive?.float ?: 8f
             val hardness = arguments["hardness"]?.jsonPrimitive?.float ?: 1f
             require(radius.isFinite() && radius in 0.5f..512f && hardness.isFinite() && hardness in 0f..1f)
             val stroke = RasterPaintEngine.Stroke(width, height)
             val tip = RasterPaintEngine.Tip(space.imageLength(radius), if (mode == "pencil") 1f else hardness, antialias = mode != "pencil")
-            if (points.size == 1) stroke.addSegment(points[0].first, points[0].second,
-                points[0].first, points[0].second, tip, work::checkpoint)
-            else points.zipWithNext().forEach { (a, b) -> stroke.addSegment(a.first, a.second, b.first, b.second, tip, work::checkpoint) }
+            stroke.trace(tip)
             stroke.bounds?.let { before(it); stroke.land(image, color, opacity, mode == "eraser", it, work::checkpoint) }
         }
         "bucket" -> {
             val (x, y) = point(arguments.getValue("point"))
             val tolerance = arguments["tolerance"]?.jsonPrimitive?.int ?: 0
             require(tolerance in 0..255)
-            RasterPaintEngine.floodFill(image, x.toInt(), y.toInt(), color, tolerance, before = before, checkpoint = work::checkpoint, opacity = opacity)
+            RasterPaintEngine.floodFill(image, x.toInt(), y.toInt(), color, tolerance, before = before, checkpoint = work::checkpoint,
+                opacity = opacity, contiguous = arguments["contiguous"]?.jsonPrimitive?.boolean ?: true)
+        }
+        "blur" -> {
+            val radius = arguments["radius"]?.jsonPrimitive?.float ?: 8f
+            val hardness = arguments["hardness"]?.jsonPrimitive?.float ?: 0.5f
+            require(radius.isFinite() && radius in 0.5f..512f && hardness.isFinite() && hardness in 0f..1f)
+            val stroke = RasterPaintEngine.Stroke(width, height)
+            val tip = RasterPaintEngine.Tip(space.imageLength(radius), hardness)
+            stroke.trace(tip)
+            stroke.bounds?.let { claimed ->
+                val kernel = blurKernel(tip.radius)
+                val padded = java.awt.Rectangle(claimed.x - kernel, claimed.y - kernel, claimed.width + 2 * kernel, claimed.height + 2 * kernel)
+                    .intersection(java.awt.Rectangle(0, 0, width, height))
+                before(claimed)
+                val original = image.getRGB(padded.x, padded.y, padded.width, padded.height, null, 0, padded.width)
+                stroke.landBlur(image, original, padded, claimed, opacity, kernel)
+            }
+        }
+        "fill" -> {
+            // A session hands the selection's bounds, or the layer's own area, and confines the result afterwards.
+            val region = (area ?: java.awt.Rectangle(0, 0, width, height)).intersection(java.awt.Rectangle(0, 0, width, height))
+            if (!region.isEmpty) {
+                before(region)
+                RasterPaintEngine.gradient(image, 0f, 0f, 0f, 0f, color, color, false, opacity, region, work::checkpoint)
+            }
+        }
+        "gradient" -> {
+            val (x0, y0) = point(arguments.getValue("from"))
+            val (x1, y1) = point(arguments.getValue("to"))
+            val end = arguments["end_color"]?.jsonArray?.map { it.jsonPrimitive.int } ?: listOf(rgba[0], rgba[1], rgba[2], 0)
+            require(end.size == 4 && end.all { it in 0..255 }) { "end_color must be four RGBA bytes" }
+            val region = (area ?: java.awt.Rectangle(0, 0, width, height)).intersection(java.awt.Rectangle(0, 0, width, height))
+            if (!region.isEmpty) {
+                before(region)
+                RasterPaintEngine.gradient(image, x0, y0, x1, y1, color, (end[3] shl 24) or (end[0] shl 16) or (end[1] shl 8) or end[2],
+                    arguments["kind"]?.jsonPrimitive?.content == "radial", opacity, region, work::checkpoint)
+            }
         }
         "shape" -> {
             val (x0, y0) = point(arguments.getValue("from"))
@@ -144,10 +231,27 @@ internal fun paintRasterGesture(image: BufferedImage, arguments: JsonObject,
             RasterPaintEngine.drawShape(image, x0.toInt(), y0.toInt(), x1.toInt(), y1.toInt(),
                 shape, color, opacity, imageWidth, arguments["filled"]?.jsonPrimitive?.boolean ?: false)
         }
+        "transform" -> {
+            val matrix = rasterTransformMatrix(arguments, space)
+            require(io.github.psd2live.core.PaintPixelTransform.inverse(matrix) != null) { "matrix squashes the pixels flat" }
+            val raster = java.awt.Rectangle(0, 0, width, height)
+            val region = (area ?: raster).intersection(raster)
+            if (!region.isEmpty) {
+                val target = io.github.psd2live.core.PaintPixelTransform.mappedBounds(matrix, region, width, height)
+                before(if (target.isEmpty) region else region.union(target))
+                val floating = io.github.psd2live.core.PaintPixelTransform.lifted(image, region, selection)
+                io.github.psd2live.core.PaintPixelTransform.clear(image, region, selection)
+                io.github.psd2live.core.PaintPixelTransform.place(image, floating, region, matrix,
+                    arguments["smooth"]?.jsonPrimitive?.boolean ?: true, work::checkpoint)
+            }
+        }
         else -> throw IllegalArgumentException("Unknown paint mode: $mode")
     }
     work.progress(0.2f, "Rasterized paint gesture")
 }
+
+/** The blur brush's box radius for a tip of [radius] raster pixels: a quarter of the tip, 1..16 pixels. */
+internal fun blurKernel(radius: Float): Int = (radius / 4f).toInt().coerceIn(1, 16)
 
 /** Pure raster-only fixture edit; application commits additionally preserve and migrate rig inputs. */
 internal fun WorkspaceDocument.paintSource(arguments: JsonObject): WorkspaceDocument {

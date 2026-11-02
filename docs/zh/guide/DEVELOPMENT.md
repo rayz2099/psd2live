@@ -6,7 +6,7 @@
 
 ## 环境
 
-- JDK 21。Gradle 使用仓库自带的 Wrapper，无需单独安装。
+- JDK 21，推荐 JetBrains Runtime（JBR）21：Windows 发布包用它，主窗口在它上面保留系统窗口框架（最大化、贴靠、拖边调整大小由系统处理），标题栏由程序绘制；其他 JDK 也能构建、测试和运行，主窗口改为无边框、整条标题栏由程序绘制。Windows 打包（`createDistributable`、`packageExe`）要求 JBR 21 SDK（带 jpackage），用其他 JDK 打包需加 `-Ppsd2live.allowNonJbr=true`。macOS 的 DMG（`packageDmg`）用运行 Gradle 的 JDK 构建，不需要 JBR，因为 Swift 外壳保留系统窗口框架。Gradle 使用仓库自带的 Wrapper，无需单独安装。
 - Windows 用 `.\gradlew.bat`，Linux / macOS 用 `./gradlew`。下文示例统一写作 `./gradlew`。
 - 官方 Cubism SDK 不是构建前提。源码构建默认使用内置渲染；原生预览见 [Cubism Native 预览](CUBISM_SDK_SETUP.md)。
 
@@ -37,6 +37,9 @@ Windows 也可以直接运行根目录的 `run-gui.bat`。不带参数启动 GUI
 | `--body-strength <value>` | 1.0 | 身体形变幅度 |
 | `--mesh-only` | 关闭 | 仅生成网格 |
 | `--no-deformers` | 关闭 | 不生成变形器 |
+| `--no-see-through` | 关闭 | 眉毛与眼睛都不透过刘海（默认都透过，输出比此前多出眉毛复制件、刘海的眼部开窗及其复制件） |
+| `--no-see-through-eyes` | 关闭 | 眼睛不透过刘海（现已默认开启的 `--see-through-eyes` 仍可接受） |
+| `--see-through-opacity <0..1>` | 0.5 | 眉毛与眼睛透过刘海的程度 |
 | `--no-motions` | 关闭 | 不输出动作 |
 | `--no-physics` | 关闭 | 不生成物理 |
 | `--no-cmo3` | 关闭 | 不输出 CMO3 |
@@ -82,8 +85,11 @@ Windows 也可以直接运行根目录的 `run-gui.bat`。不带参数启动 GUI
 ./gradlew test --tests "io.github.psd2live.scenario.CatalogContractsTest"   # 单个测试类
 ./gradlew createDistributable                    # 带运行时的应用目录
 ./gradlew packageDistributionForCurrentOS        # 当前平台的安装包
+./gradlew packageDmg                             # 仅 macOS：带 Swift 外壳的 DMG
 ```
 
+- `packageDmg` 只在 macOS 上可用。它使用 `createDistributable` 打进包里的运行时，并把启动程序换成 `packaging/macos` 里的 Swift 外壳，因此 Dock 名称、文档类型和窗口按钮都是系统的。菜单出现在屏幕顶部菜单栏；窗口里的菜单仍保留，因为那里列出了全部命令。DMG 的架构与构建它的 Mac 相同（Apple 芯片或 Intel），需要 macOS 13 或更新。包没有公证：从网络下载后，在访达里用辅助点按打开，再把 `PSD2Live` 拖进“应用程序”。
+- `CI` 工作流在 PR 和推送时运行 Ubuntu、Windows 与 macOS 测试，其中 macOS 任务分别测试并打包 Apple 芯片和 Intel 版本；也可手动运行，从产物中下载 DMG。它验证原生启动器的错误处理，并用包内运行时启动挂载后的应用。共享的 `.github/actions/package-macos` 也为发行工作流提供两种架构的 DMG，不包含 Cubism SDK。
 - 两种打包都只包含当前构建平台的原生库，并在应用资源目录附带 `LICENSE`、`THIRD_PARTY_NOTICES.md` 与 `licenses/`。
 - 官方 SDK 资源（`src/main/resources/cubism/`）默认不打包，只有传入 `-Ppsd2live.includeCubism=true` 或设置 `PSD2LIVE_INCLUDE_CUBISM=true` 时才包含。含 SDK 的包不得公开分发，发行流程见 [CI 与发行](CUBISM_CI_RELEASE.md)。
 - Linux 也可用 `./native/package_linux.sh` 生成需要系统 JDK 21 的本地启动包（输出到 `dist/linux-<时间戳>/`），详见 [native/README.md](../../../native/README.md)。
@@ -116,20 +122,23 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `MotionSheetTool.tracking` | 指针在画面上慢速绕行 12 秒，头和身体按预览的增益与速度跟随 | `motion-frames/<示例>-track/` |
 | `MotionSheetTool.idle` | 待机 12 秒的逐帧图 | `motion-frames/<示例>-idle/` |
 | `ModelProfileTool.cmo3` | `.cmo3` 的参数、变形器树（网格轴与范围）、图形网格、分段运动剖面、身体参数下各网格的位移，身体 X × 身体 Y 的剪影，以及物理组 | `model-profile/<名称>.txt`、`.png`、`-physics.txt` |
+| `RigStudyTool` | 研究成品 Cubism 模型（`PSD2LIVE_MOC3`：`.model3.json` 或其所在目录，可含多个模型）：参数与分组及用途、部件树、变形器树与各对象的关键形轴、网格密度、蒙版、Glue、物理、表情、动作与 VTube Studio 映射；逐参数的形变量、不透明度 / 绘制顺序 / 颜色变化与半段非线性度；默认姿态、每个参数五帧扫描（裁剪到其影响范围）、头部角度、眼、嘴、身体网格图与网格线框；`PSD2LIVE_STUDY_ONLY` 按路径筛选，`PSD2LIVE_STUDY_REVIEW=1` 只按审阅工具的姿态出眼部开合、睁大与视线序列（`review-eye.png`），大模型需 `-Ppsd2live.testHeap=16g` | `rig-study/<目录>/profile.txt`、`effects.txt`、`*.png` |
+| `FitDetectionTool` | 示例（`PSD2LIVE_SAMPLE`）的特征点拟合叠画在原图上：每只眼的内外眼角、上下睑缘、原画闭眼线，以及拟合眼睑在各开度键的上睑缘（从黄到蓝）；张嘴姿态下的上唇上缘（白）与下唇下缘（青）；列出嘴部图层，输出未能拟合、退回原有算法的原因 | `fit-detection/<示例>.png` |
+| `RigReviewTool` | 示例（`PSD2LIVE_SAMPLE`）以新工程的配方和引入模块之前的原有生成方式各生成一次，在审阅姿态与动作片段下对照：每个部位一张姿态板（上下两行），每个片段一张并排播放、带物理的 GIF（眨眼、慢眨、笑眼眨眼、视线、说话、元音、眉、转头、点头歪头、甩头、身体、待机）；`PSD2LIVE_REVIEW` 选部位（eye、brow、mouth、head、hair、body、motion，默认全部），`PSD2LIVE_REVIEW_SIZE` 为单帧边长 | `rig-review/<示例>/<部位>-poses.png`、`<片段>.gif` |
 | `ModelProfileTool.sample` | 生成模型（无骨架和自动骨架）的分段运动剖面、身体图层与自动骨骼 | `model-profile/<示例>.txt` |
 | `SkeletonAutoViewTool.view` | 把自动骨架叠画在示例上并打印每根骨骼，检查关节位置与分叉；`PSD2LIVE_SAMPLES` 逗号分隔多个示例或 PSD 路径，`PSD2LIVE_ZOOM=左,上,右,下`（画布像素）裁出局部 | `skeleton-auto/<示例>.png` |
 | `SimBakeSuite` | 按模型预设生成后发、前发、服装等物理体（另加顶部 10% 固定的后发），用旧方法和逐输入方法烘焙，在没参与拟合的动作（类面捕跟随、歪头、内置动作、逐输入阶跃、转头、拖动、摇晃）上对比参考模拟与导出模型的视觉指标，见[模拟与烘焙](SIMULATION.md) | `build/tools/sim-bake/<样例>/`：`summary.md`、每个设置的 JSON、尖端轨迹图 |
 | `SimRootDofExperiment` | 检验物体是否只响应根部的平移与旋转：每个输入带动根部多少、额外改变多少形状，真实驱动与刚体驱动、不同幅度、同样根部运动的不同输入之间的差别 | `build/tools/sim-root-dof/<样例>.md` |
 | `SimBakeProfileTool` | `tml` 后发单线程与多线程烘焙各一次，按进度标记分段计时并对所有线程采样 | 标准输出 |
 | `PendulumKernelTool` | 摆锤数组内核（精确与快速模式）与 `PhysicsEngine` 每帧耗时及偏差 | 标准输出 |
-| `CanvasPerfTool` | 在 Xvfb 下打开真实窗口，对编辑画布依次做静止、悬停、滚轮缩放、中键平移、变形模式拖动脸部全部点，GPU 渲染与软件渲染各一轮，报告帧间隔、界面线程延迟与界面线程热点；需 `xvfb-run -a -s "-screen 0 1920x1080x24"` | `canvas-perf/report.txt`、各阶段截图与 `.jfr` |
+| `CanvasPerfTool` | 在 Xvfb 下打开真实窗口，对编辑画布依次做静止、悬停、滚轮缩放、中键平移、变形模式拖动脸部全部点，GPU 渲染与软件渲染各一轮，报告帧间隔、界面线程延迟、界面线程热点与每阶段编辑画布的 GPU 帧数（GPU 一轮为 0 即画布没走 GPU）；`PSD2LIVE_CANVAS_AA` 选画布抗锯齿，`PSD2LIVE_OVERLAY=1` 打开性能叠加层。它用 `Robot` 移动真实指针，须在专用的 X 服务器上运行（`xvfb-run -a -s "-screen 0 1920x1080x24"`，或有 GPU 的机器上单独的 Xorg），不要在日常使用的桌面上运行 | `canvas-perf/report.txt`、各阶段截图与 `.jfr` |
 | `DragonBonesFidelityTool` | 把 `tml`、`ds`（无骨架和自动骨架）导出为 DragonBones，用 `tools/dragonbones-check`（官方 DragonBones 5.7 运行时核心，需要 node）播放：参数动画在每个关键帧上与编辑器求值器比较（误差不超过导出报告的容差），并测量片段误差 | `dragonbones-fidelity/report.txt` |
 | `RuntimeConformanceTool.generate` / `.physics` | Rust 运行时的参考数据：`generate` 为随机模型（Warp、旋转、嵌套、稀疏网格、混合形、Glue、通道、部件）、样例与 `PSD2LIVE_RUNTIME_PROJECT` 指定的工程在随机姿势下的编辑器求值结果（骨架样例另有最细采样的 `rig.fine.p2lrt`）；`physics` 为随机摆锤组和样例物理的逐帧轨迹。用 `runtime/` 中的 `p2lrt-conformance` 比较 | `runtime-conformance/<用例>/`、`runtime-physics/<用例>/` |
 | `RuntimeConformanceTool.simulation` / `.simulationRig` | 模拟的参考轨迹：`simulation` 为随机布片（顶边固定、刚度随机）在摇摆、转动、跳动的目标与固定点驱动下经编辑器 XPBD 求解的逐帧结果，一半带移动的胶囊碰撞体；`simulationRig` 为 `tml` 后发（顶部十分之一固定）烘焙后导出的模型与实时场景，以及未烘焙 Rig 上编辑器场景随头部和身体动作的结果。分别由 `p2lrt-conformance --sim`、`--sim-rig` 读取 | `runtime-sim/<用例>/trace.bin`、`runtime-sim-rig/back-hair/` |
 | `RuntimeSamplesTool` | 供目视检查播放器的合成模型：渐变上的每种颜色混合模式、乘色与屏幕色、遮罩与反向遮罩，并用软件光栅器渲染参考图 | `runtime-samples/features.p2lrt`、`features.png`、`layout.txt` |
 | `WarpProbeTool` | 编辑器求值器的黑盒探测：Warp 映射（格子内外）、Warp 下的旋转框架、翻转、混合形、稀疏网格，供运行时独立实现对照 | `warp-probe/*.tsv` |
 | `GeneratorCostTool` | 各生成器（Rig 生成有无骨架、骨架烘焙缓存前后、物理组目录、生成动作缓存前后、Rig IR 编译、两个摆动的生成与重放、模拟烘焙与写回）的耗时，及对其输入做内容哈希的耗时，用于判断生成器是否值得接入生成缓存；`PSD2LIVE_SAMPLE` 指定样例（需有前发与后发） | `generator-cost/report.txt` |
-| `ExportGoldenTool` | `tml`、`ds` 的无骨架、自动骨架、自定义动作三种变体，以及无骨架 cmo3 作为新工程导入后的全部导出文件与预览包摘要（cmo3 取读回后降级为 moc3 的摘要与物理组数），用于逐字节对比重构前后的导出；`PSD2LIVE_GOLDEN_LABEL` 指定输出名 | `export-golden/<名称>.txt`、`<名称>/<示例>-<变体>/` |
+| `ExportGoldenTool` | `tml`、`ds` 的无骨架、自动骨架、自定义动作三种变体，以及无骨架 cmo3 作为新工程导入后的全部导出文件与预览包摘要（cmo3 取读回后降级为 moc3 的摘要与物理组数），用于逐字节对比重构前后的导出；`PSD2LIVE_GOLDEN_LABEL` 指定输出名，`PSD2LIVE_GOLDEN_RECIPE=legacy` 按引入模块之前的工程（旧配方）生成，用于确认旧工程的导出不变 | `export-golden/<名称>.txt`、`<名称>/<示例>-<变体>/` |
 | `LayoutGoldenTool` | 与 `ExportGoldenTool` 相同的摘要，但用测试用的合成角色（全身角色、嘴部）生成 PSD，不需下载示例：流水线导出三种变体，以及导入 PSD 后经导出会话的 moc3 / cmo3 导出；用于逐字节对比改动前后的导出（CAN3 含随机 GUID，每次都不同）；`PSD2LIVE_GOLDEN_LABEL` 指定输出名 | `layout-golden/<名称>.txt` |
 | `LayoutPanelsTool` | 无窗口渲染素材面板、图层表标签格与生成栏：导入合成 PSD、放置一个素材使其待生成、双击打开文件夹、选中条目、把条目拖到画布落点放置（落点由测试注册，检查以落点为中心）、悬停生成按钮、打开与关闭标签菜单后再次拖放 | `layout-panels/*.png` |
 | `LayoutWindowTool` | 打开真实编辑器窗口（OpenGL），导入合成 PSD、切到 Layout 工作区，用 AWT 鼠标事件把素材文件夹从素材面板拖到画布并检查落点、点击生成栏按钮并检查生成完成；截图取自窗口自身的 Skia 帧 | `layout-window/report.txt`、`{layout,dragging,placed,generated}.png` |
@@ -139,6 +148,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `ArtPrimitiveV2VisualTool` | 在 `tml` 上把腿按侧连通块拆分、左眼睫多边形拆分、嘴部多边形拆分分别写成版本 1 与版本 2 记录，渲染未拆分、v1、v2 与 v1/v2 差异（×4）在睁眼/半闭/闭眼、闭嘴/张嘴/张嘴笑等姿态下的对照，检查接缝、错位与缺失像素 | `art-primitive-v2/{legs,eye,mouth}.png` |
 | `SafetyGoldenTool` | 自动骨架 Rig 上 24 组带种子的随机几何编辑的完整几何安全报告（不含 `coverage`），用于逐字节对比检查器改动前后的分类；`PSD2LIVE_GOLDEN_LABEL` 指定输出名 | `safety-golden/<名称>.txt` |
 | `BundleProfileTool` | moc3 预览包的分项耗时（IR 编译、IR 转回、静止网格换到画布空间、physics3/motion3、moc 降级与写出、cdi3）及几何安全检查耗时；`PSD2LIVE_SAMPLER=1` 另打印栈采样的热点 | 仅标准输出 |
+| `CubismParityTool` | 示例（`PSD2LIVE_SAMPLE`）的预览包用应用自带的 Cubism 运行时（`live2d_renderer`，离屏）渲染，与编辑器自己的渲染并排对照：全身、脸部和嘴部特写，涵盖静止、转头、张嘴、口型、闭眼等姿态；`PSD2LIVE_PARITY_RECIPE=legacy` 改用引入模块之前的生成方式。仅 Windows | `cubism-parity/<示例>[-legacy]-<视图>.png` |
 | `CubismCoreCheckTool` | 把 `tml`、`ds` 预览包中的 moc3 交给官方 Cubism Core 的一致性检查（`csmHasMocConsistency`）；需用 `PSD2LIVE_TEST_CUBISM_CORE` 指定 Core 动态库，否则跳过。小型新建模型的同样检查在 `:umamo` 的 `MocDefaultColorsTest` 中 | 仅标准输出 |
 | `TextureWorkspaceTool` | 用 `tml` 设置几种密度与锁定并按网格形状排布一次后，渲染纹理集页面与纹理面板（中英文、单选/多选/未选、热力图开关、密度滑块预览），以及编辑画布的纹理集像素与原始像素对比 | `texture-workspace/*.png` |
 | `AtlasFramePerfTool` | 无窗口、软件渲染下测量 `tml` 纹理集页面与纹理面板的帧耗时：向 `ImageComposeScene` 发送空闲、悬停、拖动角点（密度）、滚轮缩放、拖动图块与关闭线框后悬停的指针输入，记录每次渲染耗时（中位数、p90、最大），并保存角点拖动中、编辑会话、静止页面与放大近景四帧。GPU 渲染需要窗口的 Skia 上下文，由 `AtlasWindowPerfTool` 与 `PreviewWindowTool` 测量 | `atlas-frame-perf/report.txt`、`{corner-drag,session,frame,zoomed}.png` |
@@ -156,6 +166,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `SkeletonBakeDiffTool` | 骨架烘焙的前后对比：记录放大样例（`PSD2LIVE_SCALE`，默认 2）上每个蒙皮网格在各关键形格点与混合形键处的画布坐标，并渲染各肢体的极限姿势；`PSD2LIVE_LABEL` 命名本次结果，设 `PSD2LIVE_REFERENCE` 时与该结果比较，报告各网格最大顶点差（像素）与渲染差 | `skeleton-bake/<label>.bin`、`<label>-limbs.png`、`<label>-vs-<reference>.png` |
 | `OpenPerfTool.profile` | 按应用的路径打开工程（`ProjectRepository.open` 后由新的 `WorkspacePreviewBuilder` 构建头部）的耗时：在带自动骨架、两个摆动和一个已烘焙模拟的工程上，保存三种归档——应用现在的写法（各修订的作者 Rig 与头部缓存）、仅头部缓存（无已存 Rig 时的生成与重放）、两者皆无——各在空的作者 Rig 与骨架缓存下打开 3 次，测量解包/种入与头部构建，并核对三者构建的模型相同 | `open-perf/report.json`、`report.md` |
 | `SavePerfTool.profile` | 保存现实规模的生成工程的耗时（`PSD2LIVE_SAVE_LAYERS`、`PSD2LIVE_SAVE_SIZE`、`PSD2LIVE_SAVE_REVISIONS`）：同一捕获保存 3 次，重开后保存 2 次，再打开 1 次 | `save-perf/report.txt` |
+| `ExportTargetsScenario`、`GenerateAndRigScenario`、`PaintAndReplaceScenario`、`SplitThenRegenerateScenario`、`Cmo3ImportScenario`、`MotionScenario` | 合成角色上的长端到端场景，与测试套件中的场景（`scenario/`）一样逐步检查冷重放、撤销与质量：经每个导出目标导出、从导入到导出的第一次会话、骨架下的绘画与换图、拆分后再生成、cmo3 导入编辑后导出回 cmo3、内置动作编辑与导出。整条流水线跑得太久，不进测试套件；改动生成、导出或保存后运行 | 仅测试结果 |
 | `RigSourcePerfTool.profile` | 大图（示例放大 `PSD2LIVE_SCALE` 倍，默认 3）带生成输入时重建中按像素计的阶段：每第 3 层裁小几像素（需补齐到固定矩形）、每第 5 层为 2 倍密度；冷构建、热重建、绘制后重建的分阶段耗时，以及冷合成图集页与预览 PNG 编码 | `rig-source-perf/report.txt` |
 | `MeshTraceTool.compare` / `.wrap` | `compare` 把合成图层（1024² 贴图上带睫毛的眼睛、头发细束、画布分辨率图层、6000 与 2048 文档中的图层）分别以画布描轮廓与贴图描轮廓生成网格，并排渲染（灰为贴图 alpha、蓝为网格、红为网格外的不透明贴图像素），报告顶点数、耗时、`detail`、网格外像素与网格面积；`wrap` 以贴图描轮廓在包裹 0–32 下为睫毛、头发细束与手生成网格，报告顶点数、轮廓环数、耗时与网格外像素 | `mesh-trace/<用例>.png`、`report.txt`；`mesh-wrap/<用例>.png`、`report.txt` |
 | `StructureMeshTool` | 按纹理结构重布点：在示例 PSD（`PSD2LIVE_STRUCTURE_PSD`，默认 tml）的衣物与头发图层（或 `PSD2LIVE_STRUCTURE_LAYERS` 列出的图层）上运行 `layer_mesh_structure` 的计划，并排绘出旧网格与新网格及识别线（褶皱橙、阴影蓝、图案紫，未采用的线变淡），报告顶点数、采用的线、褶皱带数与耗时；`PSD2LIVE_STRUCTURE_SETTINGS` 传入设置 JSON | `structure-mesh/<网格>.png`、`report.txt` |
@@ -222,7 +233,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 - 界面与 MCP 应调用同一套编辑命令。`org.umamo.edit` 中的底层方法不自动等同于公开接口。
 - 验收链路：领域数据 → 历史重放 → 工程保存与恢复 → 目标 Cubism 版本处理 → 导出读回 → 视觉检查。详见[运行时与导出边界](../spec/RUNTIME_EXPORT_ARCHITECTURE_AND_GAPS.md)。
 
-界面文案新增时，`Messages.properties`、`Messages_zh_CN.properties`、`Messages_ja.properties`、`Messages_ko.properties` 四个文件需要同时添加，保持键数一致（`MessageBundleParityTest` 检查）。
+界面文案新增时，`Messages.properties`、`Messages_zh_CN.properties`、`Messages_ja.properties`、`Messages_ko.properties` 四个文件需要同时添加，保持键数一致（`CatalogContractsTest` 检查）。
 
 ## 检查导出结果
 

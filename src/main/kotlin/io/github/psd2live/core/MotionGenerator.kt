@@ -44,8 +44,97 @@ object MotionGenerator {
 	val idleBlinkTracks: List<MotionTrack> = listOf("ParamEyeLOpen", "ParamEyeROpen").map { id ->
 		val points = mutableListOf(0f to 1f)
 		for (start in listOf(2.7f, 6.9f, 7.25f, 10.6f)) points += listOf(start to 1f, start + 0.08f to 0f, start + 0.18f to 1f)
-		MotionCurveMath.linear(id, points + (SkeletonMotions.IDLE_DURATION to 1f))
+		MotionCurveMath.eased(id, points + (SkeletonMotions.IDLE_DURATION to 1f))
 	}
+
+	/**
+	 * The idle's blinks the `motion/natural` way, over its 12 seconds: shutting in about two frames, a breath shut,
+	 * opening over about five frames with an easing out, at uneven gaps of two to five seconds, one of them doubled;
+	 * the right eye a frame behind the left.
+	 */
+	val naturalBlinkTracks: List<MotionTrack> = listOf("ParamEyeLOpen" to 0f, "ParamEyeROpen" to 1f / 60f).map { (id, lag) ->
+		val points = mutableListOf(0f to 1f)
+		for ((start, depth) in listOf(1.9f to 1f, 5.4f to 1f, 5.78f to 0.8f, 9.1f to 1f)) {
+			val s = start + lag
+			points += listOf(s to 1f, s + 0.07f to 1f - depth, s + 0.11f to 1f - depth, s + 0.2f to 1f - 0.8f * depth * 0.25f, s + 0.3f to 1f)
+		}
+		// Eased, so the shut accelerates and the open settles instead of moving at one speed.
+		MotionCurveMath.eased(id, points + (SkeletonMotions.IDLE_DURATION to 1f))
+	}
+
+	/**
+	 * Speech the `motion/natural` way, over about six seconds: syllables mostly small - lip sync spends most of its
+	 * time at a small opening - now and then a wide one, short pauses between phrases; each syllable leans on a vowel
+	 * (A I U E O) as the opening suggests, the mouth's form wanders a little, and the head nods with the stresses.
+	 */
+	val talkTracks: List<MotionTrack> = run {
+		// Opening, vowel and length of each syllable; zeros are pauses.
+		val syllables = listOf(0.35f to 'A', 0.2f to 'I', 0.45f to 'O', 0f to ' ', 0.25f to 'E', 0.3f to 'A', 0.15f to 'U', 0.75f to 'A', 0f to ' ',
+			0.2f to 'I', 0.4f to 'E', 0.25f to 'O', 0.35f to 'A', 0.15f to 'U', 0f to ' ', 0.3f to 'E', 0.55f to 'A', 0.2f to 'I', 0f to ' ')
+		val open = mutableListOf(0f to 0f)
+		val vowels = "AIUEO".associateWith { mutableListOf(0f to 0f) }
+		var t = 0.2f
+		for ((k, entry) in syllables.withIndex()) {
+			val (amount, vowel) = entry
+			val length = if (amount == 0f) 0.45f else 0.2f + 0.06f * (k % 3)
+			val peak = t + length * 0.45f
+			open += listOf(t to 0f, peak to amount, t + length to 0.02f)
+			vowels[vowel]?.let { it += listOf(t to 0f, peak to (0.4f + amount).coerceAtMost(1f), t + length to 0f) }
+			t += length
+		}
+		open += (t + 0.2f) to 0f
+		val end = t + 0.2f
+		listOf(MotionCurveMath.linear("ParamMouthOpenY", open)) +
+			vowels.map { (v, points) -> MotionCurveMath.linear("Param$v", points + (end to 0f)) } +
+			MotionCurveMath.eased("ParamMouthForm", listOf(0f to 0.1f, end * 0.3f to 0.3f, end * 0.6f to 0f, end to 0.1f)) +
+			MotionCurveMath.eased("ParamAngleY", listOf(0f to 0f, 1.3f to -2.5f, 1.8f to 0.5f, 3.4f to -2f, 4.0f to 0.5f, end to 0f)) +
+			MotionCurveMath.eased("ParamBrowLY", listOf(0f to 0f, 1.3f to 0.25f, 2f to 0f, 3.4f to 0.2f, 4.2f to 0f, end to 0f)) +
+			MotionCurveMath.eased("ParamBrowRY", listOf(0f to 0f, 1.3f to 0.25f, 2f to 0f, 3.4f to 0.2f, 4.2f to 0f, end to 0f))
+	}
+
+	/** One blink the `motion/natural` way: shut fast, open slowly, the right eye a frame late; twice when [double]. */
+	fun naturalBlink(closure: Float = 1f, double: Boolean = false): List<MotionTrack> {
+		val depth = closure.coerceIn(0f, 1f)
+		return listOf("ParamEyeLOpen" to 0f, "ParamEyeROpen" to 1f / 60f).map { (id, lag) ->
+			fun blink(s: Float, d: Float) = listOf(s to 1f, s + 0.07f to 1f - d, s + 0.11f to 1f - d, s + 0.2f to 1f - 0.2f * d, s + 0.3f to 1f)
+			val points = listOf(0f to 1f) + blink(0.35f + lag, depth) + (if (double) blink(0.73f + lag, depth * 0.8f) else emptyList()) +
+				((if (double) 1.4f else 1.2f) to 1f)
+			MotionCurveMath.eased(id, points)
+		}
+	}
+
+	/**
+	 * The idle's glances, the `motion/natural` way: three times in its 12 seconds the eyes slip aside, drift while
+	 * they hold, and overshoot a little on the way home.
+	 */
+	val glanceTracks: List<MotionTrack> = listOf(
+		// The hold drifts a little, and the eye overshoots on the way home, instead of parking and sliding back.
+		MotionCurveMath.eased("ParamEyeBallX", listOf(
+			0f to 0f, 2.6f to 0f, 2.82f to 0.52f, 3.35f to 0.58f, 3.9f to 0.4f, 4.15f to -0.08f, 4.45f to 0f,
+			6.9f to 0f, 7.12f to -0.42f, 7.7f to -0.5f, 8.15f to -0.28f, 8.4f to 0.06f, 8.7f to 0f,
+			10.15f to 0f, 10.32f to 0.24f, 10.85f to 0.18f, 11.15f to -0.04f, 11.4f to 0f, SkeletonMotions.IDLE_DURATION to 0f,
+		)),
+		MotionCurveMath.eased("ParamEyeBallY", listOf(
+			0f to 0f, 2.6f to 0f, 2.82f to 0.08f, 3.5f to 0.12f, 4.45f to 0f,
+			6.9f to 0f, 7.12f to -0.34f, 7.7f to -0.28f, 8.15f to -0.36f, 8.7f to 0f,
+			10.15f to 0f, 10.32f to -0.08f, 11.15f to 0f, SkeletonMotions.IDLE_DURATION to 0f,
+		)),
+	)
+
+	/**
+	 * The idle's face, the `motion/natural` way: the brows rise and settle with the breaths, the right one a
+	 * little later and less, so the face is not a mask between blinks.
+	 */
+	val idleFaceTracks: List<MotionTrack> = listOf(
+		MotionCurveMath.eased("ParamBrowLY", listOf(
+			0f to 0f, 1.2f to 0.16f, 3.7f to -0.04f, 4.2f to 0f, 5.5f to 0.1f, 7.5f to -0.02f,
+			8.9f to 0.18f, 11.2f to 0.02f, SkeletonMotions.IDLE_DURATION to 0f,
+		), loop = true),
+		MotionCurveMath.eased("ParamBrowRY", listOf(
+			0f to 0f, 1.4f to 0.12f, 3.9f to -0.03f, 4.4f to 0f, 5.7f to 0.08f, 7.7f to 0f,
+			9.15f to 0.14f, 11.4f to 0f, SkeletonMotions.IDLE_DURATION to 0f,
+		), loop = true),
+	)
 
 	/**
 	 * An authored clip as motion3 JSON, each key's interpolation written as its segment type. A curve that
@@ -83,30 +172,44 @@ object MotionGenerator {
 	val nodTracks: List<MotionTrack> = nodTracks()
 
 	/**
-	 * [count] nods: the head dips, comes partly back up between dips, each a little shallower, and after the
-	 * last overshoots upward before it settles. The body and the eyelids go with the head.
+	 * [count] nods. The head looks up a little first, then dips quickly and rises more slowly, each dip a
+	 * little shallower; after the last it overshoots upward and settles. The body arrives late, the eyes
+	 * squint into the dip, and the head turns a few degrees so the nod is not a straight slide.
 	 */
 	fun nodTracks(count: Int = 1): List<MotionTrack> {
-		val head = mutableListOf(0f to 0f)
-		val eyes = mutableListOf(0f to 1f)
-		var time = 0.55f
-		for (index in 0 until count.coerceAtLeast(1)) {
-			head += time to -18f * (1f - 0.15f * index)
-			eyes += time to 0.75f
-			if (index < count - 1) {
-				head += time + 0.35f to -3f
-				eyes += time + 0.35f to 0.95f
-				time += 0.7f
+		val nods = count.coerceAtLeast(1)
+		val head = mutableListOf(0f to 0f, 0.16f to 4.5f)
+		val eyes = mutableListOf(0f to 1f, 0.16f to 1f)
+		val tilt = mutableListOf(0f to 0f, 0.16f to 1.2f)
+		var time = 0.16f
+		for (index in 0 until nods) {
+			val depth = 22f * (1f - 0.12f * index).coerceAtLeast(0.5f)
+			val bottom = time + 0.22f
+			head += bottom to -depth
+			eyes += bottom to (0.55f + 0.06f * index).coerceAtMost(0.8f)
+			tilt += bottom to -2.4f * (depth / 22f)
+			if (index < nods - 1) {
+				val crest = bottom + 0.4f
+				head += crest to -3.5f
+				eyes += crest to 0.9f
+				tilt += crest to 0.5f
+				time = crest
+			} else {
+				head += listOf(bottom + 0.46f to 7f, bottom + 0.78f to -1.8f, bottom + 1.2f to 0f)
+				eyes += listOf(bottom + 0.3f to 1f, bottom + 1.2f to 1f)
+				tilt += listOf(bottom + 0.46f to 1.5f, bottom + 1.2f to 0f)
 			}
 		}
-		head += listOf(time + 0.7f to 6f, time + 1.45f to 0f)
-		eyes += listOf(time + 0.7f to 1f, time + 1.45f to 1f)
-		val body = head.map { (t, v) -> t to v * if (v < 0f) 4f / 18f else 0.25f }
+		val lean = head.map { (t, v) -> t to if (v < -8f) 2.2f * (v / -22f) else 0f }
 		return listOf(
-			MotionCurveMath.linear("ParamAngleY", head),
-			MotionCurveMath.linear("ParamBodyAngleY", body),
-			MotionCurveMath.linear("ParamEyeLOpen", eyes),
-			MotionCurveMath.linear("ParamEyeROpen", eyes),
+			MotionCurveMath.eased("ParamAngleY", head),
+			MotionCurveMath.eased("ParamBodyAngleY", followed(head, 0.1f) { v -> v * if (v < 0f) 0.22f else 0.16f }),
+			MotionCurveMath.eased("ParamAngleZ", tilt),
+			MotionCurveMath.eased("ParamAngleX", lean),
+			MotionCurveMath.eased("ParamBrowLY", followed(head, 0.05f) { v -> (-v / 40f).coerceIn(-0.45f, 0.35f) }),
+			MotionCurveMath.eased("ParamBrowRY", followed(head, 0.08f) { v -> (-v / 48f).coerceIn(-0.4f, 0.3f) }),
+			MotionCurveMath.eased("ParamEyeLOpen", eyes),
+			MotionCurveMath.eased("ParamEyeROpen", eyes),
 		)
 	}
 
@@ -116,21 +219,40 @@ object MotionGenerator {
 
 	val shakeTracks: List<MotionTrack> = shakeTracks()
 
-	/** [count] shakes of the head, each a little narrower, then a small settle; the body and the tilt follow. */
+	/**
+	 * [count] shakes. A small wind-up, then turns that slow into each extreme and leave it quicker, each one
+	 * a little narrower and not quite the same length; the body and the tilt arrive late, and the eyes
+	 * narrow on the wider swings.
+	 */
 	fun shakeTracks(count: Int = 1): List<MotionTrack> {
-		val head = mutableListOf(0f to 0f)
-		var time = 0.4f
-		for (index in 0 until count.coerceAtLeast(1)) {
-			val reach = 20f * (1f - 0.12f * index)
-			head += listOf(time to -reach, time + 0.5f to reach)
-			time += 1f
+		val shakes = count.coerceAtLeast(1)
+		val head = mutableListOf(0f to 0f, 0.14f to 5f)
+		var time = 0.14f
+		for (index in 0 until shakes) {
+			val reach = 22f * (1f - 0.14f * index).coerceAtLeast(0.5f)
+			val out = 0.26f + 0.03f * index
+			val back = 0.22f
+			head += (time + out) to -reach
+			head += (time + out + back) to reach * 0.9f
+			time += out + back
 		}
-		head += listOf(time to -8f, time + 0.6f to 0f)
+		head += listOf(time + 0.28f to -6f, time + 0.62f to 1.4f, time + 1.05f to 0f)
+		val eyes = head.map { (t, v) -> t to if (kotlin.math.abs(v) > 12f) 0.78f else 1f }
 		return listOf(
-			MotionCurveMath.linear("ParamAngleX", head),
-			MotionCurveMath.linear("ParamBodyAngleX", head.map { (t, v) -> t to v * 0.15f }),
-			MotionCurveMath.linear("ParamAngleZ", head.map { (t, v) -> t to if (v == -8f) 1f else -v * 0.1f }),
+			MotionCurveMath.eased("ParamAngleX", head),
+			MotionCurveMath.eased("ParamBodyAngleX", followed(head, 0.1f) { it * 0.16f }),
+			MotionCurveMath.eased("ParamAngleZ", followed(head, 0.06f) { -it * 0.1f }),
+			MotionCurveMath.eased("ParamEyeLOpen", eyes),
+			MotionCurveMath.eased("ParamEyeROpen", eyes),
 		)
+	}
+
+	/** [points] a moment later, still starting and ending with them, so a heavier part can follow. */
+	private fun followed(points: List<Pair<Float, Float>>, delay: Float, map: (Float) -> Float): List<Pair<Float, Float>> {
+		val end = points.last().first
+		val shifted = (listOf(0f to map(points.first().second)) + points.map { (t, v) -> (t + delay).coerceAtMost(end) to map(v) } +
+			(end to map(points.last().second)))
+		return shifted.groupBy { it.first }.map { (t, values) -> t to values.last().second }.sortedBy { it.first }
 	}
 
 	/** Generated [tracks] as motion3 JSON; a [loop] lasts [duration], the cycle the tracks were made for. */

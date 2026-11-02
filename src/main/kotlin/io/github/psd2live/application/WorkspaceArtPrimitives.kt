@@ -28,13 +28,19 @@ internal object WorkspaceArtPrimitives {
                     replace: Map<DrawableId, List<DrawableId>>, masks: Map<DrawableId, List<DrawableId>>, extra: JsonObject,
                     userRecord: JsonObject, work: WorkspaceRasterWork): WorkspaceDocument {
         work.progress(0.78f, "Splitting the generated rig")
-        val generated = model.baseRig.resolvedPuppet()
+        // The generated rig under the IDs the journal's conversions gave its objects, as [original] is named; the record
+        // replays on the generated rig itself, so it names the original as the generators do.
+        val journal = model.config.rigEdits.authoringJournal
+        val generated = io.github.psd2live.core.RigIdConversion.converted(model.baseRig.resolvedPuppet(), journal)
+        val generatedIds = model.config.rigEdits.idRenames.of("mesh").entries.associate { (from, to) -> DrawableId(to) to DrawableId(from) }
+        fun generatedId(id: DrawableId) = generatedIds[id] ?: id
         val generatedParts = if (generated.drawables.none { it.id == original }) null else split.split(generated, user = false)
         work.checkpoint()
         val authoredParts = requireNotNull(split.split(model.authored.rig.puppet, user = true)) { "The split original is not in the rig: ${original.raw}" }
         val record = if (generatedParts == null) userRecord else JsonObject(ArtPrimitiveJournal.encode(origin, PuppetSourceAtlas.SOURCE_ID_RAW,
-            listOf(original), listOf(originalLayer), replace, parts.map { declaration(generatedParts, authoredParts, it) }, emptyList(), emptyList(),
-            masks, version = ArtPrimitiveV2.VERSION_V2) + extra)
+            listOf(generatedId(original)), listOf(originalLayer), replace.mapKeys { generatedId(it.key) },
+            parts.map { declaration(generatedParts, authoredParts, it) }, emptyList(), emptyList(),
+            masks.mapKeys { generatedId(it.key) }, version = ArtPrimitiveV2.VERSION_V2) + extra)
         val placed = document(generatedParts != null)
         val candidate = placed.copy(rigEdits = placed.rigEdits.copy(authoringJournal = placed.rigEdits.authoringJournal + record))
         val decoded = candidate.config()
@@ -101,7 +107,7 @@ internal object WorkspaceArtPrimitives {
         ArtPrimitiveJournal.replacementDrawables(overlay) + ArtPrimitiveJournal.replacementLayers(overlay)
 
     /** Request fields that name an existing layer or object; new ids and display names are not checked. */
-    private val referenceFields = setOf("layer_id", "layer_ids", "target", "targets", "destination", "source_id", "middle_ids",
+    internal val referenceFields = setOf("layer_id", "layer_ids", "target", "targets", "destination", "source_id", "middle_ids",
         "mesh_a", "mesh_b", "meshes", "mesh_id", "mesh_ids", "drawable_id", "drawable_ids", "object_id", "object_ids")
 
     /** Every reference field in [request] naming a superseded layer or mesh, alone or as `kind:id`. */
@@ -162,7 +168,7 @@ internal object WorkspaceArtPrimitives {
         } ?: LayerClassificationOverride()
         val ids = parts.map { it.id.raw }
         val parent = if (id in document.parentOverrides) document.parentOverrides[id] else model.rig.puppet.drawables.firstOrNull {
-            it.id.raw == id || model.rig.layerIdByDrawableId[it.id.raw] == id
+            it.id.raw == id || model.rig.ownLayerIdByDrawableId[it.id.raw] == id
         }?.parentDeformerId?.raw
         val owner = if (document.source.layers.any { it.id.raw == id }) id else document.source.layers
             .map { it.id.raw }.filter { id.startsWith("$it:") }.maxByOrNull(String::length)

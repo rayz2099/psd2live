@@ -16,9 +16,12 @@ internal object WorkspaceDrawOrderEdits {
         validateOperationSchema(request, WorkspaceDrawOrderSchemas.request)
         val raw = request.getValue("target").jsonPrimitive.content.removePrefix("mesh:").removePrefix("layer:")
         val drawable = model.rig.puppet.drawables.singleOrNull { it.id.raw == raw }
-            ?: model.rig.puppet.drawables.singleOrNull { model.rig.layerIdByDrawableId[it.id.raw] == raw }
+            ?: model.rig.puppet.drawables.singleOrNull { model.rig.ownLayerIdByDrawableId[it.id.raw] == raw }
             ?: throw IllegalArgumentException("Draw-order target not found: $raw")
-        val layer = model.rig.layerIdByDrawableId[drawable.id.raw] ?: drawable.id.raw
+        // A copy over the bangs draws where its bangs are: an override would not last.
+        model.rig.seeThroughCopies[drawable.id.raw]?.let { throw WorkspaceGeneratedCopyEdit(drawable.id.raw, it) }
+        // A pasted copy is ordered by its own ID: its original's layer key would move both.
+        val layer = model.rig.ownLayerIdByDrawableId[drawable.id.raw] ?: drawable.id.raw
         val before = document.settings["drawOrderOverrides"]?.jsonObject?.mapValues { it.value.jsonPrimitive.float }
             ?: model.config.drawOrderOverrides
         val value = request.getValue("order")
@@ -42,10 +45,10 @@ internal object WorkspaceDrawOrderEdits {
     fun beside(document: WorkspaceDocument, model: RigPreviewModel, anchor: String, layerIds: List<String>, inFront: Boolean): WorkspaceDocument {
         if (layerIds.isEmpty()) return document
         val drawables = model.rig.puppet.drawables
-        val target = drawables.firstOrNull { model.rig.layerIdByDrawableId[it.id.raw] == anchor } ?: drawables.firstOrNull { it.id.raw == anchor }
+        val target = drawables.firstOrNull { model.rig.ownLayerIdByDrawableId[it.id.raw] == anchor } ?: drawables.firstOrNull { it.id.raw == anchor }
             ?: return document
         val at = target.drawOrder
-        val others = drawables.filter { it !== target && model.rig.layerIdByDrawableId[it.id.raw] !in layerIds }.map { it.drawOrder }
+        val others = drawables.filter { it !== target && model.rig.ownLayerIdByDrawableId[it.id.raw] !in layerIds }.map { it.drawOrder }
         val bound = if (inFront) others.filter { it > at }.minOrNull() ?: 1001f else others.filter { it < at }.maxOrNull() ?: -1f
         val step = (bound - at) / (layerIds.size + 1)
         // The first image of the batch draws in front of the rest.

@@ -5,6 +5,7 @@ import io.github.psd2live.testing.MESSAGE_BUNDLES
 import io.github.psd2live.testing.messageBundle
 import io.github.psd2live.testing.missingMessages
 import io.github.psd2live.ui.CanvasTool
+import io.github.psd2live.ui.MeshPointMode
 import io.github.psd2live.ui.state.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -15,6 +16,14 @@ import kotlin.test.assertTrue
  * no keymap preset binds one input twice, and the command line accepts every option its help lists.
  */
 class CatalogContractsTest {
+	/** Every value the graphics settings page names. */
+	private val graphicsChoices: List<io.github.psd2live.render.GraphicsChoice> =
+		listOf(io.github.psd2live.render.RenderPath.entries, io.github.psd2live.render.VsyncMode.entries,
+			io.github.psd2live.render.FrameRateLimit.entries, io.github.psd2live.render.BackgroundFrameRate.entries,
+			io.github.psd2live.render.WindowAntialiasing.entries, io.github.psd2live.render.CanvasAntialiasing.entries,
+			io.github.psd2live.render.TextureFiltering.entries, io.github.psd2live.render.GpuCacheSize.entries,
+			io.github.psd2live.render.ThreadedGl.entries, io.github.psd2live.render.QualityPreset.entries).flatten()
+
 	@Test fun everyLanguageHasEveryMessageAndEveryToolAndShortcutIsNamed() {
 		val bundles = MESSAGE_BUNDLES.associateWith(::messageBundle)
 		val reference = bundles.getValue("Messages").stringPropertyNames()
@@ -24,7 +33,17 @@ class CatalogContractsTest {
 			assertEquals(emptySet(), keys - reference, "$name has keys the English bundle lacks")
 			assertEquals(emptyList(), keys.filter { props.getProperty(it).isBlank() }, "$name has blank values")
 		}
-		assertEquals(emptyList(), missingMessages(CanvasTool.entries.map { "editor.tool.${it.name.lowercase()}" } + ShortcutAction.entries.map { it.labelKey }))
+		assertEquals(emptyList(), missingMessages(CanvasTool.entries.map { "editor.tool.${it.name.lowercase()}" } + ShortcutAction.entries.map { it.labelKey } +
+			SettingsTopic.entries.map { it.labelKey } + graphicsChoices.flatMap { listOfNotNull(it.labelKey, it.descriptionKey) }))
+	}
+
+	/** The point tool's two faces (the old point tool and knife) each keep a name, a hint and their old key in every preset that had it. */
+	@Test fun everyFaceOfThePointToolIsNamedAndKeepsItsKey() {
+		assertEquals(emptyList(), missingMessages(MeshPointMode.entries.flatMap { listOf(it.labelKey, it.hintKey) }))
+		assertEquals(MeshPointMode.entries.size, MeshPointMode.entries.map { it.action }.toSet().size)
+		val keymap = Keymap.of(KeymapPreset.entries.first())
+		assertEquals("K", keymap.labelFor(MeshPointMode.LINE.action))
+		assertEquals("Alt+M", keymap.labelFor(MeshPointMode.POINT.action))
 	}
 
 	@Test fun everyKeymapPresetIsFreeOfCollisions() {

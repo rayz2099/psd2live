@@ -121,6 +121,7 @@ class WorkspaceReferenceEditsTest {
 		assertTrue("guide" !in given.layout.generation.pendingLayerIds && "guide" in WorkspaceReferenceMeshes.createdLayerIds(given))
 		assertTrue(builder.build(given, built).rig.puppet.parts.none { it.id.raw == WorkspaceReferenceMeshes.PART_ID })
 	}
+
     @Test fun opacityEditsWorkBeforeAndAfterGenerationWithoutJournalingPendingMeshIds() = kotlinx.coroutines.runBlocking {
         for (generated in listOf(false, true)) {
             val base = document.copy(layout = document.layout.copy(generation = document.layout.generation.copy(generated = generated)))

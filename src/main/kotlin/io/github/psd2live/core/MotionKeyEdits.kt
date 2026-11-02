@@ -120,6 +120,8 @@ internal object MotionKeyEdits {
 		dv: Float,
 		ranges: Map<String, ClosedFloatingPointRange<Float>> = emptyMap(),
 		normalized: Boolean = false,
+		/** The values a key may hold, when they differ from [ranges] (a repeating parameter's turns). */
+		limits: Map<String, ClosedFloatingPointRange<Float>> = ranges,
 	): Pair<MotionClip, Set<MotionKeyRef>> {
 		val picked = keysOf(clip, selection)
 		if (picked.isEmpty()) return clip to selection
@@ -130,7 +132,8 @@ internal object MotionKeyEdits {
 		val next = mapKeys(clip, selection) { parameterId, key ->
 			val range = ranges[parameterId]
 			val delta = if (normalized && range != null) dv * (range.endInclusive - range.start) else dv
-			val value = (key.value + delta).let { if (range != null) it.coerceIn(range) else it }
+			val limit = limits[parameterId]
+			val value = (key.value + delta).let { if (limit != null) it.coerceIn(limit) else it }
 			key.copy(time = key.time + shift, value = value).also { moved += MotionKeyRef(parameterId, it.time) }
 		}
 		return next to moved
@@ -157,12 +160,12 @@ internal object MotionKeyEdits {
 		return picked.map { (id, key) -> id to key.copy(time = key.time - start) }
 	}
 
-	/** A shorter clip drops the keys past its end, holding each curve's value there. */
+	/** A shorter clip drops the keys past its end, holding each curve's value there, and the events past it. */
 	fun withDuration(clip: MotionClip, duration: Float): MotionClip {
 		if (duration >= clip.duration) return clip.copy(duration = duration)
 		return clip.copy(duration = duration, curves = clip.curves.map { curve ->
 			MotionCurve(curve.parameterId, trimKeys(curve.keys, duration))
-		})
+		}, events = clip.events.filter { it.time <= duration + MotionClips.TIME_EPSILON })
 	}
 
 	/**

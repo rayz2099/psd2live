@@ -54,6 +54,7 @@ internal class InteriorController(
 
 	override fun close() {
 		editJob?.cancel()
+		previewJob?.cancel()
 		stopTrial()
 		drafts.clear()
 		soloViews.clear()
@@ -103,6 +104,7 @@ internal class InteriorController(
 						overlay,
 						preview.config.layerVisibility,
 						preview.config.drawOrderOverrides,
+						io.github.psd2live.core.SeeThroughLayers.Settings.of(preview.config),
 					)
 					.puppet
 			}
@@ -116,6 +118,40 @@ internal class InteriorController(
 			return
 		draftProjection = Projection(preview.rig.puppet, effect, puppet, address)
 		startTrial(effect)
+	}
+
+	private var previewJob: Job? = null
+
+	/**
+	 * Shows [draft] on the audition while the panel or a canvas handle edits it, before it is committed: the same
+	 * `interior_put` on a candidate ([previewDraft]). Nothing to show at rest, where the effect moves no vertex.
+	 */
+	internal fun previewLater(target: String, enabled: Boolean, draft: InteriorDraft) {
+		if (!enabled || !draft.dirty || poseTarget == null) return
+		val version = draft.version
+		previewJob?.cancel()
+		previewJob = scope.launch {
+			delay(90)
+			try {
+				previewDraft(draft.request(target, enabled), draft, version)
+			} catch (e: kotlinx.coroutines.CancellationException) {
+				throw e
+			} catch (e: Exception) {
+				fail(e.message ?: e.toString())
+			}
+		}
+	}
+
+	/**
+	 * Withdraws a draft preview that was never committed - a canvas drag cancelled with Esc - so the audition shows
+	 * [effect] as saved again rather than the abandoned values.
+	 */
+	internal fun dropDraftPreview(effect: NativeInteriorEffect?) {
+		previewJob?.cancel()
+		previewJob = null
+		if (draftProjection == null) return
+		draftProjection = null
+		if (effect != null && effect.enabled && poseTarget != null) startTrial(effect)
 	}
 
 	private val drafts = mutableMapOf<String, InteriorDraft>()

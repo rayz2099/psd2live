@@ -113,7 +113,7 @@ object WorkspaceViewRenderer {
 			require(vertices.size == requireNotNull(drawable.mesh).positions.size && vertices.all(Float::isFinite)) { "Invalid simulated mesh coordinates: ${id.raw}" }
 		}
 		val geometry = org.umamo.render.eval.DeformedGeometry(evaluated.worldPositions + worldPositions.filterKeys { it in evaluated.worldPositions },
-			evaluated.drawOrder, evaluated.opacity)
+			evaluated.drawOrder, evaluated.opacity, evaluated.multiplyColor, evaluated.screenColor)
 		val drawableBounds = RigCanvasSupport.boundsByDrawable(geometry)
 		val boundsByLayer = boundsByLayer(model, drawableBounds)
 		val resolvedFrame = resolveFrame(frame, boundsByLayer)
@@ -283,7 +283,7 @@ object WorkspaceViewRenderer {
 	                                 viewport: CanvasViewport, included: Set<String>) {
 		val ids = model.referenceLayerIds.filter { it in included }.toSet()
 		if (ids.isEmpty()) return
-		val quadOf = model.rig.puppet.drawables.associateBy { model.rig.layerIdByDrawableId[it.id.raw] }
+		val quadOf = model.rig.puppet.drawables.associateBy { model.rig.ownLayerIdByDrawableId[it.id.raw] }
 		val g = image.createGraphics()
 		try {
 			g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR)

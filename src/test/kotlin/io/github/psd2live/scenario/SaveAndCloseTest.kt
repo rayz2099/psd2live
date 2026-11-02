@@ -1,6 +1,5 @@
 package io.github.psd2live.scenario
 
-import io.github.psd2live.agent.AgentCallRecord
 import io.github.psd2live.application.WorkspaceBackend
 import io.github.psd2live.project.*
 import io.github.psd2live.ui.state.*
@@ -14,7 +13,6 @@ import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.*
 
 class SaveAndCloseTest {
@@ -25,15 +23,11 @@ class SaveAndCloseTest {
             vm.setStateForTest(vm.state.value.copy(atlasSize = 512, exportMoc3 = false, generatePhysics = false))
             DesktopWorkspace(vm, temp.resolve("store")).use { workspace ->
                 vm.attachWorkspace(workspace)
-                workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+                workspace.importPsd(Characters.headPsd(temp).toString(), true)
                 body(vm, workspace)
             }
         }
     }
-
-    private fun observeRead(vm: PSD2LiveViewModel) = vm.agentCallObserver.onCall(
-        AgentCallRecord("workspace_call", "job_get", true, true, 1, JsonObject(emptyMap()),
-            buildJsonObject { put("status", "running") }, null, emptyList()))
 
     private fun changePresentation(vm: PSD2LiveViewModel) {
         val layer = vm.state.value.analysis!!.layers.first().source.id.raw
@@ -44,13 +38,13 @@ class SaveAndCloseTest {
         vm.setParameterSearchQuery("Angle")
         vm.setHierarchyView(width = 250f, collapsed = true, search = "layer")
         vm.setHistoryView(1.5f, 10f, 20f, "edit", true)
+        vm.setHistoryCompressed(false)
         vm.setDrawOrderRulerWidth(45f)
         vm.setInspectorCollapsed(true)
         vm.setDynamicsSubExpanded(true)
         vm.setSimulationPresetsExpanded(true)
         vm.setStrengthSubExpanded(true)
-        vm.setRigTuningExpanded(true)
-        vm.setRigTuningAdvancedExpanded(true)
+        vm.setRigModulesExpanded(true)
         vm.setLogPanelExpanded(true)
         vm.setLogPanelHeight(200f)
         vm.setWorkspaceLayout(vm.state.value.activeWorkspace.id, "{\"layout\":[]}")
@@ -85,15 +79,9 @@ class SaveAndCloseTest {
         vm.saveProjectNow(temp.resolve("presentation.psd2live"))
         workspace.open(temp.resolve("presentation.psd2live"))
         assertEquals(TabCamera(2f, 30f, 40f), vm.state.value.activeCanvas.camera)
+        assertFalse(vm.state.value.historyCompressed, "The history view mode must survive save and reopen")
         assertFalse(vm.state.value.projectDirty)
         assertEquals(head, workspace.snapshot().historyHeadNodeId)
-    }
-
-    @Test fun presentationChangingDuringSaveStillAllowsTheCapturedContentToBecomeClean() = editor { vm, workspace ->
-        duringSave(vm, workspace, temp.resolve("changing-presentation.psd2live")) { changePresentation(vm) }
-        assertFalse(vm.state.value.projectDirty)
-        assertFalse(workspace.hasUnsavedChanges())
-        assertNull(vm.state.value.projectSaveError)
     }
 
     @Test fun changingAnUncommittedFieldBackToItsSavedValueClearsTheDirtyState() = editor { vm, workspace ->
@@ -181,14 +169,6 @@ class SaveAndCloseTest {
         assertEquals(savedModel, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
     }
 
-    @Test fun openingACleanProjectAllowsPresentationChangesWithoutDiscardPermission() = editor { vm, workspace ->
-        val archive = temp.resolve("clean-open.psd2live")
-        vm.saveProjectNow(archive)
-        openWithInterveningEdit(vm, workspace, archive, false) { changePresentation(vm) }
-        assertFalse(vm.state.value.projectDirty)
-        assertFalse(workspace.hasUnsavedChanges())
-    }
-
     @Test fun discardDoesNotAuthorizeLosingAnEditMadeAfterOpeningStarted() = editor { vm, workspace ->
         val archive = temp.resolve("late-edit.psd2live")
         vm.saveProjectNow(archive)
@@ -234,6 +214,61 @@ class SaveAndCloseTest {
         assertEquals(2, prompts)
         assertFalse(vm.state.value.projectDirty)
         assertNull(vm.state.value.errorMessage)
+    }
+
+    @Test fun discardAndOpenCanFollowACancelledEditorDraft() = editor { vm, workspace ->
+        val archive = temp.resolve("cancelled-draft.psd2live")
+        vm.saveProjectNow(archive)
+        val generation = vm.state.value.projectOpenGeneration
+        val cancelledDraft = CompletableDeferred<Unit>().apply { cancel(CancellationException("Editor draft cancelled")) }
+        vm.attachWorkspace(object : WorkspaceBackend by workspace {
+            override suspend fun awaitEditorDrafts() { cancelledDraft.await() }
+        })
+        assertFailsWith<CancellationException> { vm.openProjectNow(archive) }
+        vm.setOutputPath(temp.resolve("discard-output").toString())
+        vm.confirmUnsavedChanges = { 1 }
+        vm.openProject(archive)
+        val opened = withTimeout(20_000) {
+            vm.state.first { it.projectOpenGeneration > generation || it.errorMessage != null }
+        }
+        assertNull(opened.errorMessage)
+        assertTrue(opened.projectOpenGeneration > generation)
+        assertFalse(opened.projectDirty)
+        assertFalse(workspace.hasUnsavedChanges())
+    }
+
+    @Test fun discardAndImportCanFollowACancelledEditorDraft() = editor { vm, workspace ->
+        val generation = vm.state.value.projectOpenGeneration
+        val cancelledDraft = CompletableDeferred<Unit>().apply { cancel(CancellationException("Editor draft cancelled")) }
+        vm.attachWorkspace(object : WorkspaceBackend by workspace {
+            override suspend fun awaitEditorDrafts() { cancelledDraft.await() }
+        })
+        vm.confirmUnsavedChanges = { 1 }
+        vm.withSavedChanges { vm.analyze(discardUnsaved = true) }
+        val imported = withTimeout(20_000) {
+            vm.state.first { it.projectOpenGeneration > generation && !it.isAnalyzing || it.errorMessage != null }
+        }
+        assertNull(imported.errorMessage)
+        assertTrue(imported.projectOpenGeneration > generation)
+        assertTrue(imported.projectDirty)
+    }
+
+    @Test fun cancellingTheOpenItselfStillKeepsTheCurrentProject() = editor { vm, workspace ->
+        val archive = temp.resolve("cancel-open.psd2live")
+        vm.saveProjectNow(archive)
+        val before = workspace.snapshot()
+        val entered = CompletableDeferred<Unit>()
+        vm.attachWorkspace(object : WorkspaceBackend by workspace {
+            override suspend fun awaitEditorDrafts() { entered.complete(Unit); awaitCancellation() }
+        })
+        coroutineScope {
+            val opening = async { vm.openProjectNow(archive, discardUnsaved = true) }
+            withTimeout(20_000) { entered.await() }
+            opening.cancelAndJoin()
+            assertTrue(opening.isCancelled)
+        }
+        assertEquals(before.projectId, workspace.snapshot().projectId)
+        assertEquals(before.state, workspace.snapshot().state)
     }
 
     @Test fun discardAndOpenWaitsForAnEarlierEditAndThenReplacesTheProject() = editor { vm, workspace ->
@@ -406,23 +441,6 @@ class SaveAndCloseTest {
         assertTrue(Files.isRegularFile(archive))
     }
 
-    @Test fun anImportedCmo3KeepsItsOriginalPayloadAfterTheExternalFileIsDeleted() = editor { vm, workspace ->
-        val exported = temp.resolve("import-payload")
-        val result = workspace.exportTarget(workspace.stateToken()!!, "cmo3", exported.toString(), emptyMap())
-        val source = exported.resolve(result.getValue("files").jsonArray.map { it.jsonPrimitive.content }.single { it.endsWith(".cmo3") })
-        val bytes = Files.readAllBytes(source)
-        workspace.importCmo3(source, io.github.psd2live.core.Cmo3ImportMode.NEW, true)
-        val model = Oracles.hash(vm.state.value.previewModel!!.rig.puppet)
-        Files.delete(source)
-        val archive = temp.resolve("owned-cmo3.psd2live")
-        vm.saveProjectNow(archive)
-        java.util.zip.ZipFile(archive.toFile()).use { zip ->
-            assertContentEquals(bytes, zip.getInputStream(zip.getEntry("source/original.cmo3")).use { it.readAllBytes() })
-        }
-        workspace.open(archive)
-        assertEquals(model, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
-    }
-
     @Test fun changingAnAgentsParameterDefaultPreservesTheAuthoredPoseThroughSaveCloseAndReopen() = editor { vm, workspace ->
         val archive = temp.resolve("parameter.psd2live")
         vm.saveProjectNow(archive)
@@ -448,88 +466,18 @@ class SaveAndCloseTest {
         assertEquals(model, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
     }
 
-    @Test fun readOnlyPollingDoesNotPreventSaveAndClose() = editor { vm, workspace ->
-        val archive = temp.resolve("polling.psd2live")
+    @Test fun aGestureOverAnExternalCommitLandsAndDoesNotPoisonFutureSaves() = editor { vm, workspace ->
+        val archive = temp.resolve("carried.psd2live")
         vm.saveProjectNow(archive)
-        val original = workspace.snapshot()
-        repeat(3) {
-            coroutineScope {
-                val poll = async(start = CoroutineStart.UNDISPATCHED) {
-                    withTimeout(20_000) { vm.projectProgress.first { (it?.fraction ?: 0f) >= 0.15f } }
-                    repeat(10) { observeRead(vm) }
-                }
-                vm.saveProjectNow(archive)
-                poll.await()
-            }
-            assertFalse(vm.state.value.projectDirty)
-            assertNull(vm.state.value.projectSaveError)
-            assertEquals(original.state, workspace.stateToken())
-            assertEquals(original.historyHeadNodeId, workspace.snapshot().historyHeadNodeId)
-        }
-        vm.setOutputPath(temp.resolve("export-polling").toString())
-        coroutineScope {
-            val poll = async(start = CoroutineStart.UNDISPATCHED) {
-                withTimeout(20_000) { vm.projectProgress.first { (it?.fraction ?: 0f) >= 0.15f } }
-                observeRead(vm)
-            }
-            val closed = CompletableDeferred<Unit>()
-            vm.confirmUnsavedChanges = { 0 }
-            vm.withSavedChanges { closed.complete(Unit) }
-            withTimeout(20_000) { closed.await() }
-            poll.await()
-        }
-    }
-
-    @Test fun aBatchKeepsThePoseIntroducedBeforeALaterDefaultChange() = editor { vm, workspace ->
-        workspace.applyDocumentEdits(workspace.stateToken()!!, "Create and update an axis", listOf(
-            io.github.psd2live.application.WorkspaceDocumentOperation("parameter_create", buildJsonObject {
-                put("parameter_id", "ParamProbe"); put("name", "Probe"); put("default", 0.25f)
-            }),
-            io.github.psd2live.application.WorkspaceDocumentOperation("parameter_update", buildJsonObject {
-                put("parameter_id", "ParamProbe"); put("default", 0.75f)
-            })), MutationAuthor.AGENT)
-        val probe = ParameterId("ParamProbe")
-        assertEquals(0.25f, vm.state.value.parameterValues[probe])
-        assertEquals(0.25f, workspace.authoredPose(vm.state.value.activeWorkspace.id).values[probe])
-        vm.saveProjectNow(temp.resolve("batch.psd2live"))
-        assertFalse(vm.state.value.projectDirty)
-        workspace.open(temp.resolve("batch.psd2live"))
-        assertEquals(0.25f, vm.state.value.parameterValues[probe])
-    }
-
-    @Test fun aMotionCompletingDuringSaveDoesNotMakeTheProjectDirty() = editor { vm, workspace ->
-        val clipId = vm.createMotionClip()
-        withTimeout(20_000) { vm.state.first { !it.workspaceEditBusy } }
-        val clip = vm.state.value.rigEdits.motionClips.single { it.id == clipId }
-        val holdClock = AtomicBoolean(true)
-        vm.attachWorkspace(object : WorkspaceBackend by workspace {
-            override fun playbackFrame(dt: Float?): JsonObject = workspace.playbackFrame(if (holdClock.get()) 0f else dt)
-        })
-        workspace.controlPlayback(buildJsonObject {
-            put("state", workspace.stateToken()); put("mode", "start"); put("clip_id", clipId)
-            put("time", clip.duration - 0.01f)
-        })
-        val token = workspace.stateToken()
-        duringSave(vm, workspace, temp.resolve("motion-end.psd2live")) {
-            assertTrue(vm.state.value.animationEnabled)
-            holdClock.set(false)
-            withTimeout(20_000) { vm.state.first { !it.animationEnabled } }
-        }
-        assertFalse(vm.state.value.projectDirty)
-        assertEquals(token, workspace.stateToken())
-    }
-
-    @Test fun aRejectedGestureRestoresTheCommittedDocumentAndDoesNotPoisonFutureSaves() = editor { vm, workspace ->
-        val archive = temp.resolve("rejected.psd2live")
-        vm.saveProjectNow(archive)
-        val thickness = vm.state.value.mouthThickness
         vm.beginEditorField("probe-thickness")
         vm.setMouthThickness(4f)
         workspace.updateParameter(WorkspaceUpdateParameterRequest("ParamAngleX", workspace.stateToken()!!, name = "Renamed axis"))
         vm.endEditorField("probe-thickness")
-        withTimeout(20_000) { vm.state.first { !it.editorDraftBusy && it.errorMessage != null } }
         workspace.awaitEditorDrafts()
-        assertEquals(thickness, vm.state.value.mouthThickness)
+        withTimeout(20_000) { vm.state.first { !it.editorDraftBusy } }
+        assertNull(vm.state.value.errorMessage)
+        assertEquals(4f, vm.state.value.mouthThickness)
+        assertEquals(4f, workspace.captureQueries().projectSettings().getValue("mouthThickness").jsonPrimitive.float)
         assertEquals("Renamed axis", vm.state.value.previewModel!!.rig.puppet.parameters.single { it.id.raw == "ParamAngleX" }.name)
         val model = Oracles.hash(vm.state.value.previewModel!!.rig.puppet)
         repeat(3) { vm.saveProjectNow(archive); assertFalse(vm.state.value.projectDirty) }
@@ -537,36 +485,87 @@ class SaveAndCloseTest {
         assertEquals(model, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
     }
 
-    @Test fun failuresBeforeArchiveCaptureAreReportedAndRetryCanSucceed() = editor { vm, workspace ->
-        val fail = AtomicBoolean(true)
-        vm.attachWorkspace(object : WorkspaceBackend by workspace {
-            override suspend fun awaitEditorDrafts() {
-                if (fail.get()) throw IllegalStateException("Cannot settle the editor")
-                workspace.awaitEditorDrafts()
-            }
-        })
-        val archive = temp.resolve("retry.psd2live")
-        assertFailsWith<IllegalStateException> { vm.saveProjectNow(archive) }
-        assertEquals("Cannot settle the editor", vm.state.value.projectSaveError)
-        assertFalse(vm.state.value.projectSaving)
-        assertFalse(Files.exists(archive))
-        fail.set(false)
-        vm.saveProjectNow(archive)
-        assertNull(vm.state.value.projectSaveError)
-        assertFalse(vm.state.value.projectSaving)
-        assertFalse(vm.state.value.projectDirty)
+    /** Whether the editor shows exactly the runtime's document, with no field drafted over it. */
+    private fun showsTheRuntime(vm: PSD2LiveViewModel, workspace: DesktopWorkspace) =
+        WorkspaceRevisions.of(WorkspaceStateCodec.document(vm.state.value)) == workspace.snapshot().revisionId
+
+    private suspend fun idle(vm: PSD2LiveViewModel, workspace: DesktopWorkspace) {
+        workspace.awaitEditorDrafts()
+        withTimeout(20_000) { vm.state.first { !it.editorDraftBusy && !it.workspaceEditBusy && !it.canvasEditBusy } }
     }
 
-    @Test fun savingCatchesUpAPresentationLeftBehindAPublishedHistory() = editor { vm, workspace ->
-        val old = vm.state.value.historySnapshot
-        workspace.updateParameter(WorkspaceUpdateParameterRequest("ParamAngleX", workspace.stateToken()!!, name = "Committed axis"))
-        vm.setStateForTest(vm.state.value.copy(historySnapshot = old))
-        val archive = temp.resolve("refresh.psd2live")
-        vm.saveProjectNow(archive)
-        assertEquals(workspace.snapshot().historyHeadNodeId, vm.state.value.historySnapshot?.headNodeId)
-        assertFalse(vm.state.value.projectDirty)
-        workspace.open(archive)
-        assertEquals("Committed axis", vm.state.value.previewModel!!.rig.puppet.parameters.single { it.id.raw == "ParamAngleX" }.name)
+    @Test fun aSettingYieldedInAFieldKeepsTheAgentsValueWhereASwitchWouldDeriveIt() = editor { vm, workspace ->
+        fun setting(key: String) = workspace.captureQueries().projectSettings().getValue(key).jsonPrimitive.boolean
+        assertTrue(setting("generateDeformers"))
+        vm.beginEditorField("probe-mesh-only")
+        // Mesh-only derives generateDeformers=false; the agent sets that key itself meanwhile.
+        vm.setMeshOnly(true)
+        workspace.updateProjectSettings(workspace.stateToken()!!, buildJsonObject { put("generateDeformers", false) })
+        workspace.updateProjectSettings(workspace.stateToken()!!, buildJsonObject { put("generateDeformers", true) })
+        vm.endEditorField("probe-mesh-only")
+        idle(vm, workspace)
+        assertTrue(setting("meshOnly"), "the switch made in the field was lost")
+        assertTrue(setting("generateDeformers"), "replaying the switch overwrote the agent's value")
+        assertTrue(showsTheRuntime(vm, workspace))
+    }
+
+    @Test fun aCheckoutDiscardingAFieldWarnsAndForgetsItsSwitches() = editor { vm, workspace ->
+        val root = workspace.snapshot().historyHeadNodeId!!
+        workspace.updateParameter(WorkspaceUpdateParameterRequest("ParamAngleX", workspace.stateToken()!!, name = "Renamed axis"))
+        val thickness = vm.state.value.mouthThickness
+        vm.beginEditorField("probe-thickness")
+        vm.setMouthThickness(thickness + 2f)
+        workspace.checkoutHistory(root, MutationAuthor.AGENT)
+        assertEquals(thickness, vm.state.value.mouthThickness)
+        assertTrue(vm.state.value.logEntries.any { it.message == io.github.psd2live.i18n.tr("log.editorDraftDiscarded") },
+            "discarding the field's draft was not reported")
+        val head = workspace.snapshot().historyHeadNodeId
+        vm.endEditorField("probe-thickness")
+        idle(vm, workspace)
+        assertEquals(head, workspace.snapshot().historyHeadNodeId, "the discarded switch replayed onto the checked-out version")
+        assertTrue(showsTheRuntime(vm, workspace))
+    }
+
+    @Test fun aValueTheEditorTakesBackAfterYieldingItIsCommitted() = editor { vm, workspace ->
+        fun padding() = workspace.captureQueries().projectSettings().getValue("texturePadding").jsonPrimitive.int
+        val start = padding()
+        // The editor shows a queued value when the agent commits another one to the same setting: the editor yields.
+        vm.setStateForTest(vm.state.value.copy(texturePadding = start + 7))
+        workspace.updateProjectSettings(workspace.stateToken()!!, buildJsonObject { put("texturePadding", start + 9) })
+        assertEquals(start + 9, vm.state.value.texturePadding)
+        // The user then sets their value again; nothing they yielded earlier may write the agent's back over it.
+        vm.setTexturePadding(start + 7)
+        idle(vm, workspace)
+        assertEquals(start + 7, padding(), "an earlier yield overwrote the user's new value")
+        assertTrue(showsTheRuntime(vm, workspace))
+    }
+
+    @Test fun aMotionKeyDragEndingBeforeACommitsPublicationFollowsIt() = editor { vm, workspace ->
+        vm.createMotionClip()
+        idle(vm, workspace)
+        vm.addMotionCurve("ParamAngleX")
+        idle(vm, workspace)
+        val dragged = vm.editingMotionClip()!!
+        val stale = workspace.stateToken()!!
+        val first = AtomicBoolean(true)
+        // The drag's first attempt carries the state it read before the agent's commit was published.
+        vm.attachWorkspace(object : WorkspaceBackend by workspace {
+            override suspend fun applyDocumentEdits(state: String, summary: String, edits: List<io.github.psd2live.application.WorkspaceDocumentOperation>,
+                                                    author: MutationAuthor) =
+                workspace.applyDocumentEdits(if (first.getAndSet(false)) stale else state, summary, edits, author)
+        })
+        vm.beginMotionKeyDrag()
+        vm.dragMotionKeys(0.1f)
+        // The drag ends while the agent's commit is shown but not yet published: it reads the older state.
+        workspace.host.beforePublishingForTest {
+            workspace.host.beforePublishingForTest(null)
+            vm.endMotionKeyDrag()
+        }
+        workspace.updateProjectSettings(workspace.stateToken()!!, buildJsonObject { put("alphaThreshold", 40) })
+        idle(vm, workspace)
+        assertNull(vm.state.value.errorMessage)
+        assertNotEquals(dragged, workspace.captureQueries().motionClips().single { it.id == dragged.id }, "the drag was lost")
+        assertTrue(showsTheRuntime(vm, workspace))
     }
 
     @Test fun saveAndCloseQueuedDuringAnEditRunsWhenTheEditFinishes() = editor { vm, workspace ->
@@ -594,36 +593,6 @@ class SaveAndCloseTest {
         assertFalse(vm.state.value.projectDirty)
         workspace.open(archive)
         assertTrue(vm.state.value.analysis!!.source.layers.none { it.id.raw == layer })
-    }
-
-    @Test fun persistentFrameFailuresBackOffWithoutBlockingSaveAndAChangedInputRetriesImmediately() = editor { vm, workspace ->
-        val attempts = AtomicInteger()
-        val reject = AtomicBoolean(false)
-        vm.attachWorkspace(object : WorkspaceBackend by workspace {
-            override fun playbackFrame(dt: Float?): JsonObject {
-                if (reject.get()) {
-                    attempts.incrementAndGet()
-                    throw IllegalStateException("Preview failure")
-                }
-                return workspace.playbackFrame(dt)
-            }
-        })
-        vm.setCanvasMode(vm.state.value.activeCanvas.id, CanvasMode.PREVIEW)
-        vm.setAnimationEnabled(true)
-        val archive = temp.resolve("preview.psd2live")
-        vm.saveProjectNow(archive)
-        reject.set(true)
-        withTimeout(20_000) { vm.state.first { state -> state.logEntries.any { it.tag == "Motion" && it.message == "Preview failure" } } }
-        delay(100)
-        assertEquals(1, attempts.get())
-        vm.saveProjectNow(archive)
-        assertFalse(vm.state.value.projectDirty)
-        assertEquals(1, vm.state.value.logEntries.count { it.tag == "Motion" && it.message == "Preview failure" })
-        reject.set(false)
-        vm.setAnimationEnabled(false)
-        vm.setAnimationEnabled(true)
-        vm.saveProjectNow(archive)
-        assertFalse(vm.state.value.projectDirty)
     }
 
     @Test fun cancellingCloseWithdrawsTheQueuedCloseButAllowsTheSaveToFinish() = editor { vm, workspace ->

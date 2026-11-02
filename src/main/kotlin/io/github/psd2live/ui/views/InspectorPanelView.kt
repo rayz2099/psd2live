@@ -1,5 +1,8 @@
 package io.github.psd2live.ui.views
 
+import androidx.compose.foundation.layout.heightIn
+import io.github.psd2live.ui.components.AppMenuItem
+import io.github.psd2live.ui.components.AppDropdownMenu
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -47,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import io.github.psd2live.core.authoredMasksOf
 import io.github.psd2live.core.GeneratedOverrideIssue
 import io.github.psd2live.core.GeneratedOverrideIssueKind
 import io.github.psd2live.core.GeneratedOverrideOrphanReason
@@ -104,7 +108,7 @@ internal fun InspectorPanelView(
     // Resolve active selection
     val selectedDeformerId = state.selectedDeformerId
     val selectedLayerId = state.selectedLayerId
-    val layerDrawableId = state.previewModel?.rig?.layerIdByDrawableId?.entries?.firstOrNull { it.value == selectedLayerId }?.key
+    val layerDrawableId = state.previewModel?.rig?.ownLayerIdByDrawableId?.entries?.firstOrNull { it.value == selectedLayerId }?.key
         ?: selectedLayerId
 
     val selectedDeformer = puppet?.deformers?.firstOrNull { it.id.raw == selectedDeformerId }
@@ -186,7 +190,8 @@ internal fun InspectorPanelView(
                             Spacer(modifier = Modifier.height(4.dp))
                         }
                         ArtMeshInspector(
-                            drawable = selectedDrawable,
+                            // A bang's window in the eyes is the finished rig's: its masks show and edit as the document has them.
+                            drawable = state.previewModel?.rig?.authoredMasksOf(selectedDrawable) ?: selectedDrawable,
                             allParts = puppet.parts.map { it.id.raw to it.name },
                             allDeformers = puppet.deformers.map { it.id.raw to it.name },
                             allDrawables = puppet.drawables.map { it.id.raw to it.name },
@@ -387,8 +392,10 @@ private fun GeneratedOverrideIssueList(issues: List<GeneratedOverrideIssue>, pup
                 ?: puppet.drawables.firstOrNull { it.id.raw == issue.id }?.name ?: issue.id
             val key = issue.key.toSortedMap().entries.joinToString(", ") { (id, value) -> "$id=$value" }
             val text = when (issue.kind) {
-                GeneratedOverrideIssueKind.CONFLICT ->
-                    tr("inspector.overrides.conflict", name, key, issue.points, issue.total, issue.generator)
+                GeneratedOverrideIssueKind.CONFLICT -> issue.channel?.let { channel ->
+                    val label = channel.split('_').let { words -> words.first() + words.drop(1).joinToString("") { it.replaceFirstChar(Char::uppercaseChar) } }
+                    tr("inspector.overrides.channelConflict", name, key, tr("inspector.$label"), issue.generator)
+                } ?: tr("inspector.overrides.conflict", name, key, issue.points, issue.total, issue.generator)
                 GeneratedOverrideIssueKind.ORPHANED -> tr("inspector.overrides.orphaned", name, key, issue.generator,
                     tr("inspector.overrides.reason.${(issue.reason ?: GeneratedOverrideOrphanReason.MISSING_KEYFORM).wire}"))
             }
@@ -509,13 +516,15 @@ private fun ArtMeshInspector(
                     ) {
                         ListIcon(color = colors.textPrimary)
                     }
-                    DropdownMenu(
+                    AppDropdownMenu(
                         expanded = clipIdPickerOpen,
                         onDismissRequest = { clipIdPickerOpen = false },
+                        // A long list of meshes scrolls inside the menu rather than running off the window.
+                        modifier = Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
                     ) {
                         allDrawables.filter { it.first != drawable.id.raw }.forEach { (dId, dName) ->
                             val isMask = drawable.maskedBy.any { it.raw == dId }
-                            DropdownMenuItem(onClick = {
+                            AppMenuItem(text = "$dName ($dId)", isChecked = isMask, onClick = {
                                 val nextList = if (isMask) {
                                     drawable.maskedBy.filter { it.raw != dId }
                                 } else {
@@ -523,20 +532,7 @@ private fun ArtMeshInspector(
                                 }
                                 viewModel.applyRigStaticNow("mesh", drawable.id.raw, "masked_by" to JsonArray(nextList.map { JsonPrimitive(it.raw) }))
                                 clipIdPickerOpen = false
-                            }) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    Box(
-                                        modifier = Modifier.size(14.dp).border(1.dp, colors.border, RoundedCornerShape(2.dp)),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        if (isMask) Text("✓", fontSize = 10.sp, color = colors.textPrimary)
-                                    }
-                                    Text("$dName ($dId)", fontSize = 11.sp)
-                                }
-                            }
+                            })
                         }
                     }
                 }
@@ -569,7 +565,7 @@ private fun ArtMeshInspector(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 CompactNumberSpinner(
-                    value = (state.drawOrderOverrides[state.previewModel?.rig?.layerIdByDrawableId?.get(drawable.id.raw)]
+                    value = (state.drawOrderOverrides[state.previewModel?.rig?.ownLayerIdByDrawableId?.get(drawable.id.raw)]
                         ?: state.drawOrderOverrides[drawable.id.raw] ?: drawable.drawOrder).toDouble(),
                     onValueChange = { order ->
                         viewModel.beginEditorField("mesh.draw_order.${drawable.id.raw}")
@@ -691,6 +687,9 @@ private fun ArtMeshInspector(
                 )
             }
         }
+
+        // 13b. 判定区域 (Hit Area)
+        HitAreaInspectorRows(drawable, state, viewModel)
 
         // 14. 顶点信息 (Vertex Info X, Y)
         VertexInfoRows(editor = editor)
@@ -1023,6 +1022,8 @@ private fun RotationDeformerInspector(
 internal fun InspectorFormRow(
     label: String,
     modifier: Modifier = Modifier,
+    /** Sections of longer labels widen the column; inspectors keep the default. */
+    labelWidth: androidx.compose.ui.unit.Dp = 88.dp,
     content: @Composable () -> Unit,
 ) {
     val colors = LocalToolColors.current
@@ -1037,7 +1038,7 @@ internal fun InspectorFormRow(
             style = typography.caption.copy(fontSize = 11.sp),
             color = colors.textPrimary,
             textAlign = TextAlign.End,
-            modifier = Modifier.width(88.dp).padding(end = 8.dp),
+            modifier = Modifier.width(labelWidth).padding(end = 8.dp),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -1045,6 +1046,14 @@ internal fun InspectorFormRow(
             content()
         }
     }
+}
+
+/** A line of explanation under inspector rows, in the caption style; [warning] marks something to act on. */
+@Composable
+internal fun InspectorHint(text: String, modifier: Modifier = Modifier, warning: Boolean = false) {
+    val colors = LocalToolColors.current
+    Text(text, style = LocalToolTypography.current.caption, color = if (warning) colors.warning else colors.textMuted,
+        modifier = modifier.padding(start = 4.dp))
 }
 
 /**

@@ -21,9 +21,21 @@ interface WorkspaceStatePort {
     fun hasUnsavedChanges(): Boolean
 }
 
+/**
+ * An editor draft as submitted: the [document] the editor shows, the runtime document [origin] its untouched fields
+ * mirror (the last commit it was shown, null when unknown), and the settings it yielded to another author's commit
+ * during its session ([yieldedSettings]), which keep the runtime's value when its settings switches replay.
+ */
+data class WorkspaceEditorDraft(
+    val document: WorkspaceDocument,
+    val origin: WorkspaceDocument? = null,
+    val yieldedSettings: Set<String> = emptySet(),
+)
+
 interface WorkspaceEditorDraftPort {
     suspend fun previewEditorSettingsDraft(projectId: String, state: String, changes: List<JsonObject>): RigPreviewModel
-    fun submitEditorSettingsDraft(projectId: String, state: String, changes: List<JsonObject>,
+    /** [draft] is the editor's draft as it shows it; only [changes] are committed, the rest carries later drafts. */
+    fun submitEditorSettingsDraft(projectId: String, state: String, draft: WorkspaceEditorDraft, changes: List<JsonObject>,
                                   summary: String, author: MutationAuthor): Deferred<WorkspaceMutationResult>
     /** Build a transient field preview from the captured committed rig, using the same preparation as submission. */
     suspend fun previewEditorDraft(projectId: String, state: String, document: WorkspaceDocument,
@@ -32,7 +44,7 @@ interface WorkspaceEditorDraftPort {
      * [settingsIntents] are the settings switches made during the field session, in order. They replay through the
      * same intent as settings_update, so their links and authored-pose releases land with the draft in one commit.
      */
-    fun submitEditorDraft(projectId: String, state: String, document: WorkspaceDocument, settingsIntents: List<JsonObject>,
+    fun submitEditorDraft(projectId: String, state: String, draft: WorkspaceEditorDraft, settingsIntents: List<JsonObject>,
                           summary: String, author: MutationAuthor): Deferred<WorkspaceMutationResult>
     suspend fun awaitEditorDrafts()
     /** Advance an action only through this editor queue's own successful commits. */
@@ -49,12 +61,23 @@ interface WorkspaceQueries : WorkspaceStatePort {
     /** Solve an FK/IK drag into parameter values without changing the model or preview. */
     fun solveSkeletonPose(request: JsonObject): JsonObject
     fun motionClips(): List<MotionClip>
+    /** The captured model's expressions and pose ([WorkspaceSidecarEdits.sidecars]). */
+    fun modelSidecars(): WorkspaceSidecars
     fun previewSession(): JsonObject
     fun layerMeshSettings(layerId: String): JsonObject
     fun sampleSourceColor(layerId: String, x: Int, y: Int): List<Int>
     fun sourceMeshComponents(layerId: String): JsonObject
     /** [WorkspaceStructureMeshEdits.preview] on the captured version. */
     fun structureMeshPreview(request: JsonObject, checkpoint: () -> Unit = {}): JsonObject
+
+    companion object {
+        /** A checkpoint for work under `runInterruptible`: an interrupted thread stops there, and the caller sees cancellation. */
+        fun interrupted() { if (Thread.currentThread().isInterrupted) throw InterruptedException() }
+    }
+    /** [WorkspaceObjectEdits.find] on the captured version: the objects a find matches and what a replace makes of them. */
+    fun findObjects(request: JsonObject): JsonObject
+    /** [WorkspaceObjectEdits.planned] on the captured version: the request that records exactly what the result fields name. */
+    fun planObjectEdit(operation: String, request: JsonObject): Pair<JsonObject, JsonObject>
     fun projectSettings(): JsonObject
     fun listRigObjectSummaries(): List<JsonObject>
     fun inspectRigGeometry(arguments: JsonObject): JsonObject
@@ -76,10 +99,16 @@ interface WorkspaceQueries : WorkspaceStatePort {
                           cancelled: () -> Boolean = noSamplingCancellation): JsonObject
     fun listInteriorEffects(): List<io.github.psd2live.core.interior.NativeInteriorEffect> = emptyList()
     fun listSwings(): List<RigSwingEdit>
+    /** The captured document's hit areas, in test order. */
+    fun hitAreas(): List<io.github.psd2live.core.RigHitArea>
+    /** The captured model hit areas are tested on; null when nothing is loaded. */
+    fun hitAreaModel(): io.github.psd2live.core.RigPreviewModel?
     /** Generated overrides of the captured model that did not apply as recorded, in journal order. */
     fun generatedOverrideIssues(): List<io.github.psd2live.core.GeneratedOverrideIssue>
     /** Journal entries of the captured model that replay skipped because they address only what a later split supersedes. */
     fun supersededEntryNotes(): List<SupersededEntryNote>
+    /** The copies over the bangs the captured model's settings ask for that it could not make, as (original mesh, reason). */
+    fun seeThroughNotes(): List<Pair<String, String>>
     /** What the captured document's last regeneration checkpoint could not carry over cleanly, in merge order. */
     fun regenerationIssues(): List<io.github.psd2live.core.RigRegeneration.Issue>
     /**
@@ -92,6 +121,8 @@ interface WorkspaceQueries : WorkspaceStatePort {
     fun skeletonBindingIssues(): List<io.github.psd2live.core.quality.SkeletonBindingIssue>
     /** The captured document's Layout state with its source layers and those waiting for generation; null when nothing is loaded. */
     fun layoutState(): WorkspaceLayoutState?
+    /** `module_catalog`: the rig's areas and modules, and with a project open how its recipe uses them ([RigModuleCatalog]). */
+    fun rigModules(): kotlinx.serialization.json.JsonObject
 }
 
 /** A captured document's Layout state ([io.github.psd2live.project.WorkspaceLayout]) and the layers it applies to. */

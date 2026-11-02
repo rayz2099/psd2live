@@ -18,7 +18,10 @@ internal class WorkspaceOperations(private val workspace: WorkspaceBackend,
         registerCanvasWeightOperations(registry, workspace)
         registerCanvasDeformOperations(registry, workspace)
         registerDrawOrderOperations(registry, workspace)
+        registerHitAreaOperations(registry, workspace, workspace)
+        registerObjectOperations(registry, workspace)
         registerWarpControlOperations(registry, workspace, jobs)
+        registerMeshTopologyOperations(registry, workspace)
         registerTextureOperations(registry, workspace, workspace, jobs)
         registerPhysicsPresetApplyOperation(registry, workspace)
         registerPaintSessionOperations(registry, workspace, workspace, jobs)
@@ -26,11 +29,16 @@ internal class WorkspaceOperations(private val workspace: WorkspaceBackend,
         registerSimulationPreviewOperations(registry, workspace, workspace, jobs)
         registerPhysicsAuditionOperations(registry, workspace)
         registerLayoutOperations(registry, workspace, workspace, jobs)
-        registerDocumentBatch(registry, workspace, workspace, jobs)
+        registerSidecarOperations(registry, workspace, workspace)
+        registerDocumentBatch(registry, workspace, workspace, jobs) { edits ->
+            WorkspaceMotionIds.chosen(edits, workspace.captureQueries().motionClips(), workspace.savedProjectData().data.timelineAids)
+        }
         registerIntentOperations(registry, workspace, workspace, jobs)
         registerAuxiliaryOperations(registry, workspace, workspace)
+        registerTimelineAidsOperations(registry, workspace)
         registerCanvasVisibilityOperations(registry, workspace)
         registerPhysicsPresetLibraryOperations(registry, presetLibrary)
+        registerRigModuleOperations(registry, workspace)
         for ((id, commandId) in mapOf("project_import_psd" to "asset_import_psd", "project_create_artwork" to "asset_create_artwork")) {
             val command = commands.get(commandId)
             register(id, "Create a new source project from ${if (id == "project_import_psd") "an absolute PSD path" else "placed local raster layers"}. Unsaved changes are rejected unless discard_unsaved=true. Source reading, isolated rebuilding and installation run in a process-owned job; use job_wait/job_get for the committed project and state.",

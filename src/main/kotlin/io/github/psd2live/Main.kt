@@ -1,6 +1,8 @@
 package io.github.psd2live
 
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -28,6 +30,11 @@ import io.github.psd2live.ui.state.PSD2LiveViewModel
 import io.github.psd2live.ui.state.UiFailureReports
 import io.github.psd2live.ui.state.reportingWindowExceptionHandler
 import io.github.psd2live.ui.views.PSD2LiveApp
+import io.github.psd2live.ui.utils.LocalNativeTitleBar
+import io.github.psd2live.ui.utils.MainWindowModes
+import io.github.psd2live.ui.utils.NativeTitleBar
+import io.github.psd2live.ui.state.WindowMode
+import androidx.compose.ui.window.WindowPlacement
 import java.io.IOException
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicBoolean
@@ -35,8 +42,6 @@ import javax.swing.JOptionPane
 import kotlin.io.path.absolutePathString
 import kotlin.system.exitProcess
 
-import androidx.compose.ui.window.rememberWindowState
-import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.Alignment
 import io.github.psd2live.ui.state.AppSettings
@@ -45,16 +50,25 @@ fun main(arguments: Array<String>) {
 	System.setProperty("sun.java2d.uiScale.enabled", "true")
 	// The name macOS shows in the menu bar and Dock instead of the main class; read when AWT starts.
 	System.setProperty("apple.awt.application.name", "PSD2Live")
-	// Canvases draw on the GPU in Skia's own OpenGL context, so Skia must draw the window with OpenGL.
-	io.github.psd2live.render.SkiaGpu.requestOpenGl()
+	if (io.github.psd2live.ui.utils.MacShell.active) {
+		System.setProperty("apple.laf.useScreenMenuBar", "true")
+		System.setProperty("apple.awt.application.appearance", "system")
+	}
 	configureLanguage(arguments)
 	val command = commandArguments(arguments)
-	val isGui = command.isEmpty() ||
-		command.first() == "gui" ||
+	val filesToOpen = io.github.psd2live.ui.utils.MacShell.guiFiles(command)
+	val isGui = filesToOpen != null ||
+		command.firstOrNull() == "gui" ||
 		(!command.contains("--input") && command.any { it in setOf("--port", "-p", "--store", "--token") }) ||
 		(command.size == 1 && command.first().toIntOrNull() != null)
 
+	// Canvases draw on the GPU in Skia's own OpenGL context, so Skia must draw the window with OpenGL; the editor
+	// starts with the user's graphics settings (render path, card, vsync, driver threading), before its first window.
+	io.github.psd2live.render.GraphicsSettings.applyAtStartup(
+		if (isGui) AppSettings.graphics else io.github.psd2live.render.GraphicsOptions())
+
 	if (isGui) {
+		filesToOpen?.forEach { io.github.psd2live.ui.utils.MacShell.enqueue(it) }
 		runGui(parseGuiOptions(command))
 		return
 	}
@@ -94,6 +108,10 @@ fun main(arguments: Array<String>) {
 		bodyStrength = options.float("--body-strength", 1f),
 		meshOnly = options.flags.contains("--mesh-only"),
 		generateDeformers = !options.flags.contains("--no-deformers"),
+		seeThroughBrows = !options.flags.contains("--no-see-through"),
+		seeThroughEyes = !options.flags.contains("--no-see-through") && !options.flags.contains("--no-see-through-eyes"),
+		seeThroughOpacity = options.float("--see-through-opacity", io.github.psd2live.core.SeeThroughLayers.DEFAULT_OPACITY)
+			.takeIf { it.isFinite() }?.coerceIn(io.github.psd2live.core.SeeThroughLayers.OPACITY_RANGE) ?: io.github.psd2live.core.SeeThroughLayers.DEFAULT_OPACITY,
 		exportMotions = !options.flags.contains("--no-motions"),
 		generatePhysics = !options.flags.contains("--no-physics"),
 		exportCmo3 = !options.flags.contains("--no-cmo3"),
@@ -223,6 +241,10 @@ private fun runGui(options: GuiOptions = GuiOptions()) {
 		// Exit from main rather than letting Compose call System.exit on the EDT, which would block
 		// the EDT while the shutdown hooks run.
 		application(exitProcessOnExit = false) {
+			// Application lifetime: replacing a window for language/transparency must not cancel an open.
+			LaunchedEffect(viewModel) {
+				io.github.psd2live.ui.utils.MacShell.consumeFiles(viewModel::openExternalFile)
+			}
 			val defaultExceptionHandlers = LocalWindowExceptionHandlerFactory.current
 			val exceptionHandlers = remember(defaultExceptionHandlers) {
 				WindowExceptionHandlerFactory { window ->
@@ -235,16 +257,21 @@ private fun runGui(options: GuiOptions = GuiOptions()) {
 					}
 				}
 			}
-			// The size and maximized state the window last closed with, centred on the screen.
-			val windowState = rememberWindowState(
-				placement = if (AppSettings.windowMaximized) WindowPlacement.Maximized else WindowPlacement.Floating,
-				position = WindowPosition(Alignment.Center),
-				size = DpSize(AppSettings.windowWidth.dp, AppSettings.windowHeight.dp),
-			)
+			// Opens in the mode it last closed in, already at that mode's bounds; windowed is the saved size centred. A
+			// native frame maximizes the system's way, restoring to the windowed bounds.
+			val windowState = remember {
+				val nativeMaximized = AppSettings.windowMode == WindowMode.MAXIMIZED && NativeTitleBar.supported &&
+					!viewModel.uiState.value.canvasBackground.windowTransparent
+				val bounds = MainWindowModes.initialBounds(if (nativeMaximized) WindowMode.WINDOWED else AppSettings.windowMode,
+					AppSettings.windowWidth, AppSettings.windowHeight)
+				val placement = if (nativeMaximized) WindowPlacement.Maximized else WindowPlacement.Floating
+				if (bounds == null) WindowState(placement, position = WindowPosition(Alignment.Center), size = DpSize(AppSettings.windowWidth.dp, AppSettings.windowHeight.dp))
+				else WindowState(placement, position = WindowPosition(bounds.x.dp, bounds.y.dp), size = DpSize(bounds.width.dp, bounds.height.dp))
+			}
+			val mainFrame = remember { java.util.concurrent.atomic.AtomicReference<java.awt.Frame?>() }
 			val closeApp: () -> Unit = {
 				viewModel.withSavedChanges {
-					AppSettings.rememberWindow(windowState.size.width.value, windowState.size.height.value,
-						windowState.placement == WindowPlacement.Maximized)
+					mainFrame.get()?.let { MainWindowModes.windowedSize(it) }?.let { AppSettings.rememberWindowSize(it.width.toFloat(), it.height.toFloat()) }
 					quitByUser.set(true)
                     agentWorkspace.prepareClose(if (viewModel.state.value.projectDirty)
                         io.github.psd2live.application.WorkspaceCloseReason.DISCARDED
@@ -262,6 +289,20 @@ private fun runGui(options: GuiOptions = GuiOptions()) {
 					response.cancelQuit()
 					javax.swing.SwingUtilities.invokeLater { currentCloseApp() }
 				}
+				if (io.github.psd2live.ui.utils.MacShell.active) {
+					desktop?.takeIf { it.isSupported(java.awt.Desktop.Action.APP_ABOUT) }?.setAboutHandler {
+						javax.swing.SwingUtilities.invokeLater {
+							javax.swing.JOptionPane.showMessageDialog(null, "PSD2Live 3.7.0", tr("app.title"),
+								javax.swing.JOptionPane.INFORMATION_MESSAGE)
+						}
+					}
+					desktop?.takeIf { it.isSupported(java.awt.Desktop.Action.APP_PREFERENCES) }?.setPreferencesHandler {
+						javax.swing.SwingUtilities.invokeLater { io.github.psd2live.ui.utils.MacShell.actions.onShowSettings() }
+					}
+					desktop?.takeIf { it.isSupported(java.awt.Desktop.Action.APP_OPEN_FILE) }?.setOpenFileHandler { event ->
+						event.files.forEach { io.github.psd2live.ui.utils.MacShell.enqueue(it.absolutePath) }
+					}
+				}
 				onDispose { desktop?.setQuitHandler(null) }
 			}
 			val transparent by remember {
@@ -271,7 +312,10 @@ private fun runGui(options: GuiOptions = GuiOptions()) {
 				derivedStateOf { viewModel.uiState.value.currentLanguage }
 			}
 			// A window's transparency cannot change once it is shown, so switching the canvas
-			// background to or from transparent replaces the window; windowState keeps its bounds.
+			// background to or from transparent replaces the window; windowState keeps its bounds. The system only
+			// lets an undecorated window be transparent, so that one draws its whole title bar. Otherwise the window
+			// keeps its native frame: the JetBrains runtime draws under a custom title bar, and the Mac shell draws
+			// the app bar in the system title-bar area.
 			// A language switch replaces it too: text is read through tr() wherever it is composed,
 			// remembered, or handed to Swing, so only a fresh composition shows none of the old language.
 			CompositionLocalProvider(LocalWindowExceptionHandlerFactory provides exceptionHandlers) {
@@ -281,10 +325,22 @@ private fun runGui(options: GuiOptions = GuiOptions()) {
 						title = tr("app.title"),
 						icon = painterResource("icons/psd2live.png"),
 						state = windowState,
-						undecorated = true,
+						undecorated = transparent || (!NativeTitleBar.supported && !io.github.psd2live.ui.utils.MacShell.active),
 						transparent = transparent,
 					) {
-						androidx.compose.runtime.CompositionLocalProvider(io.github.psd2live.ui.views.LocalAwtWindow provides window) {
+						if (io.github.psd2live.ui.utils.MacShell.active && !window.isUndecorated && !NativeTitleBar.supported) {
+							io.github.psd2live.ui.utils.MacShell.installChrome(window)
+						}
+						val titleBar = remember(window) { if (window.isUndecorated) null else NativeTitleBar.install(window) }
+						DisposableEffect(window) {
+							mainFrame.set(window)
+							val uninstall = MainWindowModes.install(window)
+							onDispose { uninstall(); mainFrame.compareAndSet(window, null) }
+						}
+						val windowMode by AppSettings.windowModeFlow.collectAsState()
+						LaunchedEffect(window, windowMode) { MainWindowModes.apply(window, windowMode) }
+						androidx.compose.runtime.CompositionLocalProvider(io.github.psd2live.ui.views.LocalAwtWindow provides window,
+							LocalNativeTitleBar provides titleBar) {
 							PSD2LiveApp(
 								viewModel = viewModel,
 								window = window,
@@ -376,8 +432,10 @@ internal data class CliOptions(val values: Map<String, String>, val flags: Set<S
 	fun float(name: String, default: Float): Float = value(name)?.let { it.toFloatOrNull() ?: error(tr("cli.invalidNumber", name, it)) } ?: default
 
 	companion object {
-		internal val flagNames = setOf("--no-upscale-neural-alpha", "--upscale-neural-alpha", "--mesh-pixels", "--no-physics", "--no-cmo3", "--no-moc3", "--mesh-only", "--no-deformers", "--no-motions", "--no-json")
-		internal val valueNames = setOf("--upscale", "--upscale-noise", "--upscale-python", "--nunif-dir", "--upscale-model", "--upscale-tile", "--input", "--output", "--lang", "--atlas", "--mesh-spacing", "--mesh-wrap", "--head-strength", "--body-strength")
+		internal val flagNames = setOf("--no-upscale-neural-alpha", "--upscale-neural-alpha", "--mesh-pixels", "--no-physics", "--no-cmo3", "--no-moc3", "--mesh-only", "--no-deformers", "--no-motions", "--no-json",
+			"--no-see-through", "--no-see-through-eyes", "--see-through-eyes")
+		internal val valueNames = setOf("--upscale", "--upscale-noise", "--upscale-python", "--nunif-dir", "--upscale-model", "--upscale-tile", "--input", "--output", "--lang", "--atlas", "--mesh-spacing", "--mesh-wrap", "--head-strength", "--body-strength",
+			"--see-through-opacity")
 		fun parse(arguments: Array<String>): CliOptions {
 			val values = linkedMapOf<String, String>()
 			val flags = linkedSetOf<String>()

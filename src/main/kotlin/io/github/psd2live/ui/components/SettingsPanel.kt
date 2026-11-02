@@ -1,6 +1,5 @@
 package io.github.psd2live.ui.components
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -12,7 +11,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,7 +24,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.Divider
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -58,8 +58,7 @@ import io.github.psd2live.ui.state.AppSettings
 import io.github.psd2live.ui.state.PSD2LiveState
 import io.github.psd2live.ui.state.PSD2LiveViewModel
 import io.github.psd2live.ui.state.SettingsTopic
-import io.github.psd2live.ui.views.InspectorFormRow
-import io.github.psd2live.ui.views.InspectorSectionBox
+import io.github.psd2live.ui.state.WindowMode
 import io.github.psd2live.ui.views.PageBody
 import io.github.psd2live.ui.views.PageNavItem
 import io.github.psd2live.ui.views.PageNavList
@@ -114,6 +113,7 @@ internal fun SettingsPanel(topic: SettingsTopic, state: PSD2LiveState, viewModel
 				onLanguageChange = viewModel::setLanguage,
 			)
 			SettingsTopic.CANVAS -> SettingsCanvasSection()
+			SettingsTopic.GRAPHICS -> SettingsGraphicsSection()
 			SettingsTopic.PROMPTS -> SettingsPromptsSection(
 				mutedPrompts = state.mutedPrompts,
 				onPromptEnabledChange = viewModel::setPromptEnabled,
@@ -204,8 +204,8 @@ private fun SettingsScaleSection(
 
 	SettingsSectionDescription(tr("dialog.settings.scale.desc"))
 
-	InspectorSectionBox(tr("settings.scale.group.ui")) {
-		InspectorFormRow(tr("settings.scale.value")) {
+	SettingsGroup(tr("settings.scale.group.ui")) {
+		SettingsRow(tr("settings.scale.value")) {
 			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 				CompactSlider(
 					value = uiScale,
@@ -218,7 +218,7 @@ private fun SettingsScaleSection(
 					color = colors.textPrimary, textAlign = TextAlign.End, modifier = Modifier.width(40.dp))
 			}
 		}
-		InspectorFormRow(tr("settings.scale.presets")) {
+		SettingsRow(tr("settings.scale.presets")) {
 			Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
 				for (preset in UiScalePresets) {
 					CompactToggleChip(
@@ -230,27 +230,21 @@ private fun SettingsScaleSection(
 				}
 			}
 		}
-		InspectorFormRow(tr("settings.scale.recommended")) {
-			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-				CompactButton(
-					text = tr("settings.scale.useRecommended", percent(recommended)),
-					onClick = { onUiScaleChange(recommended) },
-					enabled = !atRecommended,
-					height = 22.dp,
-				)
-				Text(
-					tr(if (atRecommended) "settings.scale.recommended.current" else "settings.scale.recommended.hint"),
-					style = typography.caption.copy(fontSize = 10.5.sp),
-					color = colors.textMuted,
-					maxLines = 1,
-					overflow = TextOverflow.Ellipsis,
-				)
-			}
+		SettingsRow(
+			tr("settings.scale.recommended"),
+			description = tr(if (atRecommended) "settings.scale.recommended.current" else "settings.scale.recommended.hint"),
+		) {
+			CompactButton(
+				text = tr("settings.scale.useRecommended", percent(recommended)),
+				onClick = { onUiScaleChange(recommended) },
+				enabled = !atRecommended,
+				height = 22.dp,
+			)
 		}
 	}
 
-	InspectorSectionBox(tr("settings.scale.group.font")) {
-		InspectorFormRow(tr("settings.scale.fontSize")) {
+	SettingsGroup(tr("settings.scale.group.font")) {
+		SettingsRow(tr("settings.scale.fontSize")) {
 			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
 				for ((scale, label) in fontScalePresets) {
 					CompactToggleChip(
@@ -266,17 +260,17 @@ private fun SettingsScaleSection(
 		}
 	}
 
-	InspectorSectionBox(tr("settings.scale.group.display")) {
+	SettingsGroup(tr("settings.scale.group.display")) {
 		ReadoutRow(tr("settings.display.resolution"), "${metrics.physicalWidth} × ${metrics.physicalHeight}")
 		ReadoutRow(tr("settings.display.systemScale"), "${metrics.systemScalePercent}%")
 		ReadoutRow(tr("settings.display.recommended"), percent(recommended))
 	}
 }
 
-/** A read-only value in a section: its label, then the value in the mono face. */
+/** A read-only value in a group: its label, then the value in the mono face. */
 @Composable
 private fun ReadoutRow(label: String, value: String) {
-	InspectorFormRow(label, Modifier.height(20.dp)) {
+	SettingsRow(label) {
 		Text(value, style = LocalToolTypography.current.monoSmall.copy(fontSize = 11.sp), color = LocalToolColors.current.textPrimary)
 	}
 }
@@ -312,47 +306,24 @@ private fun SettingsCanvasSection() {
 
 	SettingsSectionDescription(tr("dialog.settings.canvas.desc"))
 
-	Column(
-		modifier = Modifier
-			.fillMaxWidth()
-			.background(colors.panelElevated, RoundedCornerShape(4.dp))
-			.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(4.dp))
-			.padding(10.dp),
-		verticalArrangement = Arrangement.spacedBy(6.dp),
-	) {
-		val softwareCanvas by AppSettings.softwareCanvasFlow.collectAsState()
-		val gpuStatus by io.github.psd2live.render.SkiaGpu.status.collectAsState()
-		Row(
-			modifier = Modifier
-				.fillMaxWidth()
-				.handCursor()
-				.clickable { AppSettings.softwareCanvas = !softwareCanvas }
-				.padding(vertical = 2.dp),
-			verticalAlignment = Alignment.CenterVertically,
-			horizontalArrangement = Arrangement.spacedBy(8.dp),
-		) {
-			Text(
-				text = if (softwareCanvas) "✓" else " ",
-				style = typography.body.copy(fontWeight = FontWeight.Bold),
-				color = if (softwareCanvas) colors.accent else Color.Transparent,
-				modifier = Modifier.width(16.dp),
-			)
-			Text(
-				text = tr("dialog.settings.canvas.softwareRendering"),
-				style = typography.body.copy(fontSize = 11.5.sp),
-				color = colors.textPrimary,
-			)
+	// How the main window sits on its screen; it changes as soon as a mode is picked.
+	val windowMode by AppSettings.windowModeFlow.collectAsState()
+	SettingsGroup(tr("settings.window.title")) {
+		for (mode in WindowMode.entries) {
+			Column(Modifier.fillMaxWidth()) {
+				CompactRadioButton(
+					selected = mode == windowMode,
+					onClick = { AppSettings.windowMode = mode },
+					label = tr(mode.labelKey),
+				)
+				Text(
+					text = tr(mode.descriptionKey),
+					style = typography.caption.copy(fontSize = 10.5.sp),
+					color = colors.textMuted,
+					modifier = Modifier.padding(start = 24.dp),
+				)
+			}
 		}
-		Text(
-			text = if (softwareCanvas) tr("dialog.settings.canvas.rendererSoftware") else when (val status = gpuStatus) {
-				is io.github.psd2live.render.SkiaGpu.Status.Ready -> tr("dialog.settings.canvas.rendererGpu", status.description)
-				is io.github.psd2live.render.SkiaGpu.Status.Unavailable -> tr("dialog.settings.canvas.rendererUnavailable", status.reason)
-				io.github.psd2live.render.SkiaGpu.Status.Starting -> tr("dialog.settings.canvas.rendererStarting")
-			},
-			style = typography.caption.copy(fontSize = 10.5.sp),
-			color = colors.textMuted,
-			modifier = Modifier.padding(start = 24.dp),
-		)
 	}
 }
 
@@ -371,14 +342,7 @@ private fun SettingsPromptsSection(
 
 	SettingsSectionDescription(tr("dialog.settings.prompts.desc"))
 
-	Column(
-		modifier = Modifier
-			.fillMaxWidth()
-			.background(colors.panelElevated, RoundedCornerShape(4.dp))
-			.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(4.dp))
-			.padding(10.dp),
-		verticalArrangement = Arrangement.spacedBy(8.dp),
-	) {
+	Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
 		for (prompt in AppPrompt.entries) {
 			CompactCheckbox(
 				checked = prompt !in mutedPrompts,
@@ -425,29 +389,15 @@ private fun SettingsShortcutsSection(
 
 	SettingsSectionDescription(tr("dialog.settings.shortcuts.desc"))
 
-	Row(
-		modifier = Modifier.fillMaxWidth(),
-		horizontalArrangement = Arrangement.spacedBy(8.dp),
-		verticalAlignment = Alignment.CenterVertically,
-	) {
-		Text(
-			text = tr("dialog.settings.shortcuts.preset"),
-			style = typography.caption.copy(fontSize = 11.sp),
-			color = colors.textPrimary,
-		)
+	SettingsRow(tr("dialog.settings.shortcuts.preset"), description = tr("dialog.settings.shortcuts.presetHint")) {
 		CompactDropdown(
 			items = KeymapPreset.entries,
 			selectedItem = preset,
 			onItemSelected = onPresetChange,
 			itemLabel = { tr(it.labelKey) },
-			modifier = Modifier.weight(1f),
+			modifier = Modifier.widthIn(max = 260.dp).fillMaxWidth(),
 		)
 	}
-	Text(
-		text = tr("dialog.settings.shortcuts.presetHint"),
-		style = typography.caption.copy(fontSize = 10.5.sp),
-		color = colors.textMuted,
-	)
 
 	capture?.let { active ->
 		// Staying in capture after a refusal lets the user simply try another chord.
@@ -461,40 +411,26 @@ private fun SettingsShortcutsSection(
 				tr("dialog.settings.shortcuts.conflict", tr(feedback.action.labelKey))
 			is CaptureCheck.Unsupported -> tr(feedback.messageKey)
 		}
-		Row(
-			modifier = Modifier
-				.fillMaxWidth()
-				.background(colors.panelElevated, RoundedCornerShape(4.dp))
-				.border(
-					BorderStroke(1.dp, if (rejected) colors.error else colors.accent),
-					RoundedCornerShape(4.dp),
-				)
-				.padding(horizontal = 10.dp, vertical = 6.dp),
-			verticalAlignment = Alignment.CenterVertically,
-		) {
+		// A status line marked by an edge in its colour, not a box: it is the one thing on the page that is live.
+		val tint = if (rejected) colors.error else colors.accent
+		Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), verticalAlignment = Alignment.CenterVertically) {
+			Box(Modifier.width(2.dp).fillMaxHeight().background(tint))
 			Text(
 				text = message,
-				style = typography.caption.copy(fontSize = 11.sp),
-				color = if (rejected) colors.error else colors.accent,
+				style = typography.caption.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
+				color = tint,
+				modifier = Modifier.padding(start = 8.dp, top = 2.dp, bottom = 2.dp),
 			)
 		}
 	}
 
 	for (category in ShortcutCategory.entries) {
-		Column(
-			modifier = Modifier.fillMaxWidth(),
-			verticalArrangement = Arrangement.spacedBy(4.dp),
-		) {
-			CompactSectionHeader(tr(category.labelKey))
-			Column(
-				modifier = Modifier
-					.fillMaxWidth()
-					.background(colors.panelElevated, RoundedCornerShape(4.dp))
-					.border(BorderStroke(1.dp, colors.divider), RoundedCornerShape(4.dp)),
-			) {
+		SettingsGroup(tr(category.labelKey)) {
+			// Rows of a list rather than settings: they sit edge to edge, parted by hairlines.
+			Column(Modifier.fillMaxWidth()) {
 				val actions = ShortcutAction.entries.filter { it.category == category }
 				actions.forEachIndexed { index, action ->
-					if (index > 0) Divider(color = colors.divider, thickness = 1.dp)
+					if (index > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(colors.divider.copy(alpha = 0.5f)))
 					ShortcutRow(
 						action = action,
 						keymap = keymap,
@@ -543,7 +479,7 @@ private fun ShortcutRow(
 		Row(
 			modifier = Modifier
 				.fillMaxWidth()
-				.padding(horizontal = 10.dp, vertical = 5.dp),
+				.padding(horizontal = 4.dp, vertical = 5.dp),
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.spacedBy(3.dp),
 		) {
@@ -633,7 +569,7 @@ private fun ShortcutRow(
 		if (clash) {
 			Text(
 				text = tr("dialog.settings.shortcuts.clash"),
-				modifier = Modifier.padding(start = 10.dp, end = 10.dp, bottom = 5.dp),
+				modifier = Modifier.padding(start = 4.dp, end = 4.dp, bottom = 5.dp),
 				style = typography.caption.copy(fontSize = 10.sp),
 				color = colors.error,
 			)

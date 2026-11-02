@@ -10,12 +10,12 @@ The mode menu at the top left of the canvas (like Blender's mode drop-down) list
 
 | Mode | What it changes | Common tools |
 | --- | --- | --- |
-| Object | Object selection | Click, box and lasso select; synced with the hierarchy; the toolbar's **Create** |
+| Object | Object selection | Click, box and lasso select; synced with the hierarchy; interior handles; the toolbar's **Create** |
 | Deform | Base shape or the keyform of the current parameters | Vertex / edge / face select, transform, push, smooth, inflate, path control points |
-| Edit | Mesh topology and path binding | Vertex / edge / face select, connect, merge, subdivide, knife, delete, Glue (when two meshes are selected) |
+| Edit | Mesh topology and path binding | Vertex / edge / face select, mesh points (points / line), connect, merge, subdivide, delete edges, re-triangulate, delete, Glue (when two meshes are selected) |
 | Simulate | Vertex weight groups read by the simulation (this app only) | Weight brush, weight gradient, with the group to paint (pinned, stiffness and so on) switched by kind beneath them; the mode bar creates cloth / hair and switches the reference simulation (not exported) |
 | Skeleton | Skeleton | Pose, bone edit; bone edits are saved when switching to pose or leaving the mode |
-| Paint | Layer pixels | Brush, pencil, eraser, fill, eyedropper, shapes |
+| Paint | Layer pixels | Brush, pencil, eraser, blur, fill, gradient, eyedropper, shapes, selection |
 | Preview | Nothing | Playback, mouse follow, physics, frame rate |
 
 Like Edit mode, Simulate mode acts on every selected mesh at once, and always shows the current weight group in Blender's weight colours (blue 0 → green → yellow → red 1). The weight brush ring is coloured by mode (add white, subtract red, set accent, smooth cyan); on hover it marks the vertices a press would affect, and the number next to the pointer is the nearest vertex's weight; Alt + right-drag adjusts radius / hardness and previews the falloff. The weight gradient drags from the full value to where it fades out. The simulation itself runs only inside the editor; to export it, bake it in the Simulation panel, see [Simulation and baking](SIMULATION.md).
@@ -24,7 +24,7 @@ The current tool's settings are split across several places, each with its own j
 
 | Place | Contents |
 | --- | --- |
-| Left toolbar | The current mode's tools, one per row, grouped by category with dividers; in Object mode the last group creates Warp, Rotation and deform paths. The selected tool's variants (brush shape, paint shape, Glue and skeleton sub-tools, weight group kind) unfold beneath it; `1`–`5` also pick them |
+| Left toolbar | The current mode's tools, one per row, grouped by category with dividers; in Object mode the last group creates Warp, Rotation and deform paths. The selected tool's variants (brush shape, paint shape, selection kind, Glue and skeleton sub-tools, weight group kind) unfold beneath it; `1`–`5` also pick them |
 | Mode bar (top of the canvas) | After the mode menu come the items that decide how the canvas behaves: vertex / edge / face for selection tools in Deform / Edit mode (`1`–`3`), and confirm and cancel for the current step (placement, knife, path, Glue and so on) |
 | Tool options bar (bottom left of the canvas) | The current tool's values: radius, strength, hardness, opacity, mode and so on; drag a value left or right to adjust it, click it to pop up a slider. In Paint mode the foreground / background colours come first |
 | Canvas context menu | The same settings as the mode bar and options bar (one per row), plus the tool's actions, each with an icon; it opens and highlights on hover with the same animation as the mode menu. In Object mode, creating Warp, Rotation, deform paths, bones and swings is gathered in the **Create** submenu. In Object, Edit and Paint modes, actions on the whole layer have submenus too: **Mesh** holds rebuilding the mesh from the current pixels, splitting disconnected meshes and, when available, front/back layers; a layer linked to a material also gets **Material**, which opens it in the material window or unlinks it. When the rest fits in 10 rows it is all shown directly; only beyond that are the largest groups (such as topology, falloff) folded into one row that unfolds to the right on hover. The context menus of the panels (hierarchy, materials, texture atlas, motions, physics and so on) look and open like the canvas menu: they unfold from where you pressed and flip to the other side near the window edge |
@@ -66,6 +66,25 @@ Objects without bound parameters edit the base shape; bound objects edit the cur
 
 Left-right parameters are those whose range is symmetric about the default and that are the horizontal axis of a 2D link or whose ID ends in X or Z (AngleX, AngleZ, BodyAngleX, EyeBallX and so on). The opposite object is paired by layer semantics first, then by L/R, Left/Right or 左/右 in its ID or name. A mirror covers only the object's own deformation, in the frame of its parents at the default pose; mirror the parents' keyforms separately. With several layers selected each mesh is mirrored, committed as one history step.
 
+The **Keyform** submenu of the same context menu works on the shape at the current key; its results are ordinary keyforms too and can be undone. The parameters must sit exactly on one of the object's keys:
+
+| Action | What it does |
+| --- | --- |
+| Copy keyform | Remembers the shape the object shows at the current parameters; shortcut `Ctrl+Alt+C` |
+| Paste keyform | Writes the shape fixed when copying onto the current key as moves (a mesh's from its rest, a Warp's or rotation deformer's from its default-key shape); onto the same object, or one of its kind with the same triangles (a Warp: rows and columns) under the same parent; `Ctrl+Alt+V` |
+| Reset to the default-key shape | Puts the current key back to the shape at the parameters' defaults; `Ctrl+Alt+X` |
+| Reset to the mesh rest shape | Meshes only: back to the undeformed mesh |
+| Interpolate from neighbouring keys of (parameter) | Remakes the current key from the keys on either side along that parameter; with several such parameters each is listed, and `Ctrl+Alt+I` takes the first |
+| Paste with options… | A dialog picks what to paste (shape, opacity, draw order, multiply and screen color), a blend ratio (100% pastes, less blends), a left-right or top-bottom flip (a Warp's columns or rows reversed, a mesh's vertices paired by their mirrored rest, which must be symmetric), and which object each copied shape goes onto |
+| Restore every key to the default-key shape | Every key of the object back to its default-key shape, to start over |
+| Multi-key editing… | Picks a range by parameter key values and changes opacity, draw order and colors of many keyforms of several objects at once (overwrite, add, multiply or screen) |
+
+Copying records a shape for each selected mesh; pasting writes each back onto itself or onto the next selected object that can take it, every shape as it was copied. With points selected, paste, reset and interpolate change only those points, and the menu rows show how many; a Warp at the Bezier level and a rotation deformer are always handled whole. On keyforms a generator owns the result is recorded as a generated override. When the parameters are not on one of the object's keys, or it binds none, the menu says why.
+
+**Soft selection**: with the Select or Transform tool, turn on **Soft selection** in the tool options bar (`O`); dragging or transforming selected points then also moves the points around them, less the further they are from the nearest selected point. The **Falloff radius** is in canvas units and `[` / `]` adjust it; the falloff curve is shared with the deform brush. Affected points are ringed in red, larger rings following more. What is committed is still one ordinary geometry edit.
+
+**Temporary deform**: `Shift+T` or **Temporary deform (lattice)** in the context menu lays a disposable lattice over the selected points (with no selection, the whole mesh or Warp); dragging its points carries the points inside by bilinear interpolation, one history step per release. A press between keys first snaps the pose onto the keys, and a press after the shape changed elsewhere lays the lattice again; neither starts a drag, so press again. **Lattice** in the toolbar switches 1×1–4×4; Enter, Esc or **Done** ends it, and the lattice itself is not kept.
+
 ## Multiple canvases, parameters and animation
 
 All canvases of a workspace share the parameter pose, parameter locks and playback controls. Switching between edit and preview, changing focus or hiding a canvas never swaps back to another pose. Selection, tool, camera and display settings are still kept per canvas; different workspaces keep their own poses.
@@ -101,9 +120,59 @@ The tip shape is picked under the brush in the left toolbar (the same for the we
 | Connect / merge | Connects the selected points, or merges the selected vertices into one |
 | **Duplicate** | Copies the selected vertices and the faces they fully cover; the copy becomes the selection |
 | **Delete** | Deletes the selection and tries to rebuild the gap; refused when no valid topology can be formed |
-| Knife | Places a polyline point by point; snaps near points or edges, Shift turns snapping off temporarily; Enter finishes, Esc cancels |
+| Delete edges | Deletes the selected edges (`Del` in edge mode, or **Delete edges** in the topology menu): an inner edge is replaced by the other diagonal of the quad its two triangles form, refused when the quad is not convex at rest or in any keyform or blend form (it would turn over in that pose); an outline edge removes its triangle, together with any vertex no longer used; refused when a vertex would be left joined by a single point or no triangle would remain |
+| Re-triangulate | Topology menu: around the selected vertices (the whole mesh when nothing is selected), turns slivers into more even triangles; vertices, outline and texture stay put, and a notice says when there is nothing to improve |
+| Mesh points | Point-by-point corrections to the automatic layout: **Points** adds, moves and deletes vertices, **Line** lays joined edges along a line, see below |
 
-The knife may place points outside the original mesh. Topology updates also handle UVs, keyforms, blend shapes and Glue vertex references, and rebind paths. Still check existing poses, especially boundary changes after deleting outline points.
+### Mesh points
+
+The first tool of the topology group in the Edit mode toolbar, for ordinary meshes and meshes with an interior effect alike. It has two modes, switched in the options bar or under the tool in the toolbar, or directly by each one's shortcut:
+
+| Mode | Shortcut | Use | Journal command |
+| --- | --- | --- | --- |
+| Points | `Alt+M` | Add, move and delete vertices, tune the density; every click or stroke commits at once and the mesh tidies the connections around new points, so points are **not promised an edge** between them | `add_points` (and `connect` / `delete` / `delete_edges`) |
+| Line | `K` | Click a polyline point by point and commit it with Enter; every point is joined to the last by an edge, so the mesh can **fold** along it (an eyelid, a mouth line, a crease) | `knife` |
+
+Both modes place a point by the same rule: the pointer snaps to nearby vertices and edges (one shared snap radius; in Line mode Shift turns snapping off for the moment), the hover marker shows where a press would land, and points may land outside the mesh.
+
+#### Points
+
+| Action | Result |
+| --- | --- |
+| Click on open canvas | Adds a vertex there: inside a triangle it splits the triangle in three, on an edge it splits the edge, outside the mesh it grows one triangle from the nearest visible outline edge |
+| Drag on open canvas | Adds a vertex every **Point spacing** (canvas pixels) along the stroke, committed as one step |
+| Drag a vertex | Moves it, as the select tool does: the texture stays, glued points move together |
+| Shift + click a vertex | Connects the one selected vertex to it and moves the selection onto it, so repeated Shift-clicks draw a chain |
+| Alt + click | Deletes a vertex (filling the gap) or an edge |
+
+#### Line
+
+Each click drops one anchor: on a vertex it uses that vertex, on an edge it splits the edge, inside a triangle or outside the mesh it adds a new vertex; every two neighbouring anchors are joined by an edge, splitting the edges it crosses. Enter (or **Finish line** on the mode bar) commits the whole line in one step, Delete takes back a point, Esc cancels. A line that cannot be joined without overlapping the mesh is refused whole and the draft is kept, so the last point can be taken back and placed again.
+
+#### Common to both
+
+A new vertex's position, UV, keyforms, blend shapes and vertex weights all derive from the vertices around it by one set of weights, so adding points never moves the picture; afterwards the edges around it are flipped where that does not change the texture, to avoid slivers. With **Mirror across centre** on, adds, deletes and edge deletes also happen at the mirror position across the vertical centre line of the mesh's current bounds (only on this side when there is no vertex or edge there). The selection group of the context menu also has **Select outline vertices** and **Select inner vertices**, for working on the boundary or the inside alone.
+
+On a mesh with an interior effect, adding, deleting or connecting points, deleting edges, re-triangulating or moving rest-shape vertices bakes the effect again on the new mesh in the same step; when the new mesh fails the effect's area checks, the edit is still committed and the interior panel reports that the mesh changed and needs regenerating.
+
+Topology updates also handle UVs, keyforms, blend shapes and Glue vertex references, and rebind paths. Still check existing poses, especially boundary changes after deleting outline points.
+
+## Interior handles
+
+The Object-mode **Interior handles** tool (Shift+I, or **Edit on canvas** in the Interior panel toolbar; from another mode either switches to Object mode) adjusts the [interior surface](../spec/INTERIOR_SURFACE.md) of the selected mesh on the canvas. Object mode draws no mesh vertices, so the handles do not crowd among them. When the mesh has no effect yet or it is off, the options bar says so and can turn it on; clicking another object selects it and the handles move to it.
+
+| Handle | Effect |
+| --- | --- |
+| Centre cross | Up arm bulge, left arm pressure, right arm horizontal gain, down arm vertical gain; a longer arm is a larger value, 2 at the dashed box |
+| Arches | Solid: the virtual arch at rest; dashed: the arch leaning under a full input (illustration) |
+| Arrow | Shown when timing and transmission are on; drag an end to move the start or end, the middle to move both |
+| Guides | Click the mesh or empty canvas to start a fold line, click the last point or press Enter to finish; drag a point to move it, a segment to move the line, Ctrl+click to add a point, Alt+click to remove one, Delete removes the selected point or the whole line; a selected fold has a radius handle |
+
+Hovered handles and lines light up and the status bar shows the name and value. Each drag records one history step on release and Esc cancels it; panel values and handles stay in step. With audition on, the shape updates while you drag.
+
+## Feature points
+
+The Object-mode **Feature points** tool (`Shift+Y` by default) shows the handles of the fitted features: each eye's inner and outer corners and the middles of its upper and lower lids, each brow's ends and arch, the mouth's two corners and the middles of its lips (only where those areas use a fitted base). Drag a handle and let go: the feature is refitted from the new place and every pose built from it - opening, the smiling eyes, emotions, mouth shapes - follows; a lid or lip edge follows most at its middle and follows the corners at its ends. The change goes into the rig recipe, one drag is one history step, and it stays through regeneration; a moved handle is drawn square, and `Alt` + click returns it to where the art put it. To shift a feature a little without changing its fit, drag its driving lattice (the eye's, brow's or mouth's shape warp): in Edit mode, or with `Ctrl` in Deform mode, a lattice drag is added to every keyform and blend shape of that warp, so every pose moves with it, and it stays through regeneration; the options bar shows the base values of the area last handled (the eye's lower lid rise and eyeball roundness, the mouth's early opening and form strength, and so on), one drag one history step; **Reset this feature** and **Reset all features** take back a whole feature's moves, or every feature's, at once. MCP changes the same data with `settings_update` `changes.rig.moves`.
 
 ## Creating and placing materials
 
@@ -135,7 +204,7 @@ Drag the origin to move it and the end point to rotate; by default holding `Shif
 Edit mode acts on all selected art meshes at once:
 
 - Vertex clicking, box selection, brush selection, the transform box and the deform brush all work across meshes.
-- Clicking a vertex of a mesh makes it the **primary mesh**; the knife, edge / face modes and paths act on the primary mesh only.
+- Clicking a vertex of a mesh makes it the **primary mesh**; a mesh-points line, edge / face modes and paths act on the primary mesh only.
 - Vertex actions such as delete commit once per mesh with a selection, in a single history entry.
 
 ## Glue
@@ -159,6 +228,25 @@ As in Cubism, gluing happens on the meshes' rest shape (all parameters at their 
 Select a layer before entering Paint. Strokes are kept in a separate paint session with undo and redo inside the session. After the first stroke, a session bar slides in at the top centre of the canvas (the same as the texture atlas adjustment session bar), showing the layer being painted and the stroke count, with Undo, Redo, **Discard** and **Apply**; on a narrow canvas the buttons show icons only, named on hover. The **Tool Details** panel also has **Discard** and **Apply**.
 
 The palette works the Photoshop way: the overlapping foreground / background swatches come first in the tool options bar at the bottom left, with swap (X) at the top right and the default black / white at the bottom left; clicking a swatch opens the colour picker - a saturation / brightness field on the left, a vertical hue strip on the right, **New / Current** comparison swatches (click **Current** to restore), H S B and R G B values and the hex code, and swatches and recent colours below. The **Tool Details** panel embeds the foreground colour's field and hue strip directly, along with the swatches and recent colours. The brush, pencil, eraser and shape sizes are independent of each other; a shape's line width does not change the brush size.
+
+The toolbar has three groups: brush, pencil, eraser, **blur**; bucket, **gradient**, eyedropper; shape, **selection**. Each tool's options are in the options bar at the bottom left, and the selection commands are in the **Selection** group of the canvas context menu:
+
+| Feature | How |
+| --- | --- |
+| Selection tool (`Alt+L`) | Six variants - rectangle, ellipse, lasso, polygonal lasso, magic wand, quick selection - picked with `1`–`6`. Drag a box; hold and drag the lasso's outline; click the polygon point by point and close it by clicking its first point or pressing `Enter` (`Delete` takes the last point back, `Esc` drops it); the wand takes the clicked colour within the tolerance, across the whole layer when **Contiguous** is off; quick selection is a brush that selects what it passes over together with the joined pixels of like colour around it (shading included), stopping at edges where the colour jumps - every stroke adds to the selection, `Alt` strokes take away, `[` `]` size the brush and **Tolerance** sets how alike a colour must be. Colours are compared premultiplied, so a transparent area counts as one colour whatever it hides. Hold `Shift` to add, `Alt` to subtract, `Shift+Alt` to intersect, or fix the combination in the options bar; a click without a drag deselects. The selection shows as marching ants |
+| Selection commands | `Ctrl+A` select all, `Ctrl+D` deselect, `Ctrl+I` (or `Ctrl+Shift+I`) invert, `Alt+Backspace` fill the selection with the foreground colour (the whole layer without one), `Del` clear what the selection holds; the context menu also has **Feather Selection**, **Expand Selection** and **Contract Selection** (by the options bar's **Feather** and **Expand / Contract** distances; contracting does not draw in from the canvas edge) and **Select Opaque Pixels** (the layer's transparency as the selection, Photoshop's Ctrl + click on a layer thumbnail) |
+| What a selection does | While there is one, every tool (brush, eraser, blur, fill, gradient, shapes, clear) changes only the inside, with soft edges blending in proportion. The selection is not part of the stroke history: undoing a stroke leaves it as it is; applying, discarding or switching layers clears it |
+| Free transform (`Alt+T`, or `T` in Paint mode) | Picking the tool puts the selection's pixels - the whole layer's content without one - in a transform box and leaves their place empty. Drag inside to move; drag a corner to scale in proportion (`Shift` frees it), a side handle to scale one way, `Alt` to scale about the middle; drag outside to turn about the middle (`Shift` in 15° steps). `Enter` or **Apply Transform** lays it down, `Esc` or `Ctrl+Z` puts it back, and picking another tool applies it. With **Smooth** off the pixels are sampled nearest, for pixel art. Applied, the whole transform is one step of the stroke history and the selection moves with its pixels |
+| Gradient (`Alt+G`) | Drag from the start to the end; linear or radial, from the foreground colour to the background colour or to transparent; kept to the selection and lock transparency |
+| Blur (`Alt+J`) | Softens what it passes over; **Strength** sets how much, and going back and forth in one stroke does not keep blurring further |
+| Stabilizer | **Stabilizer** 0–30 in the options bar of the brush, pencil, eraser and blur: higher steadies the line and lags more; the line catches up to where you lift the pointer |
+| Symmetry | The same four tools mirror left / right, top / bottom or four ways about the middle of the canvas, marked with dashed axes |
+| Lock transparency (`/`) | Colours only pixels already painted and keeps their transparency; the eraser then paints the background colour |
+| Bucket | With **Contiguous** off it fills every pixel of the colour |
+| Straight lines | `Shift` + click draws a straight line on from where the last stroke ended |
+| Default colours | `Alt+D` restores black / white (`X` swaps foreground and background) |
+
+Pen pressure, rotating / flipping the view, and smudge or watercolour blending are not supported yet; for the full comparison with Photoshop / SAI see [paint system](../../zh/spec/PAINT_SYSTEM_ARCHITECTURE_AND_PRD.md#工具对照与差距) (Chinese).
 
 Painting is not limited to the layer's rectangle; the whole canvas can be painted. Applying cuts the paint by the layer's mesh:
 

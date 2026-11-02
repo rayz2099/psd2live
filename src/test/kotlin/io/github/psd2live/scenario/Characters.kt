@@ -1,6 +1,8 @@
 package io.github.psd2live.scenario
 
 import io.github.psd2live.core.*
+import io.github.psd2live.core.recipe.BaseChoice
+import io.github.psd2live.core.recipe.RigRecipe
 import io.github.psd2live.project.*
 import org.umamo.format.art.*
 import org.umamo.format.png.PngCodec
@@ -48,38 +50,6 @@ internal object Characters {
 	), PipelineConfig(atlasSize = 512, generatePhysics = false, exportMoc3 = false))
 
 	/**
-	 * [figure] with a tail out of the hips. [curled]: a band to the right that turns up and runs back above itself,
-	 * the two strands 4 px apart on the canvas and far apart along the art. Otherwise a fish tail: a stalk to the right
-	 * that forks into an upper and a lower lobe with a notch between them.
-	 */
-	fun tailed(curled: Boolean): WorkspaceDocument = tailed(if (curled) TailShape.CURLED else TailShape.FORKED)
-
-	enum class TailShape { CURLED, FORKED, ARC }
-
-	/** [ARC]: a band 30 px across curving a quarter turn about (240, 170) at radius 100, down from the hips round to the right. */
-	fun tailed(shape: TailShape): WorkspaceDocument {
-		val curled = shape == TailShape.CURLED
-		val tail: (Int, Int) -> Boolean = if (shape == TailShape.ARC) { x, y ->
-			val dx = x + 0.5 - 240.0; val dy = y + 0.5 - 170.0
-			dx >= 0 && dy >= 0 && kotlin.math.hypot(dx, dy) in 85.0..115.0
-		} else if (curled) { x, y ->
-			(x in 240 until 372 && y in 266 until 282) || (x in 356 until 372 && y in 240 until 282) || (x in 280 until 372 && y in 240 until 262)
-		} else { x, y ->
-			val stalk = x in 240 until 330 && y in 263 until 279
-			fun lobe(dy: Int): Boolean {
-				// A band from the stalk's end out to (390, 271 + dy), 14 px across.
-				val ax = 322.0; val ay = 271.0; val bx = 390.0; val by = 271.0 + dy
-				val t = (((x + 0.5 - ax) * (bx - ax) + (y + 0.5 - ay) * (by - ay)) / ((bx - ax) * (bx - ax) + (by - ay) * (by - ay))).coerceIn(0.0, 1.0)
-				return kotlin.math.hypot(x + 0.5 - (ax + (bx - ax) * t), y + 0.5 - (ay + (by - ay) * t)) < 7.0
-			}
-			stalk || lobe(-48) || lobe(48)
-		}
-		// Behind the figure, as a tail is drawn.
-		val parts = listOf(Part("tail", 0, SemanticTag.TAIL, Side.NONE, tail)) + figureParts(1f).map { Part(it.id, it.order + 1, it.tag, it.side, it.inside) }
-		return document(420, 420, parts, PipelineConfig(atlasSize = 512, generatePhysics = false, exportMoc3 = false))
-	}
-
-	/**
 	 * [figure] with an eyebrow on each side under the bangs, the hair reaching over both: what the copies over the bangs
 	 * are made for ([SeeThroughLayers]).
 	 */
@@ -100,7 +70,7 @@ internal object Characters {
 	 * the white (which clips it), a lash line over the white's top and a closed-eye line, as anime art draws them - what
 	 * the eyes' window in the bangs is made for ([SeeThroughLayers]).
 	 */
-	fun eyed(): WorkspaceDocument = document(420, 420, figureParts(1f).map {
+	fun eyed(legacyEyes: Boolean = false): WorkspaceDocument = document(420, 420, figureParts(1f).map {
 		// Lower orders list first, in front: the bangs over the lashes, closed lines, irides and whites, over the face.
 		when (it.tag) {
 			SemanticTag.FACE -> Part(it.id, 17, it.tag, it.side, it.inside)
@@ -116,13 +86,28 @@ internal object Characters {
 		Part("iris_l", 14, SemanticTag.IRIDES, Side.LEFT, box(221, 56, 231, 76)),
 		Part("white_r", 15, SemanticTag.EYEWHITE, Side.RIGHT, box(184, 59, 204, 72)),
 		Part("white_l", 16, SemanticTag.EYEWHITE, Side.LEFT, box(216, 59, 236, 72)),
-	), PipelineConfig(atlasSize = 512, generatePhysics = false, exportMoc3 = false))
+	), PipelineConfig(atlasSize = 512, generatePhysics = false, exportMoc3 = false, recipe = if (!legacyEyes) RigRecipe.Modern
+		else RigRecipe(true, bases = mapOf("eye" to BaseChoice("eye/legacy")))))
 
-	/** A 64² head: back hair and a face. The smallest document the hair generators and simulation presets act on. */
-	fun head(physics: Boolean = true): WorkspaceDocument = document(64, 64, listOf(
+	/** [figure] with an open mouth drawn on the face: what the fitted mouth reads. */
+	fun mouthed(): WorkspaceDocument = document(420, 420, figureParts(1f).map {
+		when (it.tag) {
+			SemanticTag.FACE -> Part(it.id, 17, it.tag, it.side, it.inside)
+			SemanticTag.BACK_HAIR -> Part(it.id, 18, it.tag, it.side, it.inside)
+			else -> it
+		}
+	} + Part("mouth", 8, SemanticTag.MOUTH, Side.NONE, ellipse(210, 100, 14, 7)),
+		PipelineConfig(atlasSize = 512, generatePhysics = false, exportMoc3 = false, recipe = RigRecipe.Modern))
+
+	/**
+	 * A 64² head: back hair and a face. The smallest document the hair generators and simulation presets act on; its
+	 * hair keeps the one sway warp of the front and back hair ([hairChains] gives it chains instead).
+	 */
+	fun head(physics: Boolean = true, hairChains: Boolean = false): WorkspaceDocument = document(64, 64, listOf(
 		Part("hair", 0, SemanticTag.BACK_HAIR, Side.NONE, box(16, 8, 48, 56)),
 		Part("face", 1, SemanticTag.FACE, Side.NONE, box(20, 12, 44, 36)),
-	), PipelineConfig(atlasSize = 256, generatePhysics = physics, exportMoc3 = false))
+	), PipelineConfig(atlasSize = 256, generatePhysics = physics, exportMoc3 = false,
+		recipe = if (hairChains) RigRecipe.Modern else RigRecipe(true, bases = mapOf("hair" to BaseChoice("hair/legacy")))))
 
 	/** A 1200² canvas holding one 1100×1000 top: a part larger than a million square pixels (issue #56). */
 	fun largePart(): WorkspaceDocument = document(1200, 1200, listOf(
@@ -133,6 +118,12 @@ internal object Characters {
 	fun figurePsd(directory: Path): Path {
 		val source = figure().source
 		return directory.resolve("figure.psd").also { Files.write(it, PsdWriter.write(source.widthPx, source.heightPx, source.layers, source.groups)) }
+	}
+
+	/** Writes [head]'s art as a PSD: the cheapest import that still generates a head turn. */
+	fun headPsd(directory: Path): Path {
+		val source = head(physics = false).source
+		return directory.resolve("head.psd").also { Files.write(it, PsdWriter.write(source.widthPx, source.heightPx, source.layers, source.groups)) }
 	}
 
 	/** [figure] at [scale] with both eyes on one layer, two islands a mesh split offers to separate. */

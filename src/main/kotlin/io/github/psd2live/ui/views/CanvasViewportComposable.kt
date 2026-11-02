@@ -72,6 +72,7 @@ import io.github.psd2live.ui.drawTransformBox
 import io.github.psd2live.ui.CanvasTool
 import io.github.psd2live.ui.CreatePlacementKind
 import io.github.psd2live.ui.EditHierarchyMode
+import io.github.psd2live.ui.MeshPointMode
 import io.github.psd2live.ui.PaintShape
 import io.github.psd2live.ui.SelectionStyle
 import io.github.psd2live.ui.VERTEX_TOOLS
@@ -113,6 +114,9 @@ import io.github.psd2live.core.CanvasViewport
 import io.github.psd2live.core.ComponentPalette
 import io.github.psd2live.core.CubismViewport
 import io.github.psd2live.core.RigCanvasSupport
+import io.github.psd2live.ui.parameterKeyMarks
+import io.github.psd2live.ui.selectedParameterOwner
+import org.umamo.runtime.model.ParameterId
 import io.github.psd2live.ui.CachedSkiaPicture
 import io.github.psd2live.ui.SkiaRigPainter
 import io.github.psd2live.ui.SourcePixelImages
@@ -150,7 +154,9 @@ import io.github.psd2live.ui.tutorial.TutorialTargetId
 import io.github.psd2live.ui.tutorial.tutorialTarget
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
 import org.umamo.render.eval.DeformedGeometry
 import java.awt.BasicStroke
 import java.awt.Cursor
@@ -244,6 +250,14 @@ fun CanvasViewportComposable(
 	var temporarySelectButton by remember { mutableStateOf<PointerButton?>(null) }
 	var showContextMenu by remember { mutableStateOf(false) }
 	var contextMenuOffset by remember { mutableStateOf(Offset.Zero) }
+	// The hit area the last preview click hit, highlighted until the next click; it fades in as other highlights do.
+	var hitShown by remember { mutableStateOf<io.github.psd2live.core.RigHitArea?>(null) }
+	val hitAlpha = remember { androidx.compose.animation.core.Animatable(0f) }
+	LaunchedEffect(hitShown) {
+		if (hitShown == null) hitAlpha.snapTo(0f)
+		else { hitAlpha.snapTo(0f); hitAlpha.animateTo(1f, androidx.compose.animation.core.tween(io.github.psd2live.ui.theme.Motion.Fade,
+			easing = androidx.compose.animation.core.LinearOutSlowInEasing)) }
+	}
 	var fps by remember { mutableStateOf(0f) }
 	val fpsCounter = remember { ActualFpsCounter() }
 	// A paused preview still follows the pointer, so the frame pump must stay awake for a moment
@@ -321,8 +335,10 @@ fun CanvasViewportComposable(
         if (mode == CanvasMode.EDIT) {
             // A pose drag is the one gesture whose whole output is parameter values, so its own writes
             // must not read as the document changing under it.
-            // A swing handle drag patches the preview on every move for the same reason.
-            if (!editor.busy && editor.inGesture && editor.poseDrag == null && !editor.swingDragging) editor.cancel()
+            // A swing handle drag patches the preview on every move for the same reason; an interior handle drag
+            // edits a draft that its earlier release's commit, landing now, must not take back.
+            if (!editor.busy && editor.inGesture && editor.poseDrag == null && !editor.swingDragging && !editor.interiorTool.dragging)
+                editor.cancel()
             editor.reconcileWithDocument()
             if (!editor.busy && canvasState.previewModel != null) editor.target()?.let { t -> editor.vertices=editor.vertices.filter { it in 0 until t.count }.toSet() }
         }
@@ -353,6 +369,60 @@ fun CanvasViewportComposable(
 			RigCanvasSupport.evaluate(previewModel, snapshotPreview.previewValues(previewModel.rig.puppet.parameters))
 		else null
 	}
+	// The onion skin: the shape a step away on either side, faded and tinted over the artwork. An open motion steps
+	// through its frames around the playhead; otherwise the ghosts sit at the keys of the parameter being edited,
+	// around its value. An editing aid only: neither the document nor an export sees it.
+	val aids = viewOptions.aids
+	// A playing motion shows its own frames; ghosts around a moving playhead would only flicker behind it.
+	val onionPlaying = canvasState.animationEnabled || viewModel.motionEditor.playing
+	val onionOn = mode == CanvasMode.EDIT && aids.onionSkin && previewModel != null && paintSession == null && snapshotPreview == null &&
+		!onionPlaying
+	val onionClip = if (onionOn) viewModel.editingMotionClip(canvasState) else null
+	val onionParameter = if (onionOn && onionClip == null) editor.parameter?.let(::ParameterId)
+		?.takeIf { id -> previewModel?.rig?.puppet?.parameters?.any { it.id == id } == true } else null
+	val onionKeys = remember(previewModel?.rig?.puppet, onionParameter, canvasState.selectedLayerId, canvasState.selectedDeformerId) {
+		val model = previewModel
+		if (model == null || onionParameter == null) emptyList() else {
+			val puppet = model.rig.puppet
+			// The keys of the object being edited, or of the whole rig when it has none on this parameter.
+			val owner = puppet.selectedParameterOwner(canvasState.selectedLayerId, canvasState.selectedDeformerId, model.rig.ownLayerIdByDrawableId)
+			(owner?.let { puppet.parameterKeyMarks(it)[onionParameter]?.allKeys }?.takeIf { it.isNotEmpty() }
+				?: puppet.parameterKeyMarks()[onionParameter]?.allKeys).orEmpty()
+		}
+	}
+	val onionPoses: List<Pair<io.github.psd2live.ui.OnionGhost, Map<org.umamo.runtime.model.ParameterId, Float>>> = when {
+		previewModel == null -> emptyList()
+		onionClip != null -> io.github.psd2live.ui.OnionSkin.frameGhosts(viewModel.motionEditor.playhead, onionClip.fps,
+			aids.onionFrameStep, aids.onionBefore, aids.onionAfter, onionClip.duration, onionClip.loop).map { ghost ->
+			val motion = io.github.psd2live.core.MotionClips.sampleAll(onionClip, ghost.value.toDouble(), loop = false)
+				.filterKeys { it !in canvasState.lockedParameters }
+			ghost to io.github.psd2live.core.boundedPreviewPose(geometryPose + motion, previewModel.rig.puppet.parameters)
+		}
+		onionParameter != null -> {
+			val current = geometryPose[onionParameter]
+				?: previewModel.rig.puppet.parameters.first { it.id == onionParameter }.default
+			io.github.psd2live.ui.OnionSkin.keyGhosts(onionKeys, current, aids.onionBefore, aids.onionAfter)
+				.map { ghost -> ghost to geometryPose + (onionParameter to ghost.value) }
+		}
+		else -> emptyList()
+	}
+	// The ghosts are evaluated off the UI thread from the committed rig, the last ones staying up until the next are
+	// ready. A drag or a slider scrub freezes them where they were, so a gesture never evaluates a ghost per frame.
+	val onionFrozen = editor.inGesture || viewModel.parameterScrubActive
+	val onionHeld = remember { arrayOfNulls<Pair<RigPreviewModel, List<Pair<io.github.psd2live.ui.OnionGhost,
+		Map<org.umamo.runtime.model.ParameterId, Float>>>>>(1) }
+	val requested = sourcePreviewModel?.takeIf { onionOn && onionPoses.isNotEmpty() }?.let { it to onionPoses }
+	val onionRequest = if (onionFrozen && requested != null) onionHeld[0] ?: requested else requested
+	androidx.compose.runtime.SideEffect { onionHeld[0] = onionRequest }
+	val onionFrame by androidx.compose.runtime.produceState<OnionFrame?>(null, onionRequest) {
+		val (model, poses) = onionRequest ?: run { value = null; return@produceState }
+		value = OnionFrame(model, withContext(Dispatchers.Default) {
+			// A newer request cancels this one between ghosts rather than after all of them.
+			poses.map { (ghost, pose) -> ensureActive(); ghost to RigCanvasSupport.evaluate(model, pose) }
+		})
+	}
+	val onionGeometry = onionFrame?.ghosts.orEmpty()
+	val guideDrag = remember { CanvasGuideDrag() }
 	val guideState = if (allowSelectionChrome) canvasState else canvasState.copy(
 		selectedLayerId = null,
 		selectedLayerIds = emptySet(),
@@ -418,10 +488,20 @@ fun CanvasViewportComposable(
 	val gpuKey = viewModel.canvasRenderKey(canvasId, CanvasMode.EDIT)
 	val ghostKey = "$gpuKey#snapshot"
 	val simulationKey = "$gpuKey#simulation"
+	val onionKey = "$gpuKey#onion"
 	val simulationGhost = remember { SimulationGhostMemo() }
 	// The paint session this view's GPU texture holds in full; another session, or a new view, uploads all of it.
 	val paintUploaded = remember(gpuKey) { arrayOfNulls<Any>(1) }
 	DisposableEffect(gpuKey) { onDispose { CanvasGpu.release(gpuKey); CanvasGpu.release(ghostKey); CanvasGpu.release(simulationKey) } }
+	// Ghost views no longer drawn give their textures back, as do all of them with the canvas.
+	val onionViews = onionGeometry.size
+	DisposableEffect(gpuKey, onionViews) {
+		for (i in onionViews until 2 * io.github.psd2live.ui.CanvasAidOptions.MAX_ONION_GHOSTS) CanvasGpu.release("$onionKey$i")
+		onDispose {}
+	}
+	DisposableEffect(gpuKey) {
+		onDispose { for (i in 0 until 2 * io.github.psd2live.ui.CanvasAidOptions.MAX_ONION_GHOSTS) CanvasGpu.release("$onionKey$i") }
+	}
 	val drawnGeometry = remember { DrawnGeometryMemo() }
 	// A session shown by the GPU hands it changed areas instead of painting preview tiles.
 	LaunchedEffect(paintSession, gpuReady) { paintSession?.gpuPreview = gpuReady }
@@ -731,6 +811,89 @@ fun CanvasViewportComposable(
 
 	// One canvas command, from a key press, a wheel notch ([wheel]) or a button click. False lets the input
 	// through: a key to the views behind the canvas, a wheel notch to the zoom.
+	// Guides: dragged out of the rulers, moved by dragging, removed by dragging them back onto a ruler. The press
+	// and the moves only touch [guideDrag]; the release saves the guides once.
+	val guidesShown = mode == CanvasMode.EDIT && previewModel != null && aids.showGuides
+	val shownGuides = viewModel.canvasGuides(canvasState)
+	val rulerPx = CANVAS_RULER_WIDTH.value * density
+	// A guide on the artwork is taken only by the selection tools, unmodified and off the editor's own handles:
+	// a brush, a creation tool, Paint mode or a Shift/Alt gesture keeps the press however near a guide it lands.
+	fun guidesGrabbable(shift: Boolean, alt: Boolean): Boolean = !aids.guidesLocked && !shift && !alt &&
+		editor.hierarchyMode != EditHierarchyMode.PAINT &&
+		(editor.tool in io.github.psd2live.ui.SELECTION_TOOLS || editor.tool == io.github.psd2live.ui.CanvasTool.TRANSFORM) &&
+		!editor.hoversHandle()
+	fun guidePosition(at: Offset, vertical: Boolean, viewport: io.github.psd2live.core.CanvasViewport): Float {
+		val raw = if (vertical) viewport.canvasX(at.x) else viewport.canvasY(at.y)
+		if (!aids.snap || !aids.showGrid) return raw
+		val line = io.github.psd2live.ui.CanvasGrid.nearest(raw, aids.gridSpacing, aids.gridSubdivisions, viewport.scale / density)
+		val tolerance = (io.github.psd2live.ui.CanvasSnap.SCREEN_TOLERANCE * density / viewport.scale).toFloat()
+		return if (kotlin.math.abs(line - raw) <= tolerance) line else raw
+	}
+	fun guideAt(at: Offset, viewport: io.github.psd2live.core.CanvasViewport): io.github.psd2live.project.CanvasGuide? =
+		io.github.psd2live.ui.CanvasGuides.hit(shownGuides, viewport.canvasX(at.x), viewport.canvasY(at.y),
+			(GUIDE_HIT_DP * density / viewport.scale).toFloat())
+	fun guidePress(at: Offset, shift: Boolean, alt: Boolean): Boolean {
+		if (!guidesShown) return false
+		val onTop = at.y < rulerPx
+		val onLeft = at.x < rulerPx
+		val viewport = currentViewportFor(viewSize)
+		val guides = shownGuides
+		if (onTop || onLeft) {
+			// The top ruler gives a horizontal guide and the left one a vertical guide; the corner neither.
+			if (!(onTop && onLeft) && !aids.guidesLocked && guides.size < io.github.psd2live.ui.CanvasGuides.MAX_GUIDES) {
+				val vertical = onLeft
+				guideDrag.draft = io.github.psd2live.project.CanvasGuide(io.github.psd2live.ui.CanvasGuides.nextId(guides), vertical,
+					guidePosition(at, vertical, viewport))
+				guideDrag.overRuler = true
+			}
+			return true
+		}
+		if (!guidesGrabbable(shift, alt)) return false
+		val hit = guideAt(at, viewport) ?: return false
+		guideDrag.draft = hit
+		guideDrag.overRuler = false
+		return true
+	}
+	fun guideMove(at: Offset, shift: Boolean, alt: Boolean): Boolean {
+		val draft = guideDrag.draft
+		if (draft == null) {
+			guideDrag.hovered = if (guidesShown && guidesGrabbable(shift, alt) && at.x >= rulerPx && at.y >= rulerPx)
+				guideAt(at, currentViewportFor(viewSize)) else null
+			return false
+		}
+		guideDrag.draft = draft.copy(position = guidePosition(at, draft.vertical, currentViewportFor(viewSize)))
+		guideDrag.overRuler = (if (draft.vertical) at.x < rulerPx else at.y < rulerPx) ||
+			at.x > viewSize.width || at.y > viewSize.height
+		return true
+	}
+	fun guideRelease(): Boolean {
+		val draft = guideDrag.draft ?: return false
+		val remove = guideDrag.overRuler
+		guideDrag.draft = null
+		guideDrag.overRuler = false
+		val guides = shownGuides
+		viewModel.setCanvasGuides(if (remove) guides.filterNot { it.id == draft.id } else io.github.psd2live.ui.CanvasGuides.put(guides, draft))
+		return true
+	}
+	// With snapping on, a point the editor drags is drawn to the grid and the guides it nears; the pointer itself,
+	// and so every hit test and hover, stays where it is. Paint strokes and the deform brushes never snap: a stroke
+	// bent onto a grid line is not what was drawn.
+	fun snapPoint(at: Offset): Offset {
+		if (mode != CanvasMode.EDIT || !aids.snaps || editor.hierarchyMode == EditHierarchyMode.PAINT ||
+			editor.tool in io.github.psd2live.ui.DEFORM_BRUSH_TOOLS) return at
+		val viewport = currentViewportFor(viewSize)
+		val grid: ((Float) -> Float)? = if (!aids.showGrid) null else { value ->
+			io.github.psd2live.ui.CanvasGrid.nearest(value, aids.gridSpacing, aids.gridSubdivisions, viewport.scale / density)
+		}
+		val (x, y) = io.github.psd2live.ui.CanvasSnap.snap(viewport.canvasX(at.x), viewport.canvasY(at.y),
+			if (aids.showGuides) shownGuides else emptyList(), grid,
+			(io.github.psd2live.ui.CanvasSnap.SCREEN_TOLERANCE * density / viewport.scale).toFloat())
+		return Offset(viewport.x(x).toFloat(), (viewport.offsetY + y * viewport.scale).toFloat())
+	}
+	val snapsPoints = mode == CanvasMode.EDIT && previewModel != null && aids.snaps
+	androidx.compose.runtime.SideEffect { editor.snapScreenPoint = if (snapsPoints) ::snapPoint else null }
+	DisposableEffect(editor) { onDispose { editor.snapScreenPoint = null } }
+
 	fun runCanvasCommand(action: ShortcutAction, shift: Boolean, wheel: Boolean): Boolean {
 		if (action == ShortcutAction.QUICK_PREVIEW) {
 			if (previewModel != null && !canvasState.workspaceEditBusy) editor.toggleQuickPreview()
@@ -749,6 +912,39 @@ fun CanvasViewportComposable(
 			}
 			else -> Unit
 		}
+		// The canvas aids are view options and a pose: like the camera, a running commit does not hold them up.
+		when (action) {
+			ShortcutAction.TOGGLE_GRID, ShortcutAction.TOGGLE_GUIDES, ShortcutAction.LOCK_GUIDES,
+			ShortcutAction.TOGGLE_SNAP, ShortcutAction.TOGGLE_ONION_SKIN -> {
+				if (mode != CanvasMode.EDIT || previewModel == null) return false
+				val a = viewOptions.aids
+				val next = when (action) {
+					ShortcutAction.TOGGLE_GRID -> a.copy(showGrid = !a.showGrid)
+					ShortcutAction.TOGGLE_GUIDES -> a.copy(showGuides = !a.showGuides)
+					ShortcutAction.LOCK_GUIDES -> a.copy(guidesLocked = !a.guidesLocked)
+					ShortcutAction.TOGGLE_SNAP -> a.copy(snap = !a.snap)
+					else -> a.copy(onionSkin = !a.onionSkin)
+				}
+				viewModel.setCanvasViewOptions(canvasId, viewOptions.copy(aids = next), mode)
+				return true
+			}
+			ShortcutAction.RANDOM_POSE -> {
+				if (previewModel == null) return false
+				viewModel.applyRandomPose(canvasId)
+				return true
+			}
+			ShortcutAction.RESTORE_RANDOM_POSE -> {
+				viewModel.restoreRandomPose()
+				return true
+			}
+			else -> Unit
+		}
+		if (action == ShortcutAction.TOGGLE_OBJECT_MODE) {
+			if (previewModel == null) return false
+			if (!editor.busy && !canvasState.workspaceEditBusy)
+				editor.chooseCanvasMode(CanvasModeChoice.of(editor.objectModeToggleTarget))
+			return true
+		}
 		CanvasModeChoice.entries.firstOrNull { it.shortcut == action }?.let { choice ->
 			if (previewModel == null) return false
 			if (!editor.busy && !canvasState.workspaceEditBusy) editor.chooseCanvasMode(choice)
@@ -761,7 +957,10 @@ fun CanvasViewportComposable(
 			ShortcutAction.SELECT_ALL -> { editor.selectAll(); true }
 			ShortcutAction.INVERT_SELECTION -> { editor.selectAll(true); true }
 			ShortcutAction.TOOL_SELECT -> { editor.activateTool(CanvasTool.SELECT); true }
-			ShortcutAction.TOOL_TRANSFORM -> { editor.activateTool(CanvasTool.TRANSFORM); true }
+			// Paint has no objects to transform: there T is the free transform of the layer's pixels.
+			ShortcutAction.TOOL_TRANSFORM -> {
+				editor.activateTool(if (editor.hierarchyMode == EditHierarchyMode.PAINT) CanvasTool.PAINT_TRANSFORM else CanvasTool.TRANSFORM); true
+			}
 			ShortcutAction.TOOL_LASSO_SELECT -> { editor.activateTool(CanvasTool.LASSO_SELECT); true }
 			ShortcutAction.TOOL_BRUSH_SELECT -> { editor.activateTool(CanvasTool.BRUSH_SELECT); true }
 			ShortcutAction.TOOL_BRUSH -> { editor.activateTool(CanvasTool.BRUSH); true }
@@ -774,14 +973,32 @@ fun CanvasViewportComposable(
 			ShortcutAction.TOOL_CREATE_DEFORM_PATH -> { editor.activateTool(CanvasTool.CREATE_DEFORM_PATH); true }
 			ShortcutAction.TOOL_GLUE -> { editor.activateTool(CanvasTool.GLUE); true }
 			ShortcutAction.TOOL_SUBDIVIDE -> { editor.activateTool(CanvasTool.SUBDIVIDE); true }
-			ShortcutAction.TOOL_KNIFE -> { editor.activateTool(CanvasTool.KNIFE); true }
+			// The two chords arm the point tool's two faces, the way the shape chords arm the shape tool's.
+			ShortcutAction.TOOL_KNIFE -> { editor.selectMeshPointMode(MeshPointMode.LINE); true }
+			ShortcutAction.TOOL_MESH_POINT -> { editor.selectMeshPointMode(MeshPointMode.POINT); true }
 			ShortcutAction.TOOL_WEIGHT_PAINT -> { editor.activateTool(CanvasTool.WEIGHT_PAINT); true }
 			ShortcutAction.TOOL_WEIGHT_GRADIENT -> { editor.activateTool(CanvasTool.WEIGHT_GRADIENT); true }
+			ShortcutAction.TOOL_INTERIOR -> { editor.activateTool(CanvasTool.INTERIOR); true }
+			ShortcutAction.TOOL_FEATURE -> { editor.activateTool(CanvasTool.FEATURE); true }
 			ShortcutAction.SELECTION_STYLE_BOX -> { editor.selectionStyle = SelectionStyle.BOX; true }
 			ShortcutAction.SELECTION_STYLE_LASSO -> { editor.selectionStyle = SelectionStyle.LASSO; true }
 			ShortcutAction.SELECT_LINKED -> { editor.selectLinked(); true }
 			ShortcutAction.MIRROR_KEYFORM -> editor.editable && editor.keyformMirrorPlan(CanvasEditor.KeyformMirrorAction.TO_OPPOSITE_KEY) != null &&
 				true.also { editor.mirrorKeyform(CanvasEditor.KeyformMirrorAction.TO_OPPOSITE_KEY) }
+			ShortcutAction.SOFT_SELECTION_TOGGLE -> (editor.hierarchyMode == EditHierarchyMode.DEFORM) && true.also { editor.softSelection = !editor.softSelection }
+			ShortcutAction.TEMPORARY_DEFORM -> when {
+				editor.temporaryWarp != null -> { editor.endTemporaryWarp(); true }
+				editor.canBeginTemporaryWarp() -> { editor.beginTemporaryWarp(); true }
+				else -> false
+			}
+			ShortcutAction.KEYFORM_COPY -> editor.canCopyKeyform() && true.also { editor.copyKeyform() }
+			ShortcutAction.KEYFORM_PASTE -> editor.keyformToolCommands(CanvasEditor.KeyformToolAction.PASTE).isNotEmpty() &&
+				true.also { editor.runKeyformTool(CanvasEditor.KeyformToolAction.PASTE) }
+			ShortcutAction.KEYFORM_RESET -> editor.keyformToolCommands(CanvasEditor.KeyformToolAction.RESET_DEFAULT).isNotEmpty() &&
+				true.also { editor.runKeyformTool(CanvasEditor.KeyformToolAction.RESET_DEFAULT) }
+			// The first axis the key sits between keys of; the menu lists each.
+			ShortcutAction.KEYFORM_INTERPOLATE -> editor.keyformInterpolationAxes().firstOrNull()?.let { parameter ->
+				editor.runKeyformTool(CanvasEditor.KeyformToolAction.INTERPOLATE, parameter); true } ?: false
 			ShortcutAction.LAYER_TO_FRONT -> viewModel.reorderSelectedLayers("front")
 			ShortcutAction.LAYER_FORWARD -> viewModel.reorderSelectedLayers("forward")
 			ShortcutAction.LAYER_BACKWARD -> viewModel.reorderSelectedLayers("backward")
@@ -798,14 +1015,21 @@ fun CanvasViewportComposable(
 					if (referenceInteraction.active) referenceInteraction.cancel()
 					else if (selectedReference() != null) viewModel.selectReference(null, canvasId, canvasState.activeWorkspace.id)
 					else if (viewModel.swingSession != null) viewModel.endSwing()
+					// The interior tool steps back its own gesture first, leaving the audition running.
+					else if (editor.tool == CanvasTool.INTERIOR && editor.cancelInterior()) Unit
+					else if (editor.tool == CanvasTool.FEATURE && editor.cancelFeature()) Unit
 					else if (editor.placement != null) editor.cancelPlacement() else editor.cancel()
 					true
 				}
 			}
 			ShortcutAction.FINISH_PATH -> {
 				when {
+					editor.activeTemporaryWarp() != null -> { editor.endTemporaryWarp(); true }
 					viewModel.swingSession != null -> { viewModel.commitSwing(); true }
-					editor.tool == CanvasTool.KNIFE -> { editor.finishKnife(); true }
+					editor.hierarchyMode == EditHierarchyMode.PAINT && editor.paintTransform != null -> { editor.applyPaintTransform(); true }
+					editor.hierarchyMode == EditHierarchyMode.PAINT && editor.paintSelectDraft.isNotEmpty() -> editor.finishPaintPolygon()
+					editor.knifing -> { editor.finishKnife(); true }
+					editor.tool == CanvasTool.INTERIOR -> editor.interiorTool.finish()
 					editor.placement != null && editor.placement?.kind != CreatePlacementKind.PATH -> {
 						editor.confirmPlacement(); true
 					}
@@ -818,11 +1042,16 @@ fun CanvasViewportComposable(
 					else -> false
 				}
 			}
+			// Select mode copies and pastes objects; the other modes leave the chords to what they hold.
+			ShortcutAction.COPY -> editor.hierarchyMode == EditHierarchyMode.SELECT && viewModel.copyObjects()
+			ShortcutAction.PASTE -> editor.hierarchyMode == EditHierarchyMode.SELECT && editor.editable && viewModel.pasteObjects()
 			ShortcutAction.DELETE_SELECTION -> {
 				if (selectedReference() != null) { referenceInteraction.cancel(); viewModel.removeReference(requireNotNull(selectedReference()).id) }
-				else if (editor.tool == CanvasTool.KNIFE || editor.drawingPath) editor.undoDraftPoint()
+				else if (editor.knifing || editor.drawingPath) editor.undoDraftPoint()
+				else if (editor.tool == CanvasTool.INTERIOR) editor.interiorTool.deleteSelection()
                         else if (editor.tool == CanvasTool.CREATE_DEFORM_PATH || editor.activePath != null) editor.deletePathPoint()
-				else if (editor.hierarchyMode == EditHierarchyMode.EDIT) editor.topology("delete")
+				else if (editor.hierarchyMode == EditHierarchyMode.EDIT) editor.deleteMeshSelection()
+				else if (editor.hierarchyMode == EditHierarchyMode.PAINT) editor.deleteInPaint()
 				true
 			}
 			ShortcutAction.TOOL_PAINT_BRUSH -> {
@@ -859,6 +1088,13 @@ fun CanvasViewportComposable(
 				if (editor.hierarchyMode != EditHierarchyMode.PAINT) editor.setHierarchyMode(EditHierarchyMode.PAINT)
 				editor.selectPaintShape(PaintShape.ELLIPSE); true
 			}
+			ShortcutAction.TOOL_PAINT_SELECT, ShortcutAction.TOOL_PAINT_GRADIENT, ShortcutAction.TOOL_PAINT_BLUR,
+			ShortcutAction.TOOL_PAINT_TRANSFORM -> {
+				if (editor.hierarchyMode != EditHierarchyMode.PAINT) editor.setHierarchyMode(EditHierarchyMode.PAINT)
+				editor.paintShortcut(action)
+			}
+			ShortcutAction.PAINT_DESELECT, ShortcutAction.PAINT_FILL_SELECTION, ShortcutAction.PAINT_RESET_COLORS,
+			ShortcutAction.PAINT_LOCK_ALPHA -> editor.hierarchyMode == EditHierarchyMode.PAINT && editor.paintShortcut(action)
 			ShortcutAction.PAINT_SHAPE_CYCLE -> {
 				if (editor.hierarchyMode != EditHierarchyMode.PAINT) editor.setHierarchyMode(EditHierarchyMode.PAINT)
 				editor.cyclePaintShape(); true
@@ -980,6 +1216,8 @@ fun CanvasViewportComposable(
 				runCanvasCommand(action, event.isShiftPressed, wheel = false)
 			}
 			.pointerHoverIcon(PointerIcon(when {
+                (guideDrag.draft ?: guideDrag.hovered) != null -> Cursor.getPredefinedCursor(
+                    if ((guideDrag.draft ?: guideDrag.hovered)!!.vertical) Cursor.E_RESIZE_CURSOR else Cursor.N_RESIZE_CURSOR)
                 isDragging && zoomDragAnchor != null -> Cursor.getPredefinedCursor(Cursor.N_RESIZE_CURSOR)
                 isDragging -> Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR)
                 mode == CanvasMode.EDIT && canvasState.selectedReferenceId != null -> io.github.psd2live.ui.CanvasCursors.transform(
@@ -1007,6 +1245,12 @@ fun CanvasViewportComposable(
                 // The floating bars and rails consume the presses that land on them (canvasChrome), whatever
                 // their size at the moment; the strips along the top and bottom edge stay out of reach.
                 if(change.isConsumed) return@onPointerEvent
+                if (mode == CanvasMode.EDIT && event.button == PointerButton.Primary && !editor.space && !editor.inGesture &&
+                    !referenceInteraction.active &&
+                    guidePress(change.position, event.keyboardModifiers.isShiftPressed, event.keyboardModifiers.isAltPressed)) {
+                    focusRequester.requestFocus()
+                    change.consume(); return@onPointerEvent
+                }
                 if (mode == CanvasMode.EDIT && referenceInteraction.active) {
                     if (event.button == PointerButton.Primary) referenceInteraction.cancel()
                     else { change.consume(); return@onPointerEvent }
@@ -1039,17 +1283,6 @@ fun CanvasViewportComposable(
                     showContextMenu = false
                     change.consume(); return@onPointerEvent
                 }
-                // A right press that starts no gesture opens the mode/tool context menu (parameters + topology/paint actions).
-                if (mode == CanvasMode.EDIT && previewModel != null && event.button == PointerButton.Secondary &&
-                    gesture == null && !isDragging && !editor.inGesture && !editor.adjustingBrush &&
-                    viewModel.swingSession == null && (selectedReference() != null || referenceAt(change.position) != null || canvasContextMenuHasContent(editor))
-                ) {
-                    referenceAt(change.position)?.let { viewModel.selectReference(it.id, canvasId, canvasState.activeWorkspace.id) }
-                    contextMenuOffset = change.position
-                    showContextMenu = true
-                    change.consume()
-                    return@onPointerEvent
-                }
                 // The pan gesture (the middle button by default) or Space + left drag pans; the zoom gesture
                 // zooms about the press point as the pointer moves up and down.
                 if (gesture == ShortcutAction.ZOOM_DRAG || CanvasNavigation.pans(gesture, event.button, mode == CanvasMode.EDIT && editor.space)) {
@@ -1060,8 +1293,9 @@ fun CanvasViewportComposable(
                     change.consume()
                     return@onPointerEvent
                 }
-                // A middle or side button bound to a canvas command fires it; a held temporary selection lasts
-                // until that button's release.
+                // A button bound to a canvas command fires it before the right press can open a menu: the binding
+                // wins and the menu below is only the fallback, as on the atlas page. A held temporary selection
+                // lasts until that button's release.
                 val command = if (canvasState.keyCapture == null) canvasState.keymap.mouseCommand(pressed, ShortcutScope.CANVAS) else null
                 if (command == ShortcutAction.TEMPORARY_SELECT) {
                     if (mode == CanvasMode.EDIT && !canvasState.workspaceEditBusy && editor.beginTemporarySelection())
@@ -1070,6 +1304,18 @@ fun CanvasViewportComposable(
                 }
                 if (command != null && runCanvasCommand(command, event.keyboardModifiers.isShiftPressed, wheel = false)) {
                     change.consume(); return@onPointerEvent
+                }
+                // A right press that starts no gesture and fires no bound command opens the mode/tool context menu
+                // (parameters + topology/paint actions).
+                if (mode == CanvasMode.EDIT && previewModel != null && event.button == PointerButton.Secondary &&
+                    gesture == null && !isDragging && !editor.inGesture && !editor.adjustingBrush &&
+                    viewModel.swingSession == null && (selectedReference() != null || referenceAt(change.position) != null || canvasContextMenuHasContent(editor))
+                ) {
+                    referenceAt(change.position)?.let { viewModel.selectReference(it.id, canvasId, canvasState.activeWorkspace.id) }
+                    contextMenuOffset = change.position
+                    showContextMenu = true
+                    change.consume()
+                    return@onPointerEvent
                 }
                 if (mode == CanvasMode.EDIT && previewModel != null && event.button == PointerButton.Primary) {
                     if (showContextMenu) {
@@ -1112,6 +1358,10 @@ fun CanvasViewportComposable(
 			}
 			.onPointerEvent(PointerEventType.Release) { event ->
 				val change = event.changes.firstOrNull()
+                if (event.button == PointerButton.Primary && guideRelease()) {
+                    change?.consume()
+                    return@onPointerEvent
+                }
                 if (mode == CanvasMode.EDIT && event.button == PointerButton.Primary && referenceInteraction.active) {
                     referenceInteraction.release()?.let { viewModel.placeReference(it.id, it.rect, it.rotation) }
                     change?.consume()
@@ -1142,6 +1392,15 @@ fun CanvasViewportComposable(
                     }
                     return@onPointerEvent
                 }
+                // A click on the preview, not a drag: hit-test it as the runtime would, to check the hit areas.
+                if (mode == CanvasMode.PREVIEW && isDragging && zoomDragAnchor == null && event.button == PointerButton.Primary &&
+                    change != null && (change.position - dragStartPos).getDistance() <= HIT_CLICK_SLOP * density && previewModel != null &&
+                    canvasState.rigEdits.hitAreas.isNotEmpty()) {
+                    val viewport = currentViewportFor(viewSize)
+                    val geometry = RigCanvasSupport.evaluate(previewModel, informationPose(frameFlow.value))
+                    hitShown = viewModel.previewHitTest(previewModel, geometry, viewport.canvasX(change.position.x).toFloat(),
+                        -viewport.canvasY(change.position.y).toFloat())
+                }
                 if (isDragging) {
 					isDragging = false
 					zoomDragAnchor = null
@@ -1171,7 +1430,7 @@ fun CanvasViewportComposable(
 					val effect =
 						canvasState.rigEdits.interiorEffects.singleOrNull {
 							it.target ==
-								previewModel.rig.layerIdByDrawableId.entries
+								previewModel.rig.ownLayerIdByDrawableId.entries
 									.firstOrNull { e -> e.value == canvasState.selectedLayerId }
 									?.key || it.target == canvasState.selectedLayerId
 						}
@@ -1200,6 +1459,10 @@ fun CanvasViewportComposable(
                 // would leave every paint tool picking; the pointer's own modifiers are the truth.
                 if (mode == CanvasMode.EDIT) editor.altHeld = event.keyboardModifiers.isAltPressed
                 if (mode == CanvasMode.EDIT && previewModel != null && !isDragging) {
+                    if (guideDrag.active && !event.buttons.isPrimaryPressed) guideRelease()
+                    if (guideMove(change.position, event.keyboardModifiers.isShiftPressed, event.keyboardModifiers.isAltPressed)) {
+                        change.consume(); return@onPointerEvent
+                    }
                     if (referenceInteraction.active) {
                         if (!event.buttons.isPrimaryPressed) {
                             referenceInteraction.release()?.let { viewModel.placeReference(it.id, it.rect, it.rotation) }
@@ -1452,8 +1715,13 @@ fun CanvasViewportComposable(
 						canvasState.hierarchyParentOverrides, editor.hierarchyMode, editor.objects,
 						editor.glueSwapped, editor.drawsTransformBox,
 					)
-					val drawableBounds = RigCanvasSupport.boundsByDrawable(geometry)
-					val deformerBounds = RigCanvasSupport.boundsByDeformer(model, drawableBounds)
+					val transformBoxOwnsSelection = mode == CanvasMode.EDIT && editor.drawsTransformBox
+					// Selection boxes are the only readers of these bounds; preview frames and unselected edits skip the
+					// full vertex scan.
+					val selectionBounds = showSelectionBounds && !transformBoxOwnsSelection &&
+						(selectedLayerId != null || (mode == CanvasMode.EDIT && selectedDeformerId != null))
+					val drawableBounds = if (selectionBounds) RigCanvasSupport.boundsByDrawable(geometry) else emptyMap()
+					val deformerBounds = if (selectionBounds) RigCanvasSupport.boundsByDeformer(model, drawableBounds) else emptyMap()
 					val deformEditTarget = selectedDeformerId?.takeIf {
 						mode == CanvasMode.EDIT && showRotation && (
 							editor.hierarchyMode == EditHierarchyMode.DEFORM ||
@@ -1465,7 +1733,6 @@ fun CanvasViewportComposable(
 						deformEditTarget != null -> rotationIds - deformEditTarget
 						else -> rotationIds
 					}
-					val transformBoxOwnsSelection = mode == CanvasMode.EDIT && editor.drawsTransformBox
 					// The rig guides the GPU draws itself; their names and indices are Compose text over its frame.
 					// 3e's paths. A path belongs to the part it deforms, so it is drawn only while that part (or the part's
 					// deformer) is selected -- an edit-time guide, never part of the Preview tab's render. Hovering a
@@ -1476,13 +1743,13 @@ fun CanvasViewportComposable(
 							descendantLayerIds(model, selectedDeformerId, canvasState.hierarchyParentOverrides)
 						} else emptySet()
 						model.rig.puppet.deformPaths.filter { path ->
-							val layerId = model.rig.layerIdByDrawableId[path.drawableId.raw]
+							val layerId = model.rig.ownLayerIdByDrawableId[path.drawableId.raw] ?: path.drawableId.raw
 							(selectedLayerId != null && layerId == selectedLayerId) ||
 								(selectedDeformerId != null && layerId != null && layerId in selectedLayerDescendants)
 						}.mapTo(HashSet()) { it.id }
 					}
 					val hoveredPathIds: Set<String> = if (!pathsShown) emptySet() else model.rig.puppet.deformPaths.filter { path ->
-						hoveredLayerId != null && model.rig.layerIdByDrawableId[path.drawableId.raw] == hoveredLayerId
+						hoveredLayerId != null && (model.rig.ownLayerIdByDrawableId[path.drawableId.raw] ?: path.drawableId.raw) == hoveredLayerId
 					}.mapTo(HashSet()) { it.id }
 					val pathIds = selectedPathIds + hoveredPathIds
 					val gpuWarpGuides = gpuReady
@@ -1498,7 +1765,7 @@ fun CanvasViewportComposable(
 						}
 						if (gpuBoxGuides && showSelectionBounds && !transformBoxOwnsSelection) {
 							selectedLayerId?.let { layerId ->
-								val drawableId = model.rig.layerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
+								val drawableId = model.rig.ownLayerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
 								drawableId?.let(drawableBounds::get)?.let { guides.selectionBox(it, ComponentPalette.strong(layerId).brighter()) }
 							}
 							if (mode == CanvasMode.EDIT) selectedDeformerId?.let { defId ->
@@ -1544,7 +1811,7 @@ fun CanvasViewportComposable(
 									editor.target()?.kind == "mesh")
 							if (selectedId != null && !overlayDrawsMesh) {
 								for (drawable in model.rig.puppet.drawables) {
-									if (model.rig.layerIdByDrawableId[drawable.id.raw] == selectedId) wire(drawable, selected = true, dimmed = false)
+									if (model.rig.ownLayerIdByDrawableId[drawable.id.raw] == selectedId) wire(drawable, selected = true, dimmed = false)
 								}
 							}
 						} else {
@@ -1561,7 +1828,7 @@ fun CanvasViewportComposable(
 							}
 							if (selectedId != null) {
 								for (drawable in model.rig.puppet.drawables) {
-									if (model.rig.layerIdByDrawableId[drawable.id.raw] == selectedId) wire(drawable, selected = true, dimmed = false)
+									if (model.rig.ownLayerIdByDrawableId[drawable.id.raw] == selectedId) wire(drawable, selected = true, dimmed = false)
 								}
 							}
 						}
@@ -1711,7 +1978,7 @@ fun CanvasViewportComposable(
 					// dragged. Every other tool leaves this as the only selection feedback.
 					if (!gpuBoxGuides && showSelectionBounds && !transformBoxOwnsSelection) {
 						selectedLayerId?.let { layerId ->
-							val drawableId = model.rig.layerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
+							val drawableId = model.rig.ownLayerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
 							val bounds = drawableId?.let(drawableBounds::get)
 							if (bounds != null) {
 								painted = true
@@ -1816,10 +2083,11 @@ fun CanvasViewportComposable(
 						}
 					}
 					for (label in labels) {
-						val layout = guideLabelMeasurer.measure(label.text, GuideLabelStyle)
+						val layout = guideLabelMeasurer.measure(label.text, typography.body)
 						val top = label.baseline - layout.firstBaseline
-						if (label.plate) drawRect(Color(20, 20, 24, 220), Offset(label.x - 3f, label.baseline - 14f),
-							Size(layout.size.width + 6f, 17f))
+						// The plate wraps the laid-out text, so a larger font or UI scale keeps it covered.
+						if (label.plate) drawRect(Color(20, 20, 24, 220), Offset(label.x - 3f, top - 1f),
+							Size(layout.size.width + 6f, layout.size.height + 2f))
 						drawText(layout, color = Color(label.argb), topLeft = Offset(label.x, top))
 					}
 				}
@@ -1863,6 +2131,34 @@ fun CanvasViewportComposable(
 								dstSize = androidx.compose.ui.unit.IntSize(tile.width, tile.height),
 								filterQuality = androidx.compose.ui.graphics.FilterQuality.Low
 							)
+						}
+					}
+				}
+			}
+			// The onion skin's ghosts over the artwork, each one flattened layer faded and tinted as a whole, so meshes
+			// overlapping within a ghost do not darken it. Their GPU views keep their frames while the ghost stays.
+			val onion = onionFrame
+			if (snapshotGeometry == null && onion != null) {
+				val options = ArtworkOptions(visibleLayerIds = targetVisibleLayerIds, drawOrderOverrides = canvasState.drawOrderOverrides)
+				val model = onion.model
+				onion.ghosts.forEachIndexed { index, (ghost, ghostGeometry) ->
+					val before = ghost.offset < 0
+					val alpha = io.github.psd2live.ui.OnionSkin.alpha(ghost.offset, if (before) aids.onionBefore else aids.onionAfter, aids.onionOpacity)
+					val tint = (if (before) aids.onionBeforeColor else aids.onionAfterColor).color(colors)
+					if (gpuReady) {
+						CanvasGpu.draw(awtWindow, "$onionKey$index", listOf(model.rig.puppet, model.atlas, ghostGeometry, viewport, w, h, options)) {
+							CanvasScene(w, h, viewport, model, ghostGeometry, ArtworkDrawList.build(model, ghostGeometry, options))
+						}?.let { drawGpuFrame(it, alpha = alpha, tint = tint) }
+					} else if (editingPainter != null) drawIntoCanvas { target ->
+						org.jetbrains.skia.Paint().use { fade ->
+							fade.setAlphaf(alpha)
+							fade.colorFilter = onionTintFilter(tint)
+							val canvas = target.skiaCanvas
+							val saved = canvas.saveLayer(org.jetbrains.skia.Rect.makeWH(w.toFloat(), h.toFloat()), fade)
+							try {
+								editingPainter.paint(canvas, model, ghostGeometry, viewport, visibleLayerIds = options.visibleLayerIds,
+									drawOrderOverrides = canvasState.drawOrderOverrides)
+							} finally { canvas.restoreToCount(saved) }
 						}
 					}
 				}
@@ -1956,7 +2252,31 @@ fun CanvasViewportComposable(
 					colors, referenceHandles, pointer = referenceInteraction.pointer, active = referenceInteraction.active)
 			}
 		}
+		// The grid, the guides and their rulers, over the artwork and its handles. Like the overlay it only redraws
+		// when the camera, the options or a guide changes, never with a pose: the draw is one remembered lambda that
+		// reads what it shows through states, so a recomposition hands the view the same one.
+		if (mode == CanvasMode.EDIT && previewModel != null && (aids.showGrid || aids.showGuides)) {
+			val aidsDrawn by rememberUpdatedState(aids)
+			val guidesDrawn by rememberUpdatedState(shownGuides)
+			val aidColors by rememberUpdatedState(colors)
+			val rulerLabels by rememberUpdatedState(io.github.psd2live.ui.theme.LocalToolTypography.current.monoSmall)
+			val drawAids: androidx.compose.ui.graphics.drawscope.DrawScope.() -> Unit = remember {
+				{
+					canvasOrigin.x
+					drawCanvasAids(currentViewportFor(viewSize), aidsDrawn, guidesDrawn, guideDrag, aidColors, guideLabelMeasurer, rulerLabels)
+				}
+			}
+			CompositedCanvas(Modifier.fillMaxSize(), previewGpu, "$gpuKey/aids", editComposited, canvasOriginState,
+				order = 3, clear = false, layer = gpuKey, onDraw = drawAids)
+		}
+		val hitArea = hitShown?.takeIf { mode == CanvasMode.PREVIEW && it in canvasState.rigEdits.hitAreas }
+		if (hitArea != null && previewModel != null)
+			HitAreaHighlight(hitArea, previewModel, frameFlow, ::informationPose, { currentViewportFor(viewSize) }, { hitAlpha.value })
 		if (mode == CanvasMode.PREVIEW && previewModel != null) {
+			MotionTrajectoryOverlay(viewModel, previewModel, canvasState.parameterValues, canvasState.lockedParameters,
+				canvasState.selectedLayerIds.ifEmpty { setOfNotNull(canvasState.selectedLayerId) }, canvasState.selectedDeformerId) {
+				currentViewportFor(viewSize)
+			}
 			// The same mode menu as the edit canvas, on Preview: any other row goes back to editing.
 			PreviewModeBar(editor) { focusRequester.requestFocus() }
 			CanvasPreviewToolbar(
@@ -2099,22 +2419,23 @@ fun CanvasViewportComposable(
 				CanvasDropTiles(viewModel, canvasId, selected?.let { it.id.raw to it.name }, Modifier.align(Alignment.BottomCenter).padding(bottom = 56.dp, start = 16.dp, end = 16.dp))
 			}
 			// Bottom-right: display-toggle rail (mirrors the left tool palette).
+			val railPins by io.github.psd2live.ui.state.AppSettings.canvasRailFlow.collectAsState()
 			CanvasViewOptionsBar(
 				options = viewOptions,
 				onOptionsChange = { viewModel.setCanvasViewOptions(canvasId, it, mode) },
-				showPathGuides = mode == CanvasMode.EDIT,
-				showSelectionFocus = mode == CanvasMode.EDIT,
-				showSourcePixels = mode == CanvasMode.EDIT,
-				hasReference = mode == CanvasMode.EDIT && layoutReferences.isNotEmpty(),
-				onAddReference = if (mode == CanvasMode.EDIT && canvasState.analysis != null) ({
-					val files = io.github.psd2live.ui.utils.NativeFilePicker.chooseMaterialFiles(awtWindow)
-					if (files.isNotEmpty()) viewModel.importMaterials(files.take(1).map { it.toPath() }, null, asReference = true)
-				}) else null,
-				hasReferenceLayers = mode == CanvasMode.EDIT && canvasState.previewModel?.referenceLayerIds?.isNotEmpty() == true,
-				showDensity = mode == CanvasMode.EDIT,
-				// The skin weights belong to the skeleton's meshes, so the toggle comes with an armature.
-				skinWeights = editor.showSkeletonWeights.takeIf { mode == CanvasMode.EDIT && editor.committedSkeleton != null },
+				content = io.github.psd2live.ui.state.CanvasViewContent.of(canvasState, mode,
+					skeleton = mode == CanvasMode.EDIT && editor.committedSkeleton != null),
+				pins = railPins,
+				skinWeights = editor.showSkeletonWeights,
 				onSkinWeightsChange = { editor.showSkeletonWeights = it },
+				aids = if (mode != CanvasMode.EDIT) null else CanvasAidsRail(
+					guideCount = shownGuides.size,
+					onClearGuides = { viewModel.clearCanvasGuides() },
+					onRestoreGuides = viewModel.clearedCanvasGuides?.takeIf { it.first == canvasState.projectOpenGeneration }
+						?.let { { viewModel.restoreClearedCanvasGuides() } },
+					keyLabel = canvasState.keymap::labelFor,
+					onMenuClosed = { focusRequester.requestFocus() },
+				),
 				modifier = Modifier
 					.align(Alignment.BottomEnd)
 					.padding(end = 8.dp, bottom = 8.dp),
@@ -2127,7 +2448,10 @@ fun CanvasViewportComposable(
 /** One guide's name or point index, drawn as text over the GPU frame; [baseline] as Java2D's drawString takes it. */
 private class GuideLabel(val text: String, val x: Float, val baseline: Float, val argb: Int, val plate: Boolean)
 
-private val GuideLabelStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp)
+/** The onion skin's ghosts and the rig they were evaluated from, which is the one they are drawn with. */
+private class OnionFrame(val model: RigPreviewModel,
+	val ghosts: List<Pair<io.github.psd2live.ui.OnionGhost, DeformedGeometry>>)
+
 
 /** The guide labels laid out for one set of guide inputs, kept across redraws that change nothing they show. */
 private class GuideLabelMemo {
@@ -2163,7 +2487,7 @@ private class DrawnGeometryMemo {
         val evaluated = editGeometry ?: RigCanvasSupport.evaluate(model, pose)
         val next = if (simulated == null) evaluated else org.umamo.render.eval.DeformedGeometry(
             evaluated.worldPositions + simulated.positions.filterKeys { it in evaluated.worldPositions },
-            evaluated.drawOrder, evaluated.opacity,
+            evaluated.drawOrder, evaluated.opacity, evaluated.multiplyColor, evaluated.screenColor,
         )
         puppet = model.rig.puppet
         edit = editGeometry
@@ -2173,6 +2497,52 @@ private class DrawnGeometryMemo {
         return next
     }
 }
+
+/**
+ * The hit area the last preview click hit, drawn over the preview as it plays: the meshes of it that count for a hit,
+ * evaluated off the UI thread for each frame. A composable of its own, so the frames recompose only it.
+ */
+@Composable
+private fun HitAreaHighlight(area: io.github.psd2live.core.RigHitArea, model: RigPreviewModel,
+                             frames: kotlinx.coroutines.flow.StateFlow<io.github.psd2live.core.PreviewFrame?>,
+                             pose: (io.github.psd2live.core.PreviewFrame?) -> Map<org.umamo.runtime.model.ParameterId, Float>,
+                             viewport: () -> CanvasViewport, alpha: () -> Float) {
+	val fill = LocalToolColors.current.accent
+	val currentPose by rememberUpdatedState(pose)
+	var drawn by remember(area, model) { mutableStateOf<Map<String, Pair<FloatArray, IntArray>>>(emptyMap()) }
+	LaunchedEffect(area, model, frames) {
+		frames.collectLatest { frame ->
+			val values = currentPose(frame)
+			drawn = withContext(Dispatchers.Default) {
+				io.github.psd2live.core.RigHitAreas.drawn(listOf(area), model.rig.puppet, RigCanvasSupport.evaluateExact(model, values))
+			}
+		}
+	}
+	androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+		val view = viewport()
+		val path = androidx.compose.ui.graphics.Path()
+		for ((positions, indices) in drawn.values) {
+			for (offset in 0 until indices.size - 2 step 3) {
+				val a = indices[offset]
+				// Every triangle wound the same way, so overlapping ones never cancel under the non-zero fill.
+				val ab = (positions[indices[offset + 1] * 2] - positions[a * 2]) * (positions[indices[offset + 2] * 2 + 1] - positions[a * 2 + 1]) -
+					(positions[indices[offset + 1] * 2 + 1] - positions[a * 2 + 1]) * (positions[indices[offset + 2] * 2] - positions[a * 2])
+				val b = indices[if (ab >= 0f) offset + 1 else offset + 2]; val c = indices[if (ab >= 0f) offset + 2 else offset + 1]
+				path.moveTo(view.x(positions[a * 2]).toFloat(), view.yFromWorld(positions[a * 2 + 1]).toFloat())
+				path.lineTo(view.x(positions[b * 2]).toFloat(), view.yFromWorld(positions[b * 2 + 1]).toFloat())
+				path.lineTo(view.x(positions[c * 2]).toFloat(), view.yFromWorld(positions[c * 2 + 1]).toFloat())
+				path.close()
+			}
+		}
+		drawPath(path, fill.copy(alpha = HIT_HIGHLIGHT_ALPHA * alpha()))
+	}
+}
+
+/** How far a preview press may move, in dp, and still count as a hit-test click rather than a pan. */
+private const val HIT_CLICK_SLOP = 4f
+
+/** The hit-area highlight: the accent's pressed strength. */
+private const val HIT_HIGHLIGHT_ALPHA = 0.30f
 
 /** How strongly the reference simulation shows over the export. */
 private const val SIMULATION_GHOST_ALPHA = 0.55f
@@ -2187,7 +2557,7 @@ private class SimulationGhostMemo {
         val cached = geometry
         if (cached != null && this.exported === exported && this.frame === frame) return cached
         val next = org.umamo.render.eval.DeformedGeometry(exported.worldPositions + frame.positions.filterKeys { it in exported.worldPositions },
-            exported.drawOrder, exported.opacity)
+            exported.drawOrder, exported.opacity, exported.multiplyColor, exported.screenColor)
         this.exported = exported; this.frame = frame; geometry = next
         return next
     }
@@ -2353,11 +2723,24 @@ private fun computeEditorViewport(model: RigPreviewModel, size: IntSize, zoom: D
 }
 
 
-/** Draws a GPU frame at the origin: the top-left [GpuFrame.width] × [GpuFrame.height] texels of its texture. */
-internal fun androidx.compose.ui.graphics.drawscope.DrawScope.drawGpuFrame(frame: GpuFrame, alpha: Float = 1f) {
+/** An onion-skin ghost's colour: [tint] laid over the artwork's own colours, its coverage kept. */
+private fun onionTintFilter(tint: Color): org.jetbrains.skia.ColorFilter =
+	org.jetbrains.skia.ColorFilter.makeBlend(tint.copy(alpha = ONION_TINT).toArgb(), org.jetbrains.skia.BlendMode.SRC_ATOP)
+
+/** How much of its colour an onion-skin ghost takes over the artwork's. */
+private const val ONION_TINT = 0.6f
+
+/**
+ * Draws a GPU frame at the origin: the top-left [GpuFrame.width] × [GpuFrame.height] texels of its texture, faded
+ * to [alpha] and, for an onion-skin ghost, washed with [tint].
+ */
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.drawGpuFrame(frame: GpuFrame, alpha: Float = 1f, tint: Color? = null) {
 	drawIntoCanvas { canvas ->
 		val rect = org.jetbrains.skia.Rect.makeWH(frame.width.toFloat(), frame.height.toFloat())
-		val paint = if (alpha < 1f) org.jetbrains.skia.Paint().apply { setAlphaf(alpha) } else null
+		val paint = if (alpha < 1f || tint != null) org.jetbrains.skia.Paint().apply {
+			setAlphaf(alpha)
+			if (tint != null) colorFilter = onionTintFilter(tint)
+		} else null
 		try {
 			canvas.nativeCanvas.drawImageRect(frame.image, rect, rect, org.jetbrains.skia.SamplingMode.DEFAULT, paint, true)
 		} finally {

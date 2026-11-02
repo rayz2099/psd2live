@@ -6,7 +6,8 @@ import kotlinx.serialization.json.JsonObject
 internal object WorkspaceSettingsDraft {
     fun presetDefaults(): JsonObject {
         val keys = setOf("headStrength", "bodyStrength", "rigTuning", "featureDisplacementEnabled",
-            "mouthOutlineEnabled", "mouthShape", "mouthCurve", "mouthColor", "mouthThickness", "exportMotions",
+            "mouthOutlineEnabled", "mouthShape", "mouthCurve", "mouthColor", "mouthThickness",
+            "seeThroughBrows", "seeThroughEyes", "seeThroughOpacity", "exportMotions",
             "motionBasic", "motionIdle", "motionBlink", "motionNod", "motionShake", "motionSkeleton",
             "generatePhysics", "physicsFrontHair", "physicsBackHair", "physicsEyeJelly")
         return JsonObject(io.github.psd2live.project.WorkspaceSettingsCodec.encode(io.github.psd2live.core.PipelineConfig()).filterKeys { it in keys })

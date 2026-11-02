@@ -6,7 +6,7 @@
 
 ## 必要環境
 
-- JDK 21。Gradle は同梱の Wrapper で実行するため、別途インストールは不要です。
+- JDK 21。JetBrains Runtime（JBR）21 を推奨します。Windows のリリースパッケージは JBR を同梱し、その上ではメインウィンドウがシステムのウィンドウ枠を保ったまま（最大化・スナップ・端でのサイズ変更はシステムが処理）、タイトルバーをアプリが描画します。他の JDK でもビルド・テスト・実行はでき、その場合はメインウィンドウが枠なしになり、タイトルバー全体をアプリが描画します。Windows のパッケージ作成（`createDistributable`、`packageExe`）には JBR 21 SDK（jpackage 付き）が必要で、他の JDK で作成するには `-Ppsd2live.allowNonJbr=true` を付けます。macOS の DMG（`packageDmg`）は Gradle を実行している JDK で作り、JBR は不要です。Swift のシェルがシステムのウィンドウ枠を保つためです。Gradle は同梱の Wrapper で実行するため、別途インストールは不要です。
 - Windows では `.\gradlew.bat`、Linux / macOS では `./gradlew` を使います。以下の例は `./gradlew` で表記します。
 - 公式 Cubism SDK は必須ではありません。ソースビルドは内蔵レンダラーを使います。ネイティブブリッジは [Cubism ネイティブプレビュー](CUBISM_SDK_SETUP.md)を参照してください。
 
@@ -37,6 +37,9 @@ Windows ではリポジトリ直下の `run-gui.bat` でも GUI を起動でき�
 | `--body-strength <value>` | 1.0 | 体の変形の強さ |
 | `--mesh-only` | オフ | メッシュのみ生成 |
 | `--no-deformers` | オフ | デフォーマを生成しない |
+| `--no-see-through` | オフ | 眉も目も前髪から透かさない（既定ではどちらも透かすため、以前の版より出力に眉の複製、前髪の目の窓とその複製が増える） |
+| `--no-see-through-eyes` | オフ | 目を前髪から透かさない（既定になった `--see-through-eyes` も引き続き受け付ける） |
+| `--see-through-opacity <0..1>` | 0.5 | 眉と目が前髪から透ける度合い |
 | `--no-motions` | オフ | モーションを出力しない |
 | `--no-physics` | オフ | 物理を生成しない |
 | `--no-cmo3` | オフ | CMO3 を出力しない |
@@ -82,8 +85,10 @@ Windows ではリポジトリ直下の `run-gui.bat` でも GUI を起動でき�
 ./gradlew test --tests "io.github.psd2live.scenario.CatalogContractsTest"   # 単一のテストクラス
 ./gradlew createDistributable                    # ランタイム付きのアプリディレクトリ
 ./gradlew packageDistributionForCurrentOS        # 現在のプラットフォーム向けインストーラー
+./gradlew packageDmg                             # macOS のみ: Swift シェル入り DMG
 ```
 
+- `packageDmg` は macOS 専用です。`createDistributable` が同梱したランタイムを使い、起動プログラムを `packaging/macos` の Swift シェルに置き換えます。Dock 名、書類タイプ、ウィンドウボタンはシステムのものです。メニューは画面上部のメニューバーに出ます。ウィンドウ内のメニューも残します。そちらにすべてのコマンドがあります。DMG はビルドした Mac のアーキテクチャ（Apple シリコンまたは Intel）向けで、macOS 13 以降が必要です。公証はしていません。インターネットから受け取ったものは、Finder で副ボタンクリックして開きます。`PSD2Live` を「アプリケーション」へドラッグします。
 - どちらもビルドしたプラットフォームのネイティブライブラリのみを含み、アプリのリソースに `LICENSE`、`THIRD_PARTY_NOTICES.md`、`licenses/` を同梱します。
 - 公式 SDK のリソース（`src/main/resources/cubism/`）は、`-Ppsd2live.includeCubism=true` または `PSD2LIVE_INCLUDE_CUBISM=true` を指定したときだけ含まれます。SDK を含むパッケージは公開配布できません。[CI とリリース](../../en/guide/CUBISM_CI_RELEASE.md)（英語）を参照してください。
 - Linux では `./native/package_linux.sh` で、システムの JDK 21 を使うローカル起動パッケージを作成できます（`dist/linux-<タイムスタンプ>/` に出力）。詳しくは [native/README.md](../../../native/README.md) を参照してください。
@@ -122,7 +127,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `SimRootDofExperiment` | 物体が根元の平行移動と回転だけに応答するかの検証：各入力が根元をどれだけ動かし、それ以外にどれだけ形を変えるか、実際の駆動と剛体駆動・振幅・同じ根元の動きをする別の入力の違い | `build/tools/sim-root-dof/<サンプル>.md` |
 | `SimBakeProfileTool` | `tml` の後ろ髪を単一スレッドと全スレッドで焼き込み、進捗ごとの所要時間と全スレッドのサンプリング | 標準出力 |
 | `PendulumKernelTool` | 振り子の配列カーネル（厳密・高速）と `PhysicsEngine` のフレームあたりの時間と差 | 標準出力 |
-| `CanvasPerfTool` | Xvfb 上で実際のウィンドウを開き、編集キャンバスで待機、ホバー、ホイールズーム、中ボタンのパン、変形モードで顔の全点のドラッグを順に行う。GPU 描画とソフトウェア描画で各 1 回、フレーム間隔、UI スレッドの遅延とホットスポットを報告。`xvfb-run -a -s "-screen 0 1920x1080x24"` が必要 | `canvas-perf/report.txt`、各段階のキャプチャと `.jfr` |
+| `CanvasPerfTool` | Xvfb 上で実際のウィンドウを開き、編集キャンバスで待機、ホバー、ホイールズーム、中ボタンのパン、変形モードで顔の全点のドラッグを順に行う。GPU 描画とソフトウェア描画で各 1 回、フレーム間隔、UI スレッドの遅延とホットスポット、段階ごとの編集キャンバスの GPU フレーム数（GPU の回で 0 ならキャンバスが GPU で描画されていない）を報告。`PSD2LIVE_CANVAS_AA` でキャンバスのアンチエイリアス、`PSD2LIVE_OVERLAY=1` でパフォーマンスオーバーレイを指定。`Robot` で実際のポインターを動かすため、専用の X サーバー（`xvfb-run -a -s "-screen 0 1920x1080x24"`、または GPU のあるマシンの別の Xorg）で実行し、使用中のデスクトップでは実行しない | `canvas-perf/report.txt`、各段階のキャプチャと `.jfr` |
 | `DragonBonesFidelityTool` | `tml` と `ds`（スケルトンなしと自動スケルトン）を DragonBones に書き出し、`tools/dragonbones-check`（公式 DragonBones 5.7 ランタイムのコア、node が必要）で再生する。パラメータアニメーションを各キーフレームでエディタの評価と比較し（書き出しが報告した許容差以内）、クリップの誤差を測る | `dragonbones-fidelity/report.txt` |
 | `RuntimeConformanceTool.generate` / `.physics` | Rust ランタイムの参照データ。`generate` はランダムなモデル（ワープ、回転、入れ子、疎なキーフォーム、ブレンドシェイプ、グルー、チャンネル、パーツ）、サンプル、`PSD2LIVE_RUNTIME_PROJECT` で指定したプロジェクトをランダムなポーズでエディタが評価した結果（スケルトンのサンプルは最も細かくベイクした `rig.fine.p2lrt` も）。`physics` はランダムな振り子グループとサンプルの物理のフレームごとの軌跡。`runtime/` の `p2lrt-conformance` で比較する | `runtime-conformance/<ケース>/`、`runtime-physics/<ケース>/` |
 | `RuntimeConformanceTool.simulation` / `.simulationRig` | シミュレーションの参照軌跡。`simulation` はランダムな布（上辺を固定、剛性はランダム）を、揺れ・回転・跳ねる目標と固定点で動かしてエディタの XPBD ソルバーで解いた各フレームの結果（半数は動くカプセル衝突体つき）。`simulationRig` は `tml` の後ろ髪（上 10 分の 1 を固定）をベイクしてライブシーンごと書き出したモデルと、未ベイクの Rig 上で頭と体の動きに従うエディタのシーン。それぞれ `p2lrt-conformance --sim`、`--sim-rig` が読む | `runtime-sim/<ケース>/trace.bin`、`runtime-sim-rig/back-hair/` |
@@ -136,6 +141,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `ArtPrimitiveV2VisualTool` | `tml` で脚を左右の連結成分ごとに、左目のまつ毛と口をポリゴンで分割し、それぞれバージョン 1 と 2 のレコードとして書く。分割前、v1、v2、v1/v2 の差分（×4）を目の開き・半目・閉じ、口の閉じ・開き・笑顔のポーズで並べ、継ぎ目、ずれ、欠けたピクセルを確認する | `art-primitive-v2/{legs,eye,mouth}.png` |
 | `SafetyGoldenTool` | 自動スケルトン Rig 上の、シード付きランダムなジオメトリ編集 24 件の完全なジオメトリ安全性レポート（`coverage` を除く）。検査器の変更前後で分類をバイト単位で比較する。`PSD2LIVE_GOLDEN_LABEL` で出力名を指定 | `safety-golden/<名前>.txt` |
 | `BundleProfileTool` | moc3 プレビューバンドルの段階別時間（IR コンパイル、IR からの復元、静止メッシュのキャンバス空間への変換、physics3/motion3、moc の変換と書き出し、cdi3）とジオメトリ安全性検査の時間。`PSD2LIVE_SAMPLER=1` でスタックサンプラーのホットスポットも出力 | 標準出力のみ |
+| `CubismParityTool` | サンプル（`PSD2LIVE_SAMPLE`）のプレビューバンドルを同梱の Cubism ランタイム（`live2d_renderer`、オフスクリーン）で描き、エディタ自身の描画と並べる。全身・顔・口のアップを、静止・振り向き・口の開き・母音・目閉じなどのポーズで比べる。`PSD2LIVE_PARITY_RECIPE=legacy` でモジュール導入前の生成を使う。Windows のみ | `cubism-parity/<サンプル>[-legacy]-<ビュー>.png` |
 | `CubismCoreCheckTool` | `tml` と `ds` のプレビューバンドルの moc3 を公式 Cubism Core の整合性検査（`csmHasMocConsistency`）にかける。`PSD2LIVE_TEST_CUBISM_CORE` で Core のライブラリを指定しないと skip される。小さな新規モデルの同じ検査は `:umamo` の `MocDefaultColorsTest` にある | 標準出力のみ |
 | `TextureWorkspaceTool` | `tml` にいくつかの密度とロックを設定してメッシュの形で一度配置し、アトラスのページとテクスチャパネル（中国語と英語、単一・複数・未選択、ヒートマップのオン／オフ、密度スライダーのプレビュー）、および編集キャンバスのアトラスと元画像のピクセルの比較を描画 | `texture-workspace/*.png` |
 | `AtlasFramePerfTool` | `tml` のアトラスページとテクスチャパネルのフレームコストを、ウィンドウなし・ソフトウェア描画で計測：`ImageComposeScene` に待機、ホバー、角（密度）のドラッグ、ホイールズーム、タイルのドラッグ、ワイヤーフレームなしのホバーのポインター入力を送り、各描画の時間（中央値、p90、最大）を記録し、角のドラッグ中・編集セッション・静止したページ・拡大の 4 フレームを保存。GPU 描画はウィンドウの Skia コンテキストが必要なので `AtlasWindowPerfTool` と `PreviewWindowTool` で計測する | `atlas-frame-perf/report.txt`、`{corner-drag,session,frame,zoomed}.png` |
@@ -153,6 +159,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `SkeletonBakeDiffTool` | スケルトンベイクの前後比較。拡大したサンプル（`PSD2LIVE_SCALE`、既定 2）で各スキンメッシュがキーフォームグリッドの各セルとブレンドシェイプの各キーで置かれるキャンバス座標を記録し、各肢を極端なポーズでレンダリング。`PSD2LIVE_LABEL` で結果に名前を付け、`PSD2LIVE_REFERENCE` を指定するとその結果と比較し、メッシュごとの最大頂点差（ピクセル）とレンダリング差を報告 | `skeleton-bake/<label>.bin`、`<label>-limbs.png`、`<label>-vs-<reference>.png` |
 | `OpenPerfTool.profile` | アプリと同じ経路（`ProjectRepository.open` の後、新しい `WorkspacePreviewBuilder` がヘッドを構築）でプロジェクトを開く時間。自動スケルトン、揺れ 2 つ、ベイク済みシミュレーション 1 つを持つプロジェクトで、アプリが今書く形（各リビジョンの作成 Rig とヘッドキャッシュ）、ヘッドキャッシュのみ（保存 Rig なしの生成と再生）、どちらもなしの 3 種のアーカイブを保存し、空の作成 Rig キャッシュとスケルトンキャッシュでそれぞれ 3 回開いて、展開/シードとヘッドの構築を計測し、3 種の構築モデルが同一であることを確認 | `open-perf/report.json`、`report.md` |
 | `SavePerfTool.profile` | 現実的な規模の生成プロジェクト（`PSD2LIVE_SAVE_LAYERS`、`PSD2LIVE_SAVE_SIZE`、`PSD2LIVE_SAVE_REVISIONS`）の保存時間。同じキャプチャを 3 回、開き直した後に 2 回保存し、1 回開く | `save-perf/report.txt` |
+| `ExportTargetsScenario`、`GenerateAndRigScenario`、`PaintAndReplaceScenario`、`SplitThenRegenerateScenario`、`Cmo3ImportScenario`、`MotionScenario` | 合成キャラクターでの長いエンドツーエンドのシナリオ。テストスイートのシナリオ（`scenario/`）と同じく各ステップでコールドリプレイ、元に戻す、品質を確認します：全エクスポート先への書き出し、インポートから書き出しまでの最初のセッション、スケルトン下でのペイントと画像の差し替え、分割後の再生成、cmo3 のインポート・編集と cmo3 への書き戻し、組み込みモーションの編集と書き出し。パイプライン全体を長く実行するためスイートには含めません。生成・エクスポート・保存を変更したあとに実行します | テスト結果のみ |
 | `RigSourcePerfTool.profile` | 生成入力を持つ大きな文書（サンプルを `PSD2LIVE_SCALE` 倍、既定 3 倍に拡大）での再構築のうち画素数に比例する段階。3 層ごとに数ピクセル切り詰め（固定矩形まで補われる）、5 層ごとに 2 倍密度とし、コールド構築・ウォーム再構築・描画後の再構築の段階別時間と、アトラスページのコールド合成とプレビュー PNG エンコードを計測 | `rig-source-perf/report.txt` |
 | `MeshTraceTool.compare` / `.wrap` | `compare` は合成レイヤー（1024² テクスチャ上のまつ毛付きの目、細い髪束、キャンバス解像度のレイヤー、6000 px と 2048 px ドキュメントのレイヤー）をキャンバストレースとテクスチャトレースでメッシュ化して並べて描画（灰色がテクスチャ alpha、青がメッシュ、赤がメッシュ外の不透明テクスチャピクセル）し、頂点数、時間、`detail`、メッシュ外のピクセル数とメッシュ面積を出力。`wrap` はまつ毛、細い髪束、手をテクスチャトレースで包み込み 0〜32 でメッシュ化し、頂点数、輪郭ループ数、時間、メッシュ外のピクセル数を出力 | `mesh-trace/<ケース>.png`、`report.txt`；`mesh-wrap/<ケース>.png`、`report.txt` |
 | `ReadmeShotsTool` | 実際のエディタウィンドウを開き、スタートページで「フル」プリセットを選んで `PSD2LIVE_SAMPLE` を読み込み、「メッシュごとにレイヤーを分割」の提案をすべて受け入れて読み込み、シミュレーションのベイクを待って自動スケルトンを確定し、各ワークスペースとキャンバスモードのウィンドウ自身のフレーム（画面キャプチャではない）を保存、プロジェクトを `project.psd2live` に保存します。`PSD2LIVE_SHOT_REUSE=1` で保存済みプロジェクトを開き直し、`PSD2LIVE_SHOT_W` / `_H` でウィンドウサイズを指定。トップページのスクリーンショット用 | `readme-shots/<サンプル>/*.png`、`project.psd2live` |
@@ -218,7 +225,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 - UI と MCP は同じ編集コマンドを使います。`org.umamo.edit` の低レベルメソッドは、そのまま公開インターフェースになるわけではありません。
 - 受け入れ確認の流れ：ドメインデータ → 履歴の再生 → 保存と再読み込み → 対象 Cubism バージョンの処理 → 書き出しと読み戻し → 目視確認。詳しくは[ランタイムと書き出しの境界](../../zh/spec/RUNTIME_EXPORT_ARCHITECTURE_AND_GAPS.md)（中国語）を参照してください。
 
-UI 文言を追加するときは、`Messages.properties`、`Messages_zh_CN.properties`、`Messages_ja.properties`、`Messages_ko.properties` の四つに同時に追加し、キー数をそろえてください（`MessageBundleParityTest` が検査します）。
+UI 文言を追加するときは、`Messages.properties`、`Messages_zh_CN.properties`、`Messages_ja.properties`、`Messages_ko.properties` の四つに同時に追加し、キー数をそろえてください（`CatalogContractsTest` が検査します）。
 
 ## 書き出し結果の確認
 

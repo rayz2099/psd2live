@@ -37,6 +37,10 @@ internal object WorkspaceLayoutOperations {
         put("type", "object"); put("additionalProperties", false); put("properties", JsonObject(fields))
         put("required", JsonArray(required.map(::JsonPrimitive)))
     }
+    /** A reference names its target by reference_id or layer_id, exactly one of them. */
+    private fun oneTarget(schema: JsonObject) = JsonObject(schema + ("oneOf" to JsonArray(listOf("reference_id", "layer_id").map { field ->
+        buildJsonObject { put("type", "object"); put("required", JsonArray(listOf(JsonPrimitive(field)))) }
+    })))
     private val rect = schema(listOf("left", "top", "width", "height").associateWith { number() }, listOf("left", "top", "width", "height"))
     private val state = mapOf("state" to string())
     private fun choices(vararg values: String) = buildJsonObject { put("type", "string"); put("enum", JsonArray(values.map(::JsonPrimitive))) }
@@ -84,11 +88,11 @@ internal object WorkspaceLayoutOperations {
                 put("items", buildJsonObject { put("type", "object"); put("additionalProperties", number()) }) }), listOf("state", "material_id")),
         WorkspaceMaterialEdits.ORDER_REFERENCE to schema(state + mapOf("id" to string(), "index" to buildJsonObject { put("type", "integer"); put("minimum", 0) }),
             listOf("state", "id", "index")),
-        WorkspaceReferenceOpacity.OP to schema(state + mapOf("reference_id" to string(), "layer_id" to string(), "opacity" to range(0, 1)),
-            listOf("state", "opacity")),
+        WorkspaceReferenceOpacity.OP to oneTarget(schema(state + mapOf("reference_id" to string(), "layer_id" to string(), "opacity" to range(0, 1)),
+            listOf("state", "opacity"))),
         WorkspaceReferenceModes.OP to schema(state + mapOf("reference_id" to string(), "layer_id" to string(),
             "mode" to buildJsonObject { put("type", "string"); put("enum", JsonArray(listOf("background", "layer", "foreground").map(::JsonPrimitive))) }),
-            listOf("state", "mode")),
+            listOf("state", "mode")).let(::oneTarget),
         WorkspaceMaterialEdits.CROP to schema(state + mapOf("id" to string(), "rect" to rect, "canvas_rect" to rect, "name" to string(),
             "new_id" to string(), "folder_id" to nullableString()), listOf("state", "id")),
         WorkspaceMaterialPixels.SET_PIXELS to schema(state + mapOf("id" to string(), "staging" to string()), listOf("state", "id", "staging")),
@@ -136,8 +140,8 @@ internal object WorkspaceLayoutOperations {
         WorkspaceMaterialEdits.RESOLUTION to "Render a vector (SVG) material at width x height pixels, its texture resolution. Every layer showing it takes the new pixels over its unchanged canvas rectangle, as layer_replace_image does. One history edit.",
         WorkspaceMaterialEdits.PLACE to "Place a material on the canvas as new source layers: an item as one layer, a folder as one layer per item in it with its subfolders as source groups, items keeping their places relative to each other. " +
             "Default size: the item's own place (a PSD layer's position) with the PSD's canvas centred on the project canvas and shrunk to fit it (unchanged when both are one size), else one material pixel per canvas unit fitted into the canvas. Canvas units are the model's coordinates (exported as the Cubism model canvas, one pixel per unit) and set its size, not its sharpness, which comes from the material's own pixels and the atlas budget; rect sets an item's canvas rectangle (the pixels are not resampled, so a smaller rectangle is a denser texture); at [x, y] centres the placement there. " +
-            "The material's tags and its folders' tags become the layer's tags. Placed layers paint over the others. In a generated project they wait for rig_generate and show as plain meshes until then; " +
-            "move them with layer_set_canvas_rect or layer_transform (move, scale, mirror), replace their pixels with layer_replace_image. layer_id names a single item's new layer. " +
+            "The material's tags and its folders' tags become the layer's tags. Placed layers paint over the others. Every placed layer immediately has an editable mesh and texture tile; semantic binding waits for rig_generate; " +
+            "move them with layer_set_canvas_rect or layer_transform (move, scale, mirror, rotate), replace their pixels with layer_replace_image. layer_id names a single item's new layer. " +
             "reference true places every layer as a reference layer (layer_mark_reference), false as model layers; omitted, each item follows its own mark (material_mark_reference). The changed list names the new layers (layer:<id>). One history edit.",
         WorkspaceMaterialPixels.PAINT to "Paint on a material item's own pixels, in its pixel coordinates (origin at the top left), with the raster engine the paint operation uses: one gesture given by mode and its fields, or gestures, a list of up to ${WorkspaceMaterialPixels.MAX_GESTURES} applied in order (a painting session's strokes as one edit). " +
             "brush, pencil and eraser take points, radius and hardness; bucket a point and tolerance; shape from, to, shape, stroke_width and filled; clear erases everything. color is RGBA bytes (default opaque black), opacity 0..1. " +
@@ -279,13 +283,14 @@ internal fun registerLayoutOperations(registry: WorkspaceOperationRegistry, port
         "Import 1..${WorkspaceMaterialFiles.MAX_PATHS} absolute paths into the material library under folder_id: PNG, BMP, TIFF, WebP and JPEG images as items; " +
             "a PSD as a folder of its layers (its groups as subfolders, each layer keeping its place, opacity and visibility); a CMO3 as a folder of its ArtMesh images, each the pixels importing the model " +
             "as a project (project_import_cmo3) gives that mesh's layer; an SVG as a vector item rendered at its own size " +
-            "(material_set_resolution changes it); a folder as a folder of the files it holds, its subfolders nested as they are (hidden ones left out, names in number order). Each image is at most 16 megapixels. as_reference=true also lays the first new material over the canvas as the reference image. The library is part of the " +
+            "(material_set_resolution changes it); a folder as a folder of the files it holds, its subfolders nested as they are (hidden ones left out, names in number order). Each image is at most 16 megapixels. as_reference=true also lays the first new material over the canvas as the reference image (behind the model with reference_under=true), in the same history edit. The library is part of the " +
             "document: one history edit, undoable. Returns a process-owned job handle; the result's changed list names the new materials (material:<id>).",
         WorkspaceLayoutOperations.schema(mapOf("state" to buildJsonObject { put("type", "string"); put("minLength", 1) },
             "paths" to buildJsonObject { put("type", "array"); put("minItems", 1); put("maxItems", WorkspaceMaterialFiles.MAX_PATHS)
                 put("items", buildJsonObject { put("type", "string"); put("minLength", 1) }) },
             "folder_id" to buildJsonObject { put("type", JsonArray(listOf(JsonPrimitive("string"), JsonPrimitive("null")))) },
-            "as_reference" to buildJsonObject { put("type", "boolean") }), listOf("state", "paths")),
+            "as_reference" to buildJsonObject { put("type", "boolean") }, "reference_under" to buildJsonObject { put("type", "boolean") }),
+            listOf("state", "paths")),
         WorkspaceOperationKind.DOCUMENT, jobBacked = true,
         resultSchema = requireNotNull(WorkspaceJobResultSchemas.operationOutput(WorkspaceLayoutOperations.IMPORT)),
         jobResultSchema = WorkspaceJobResultSchemas.result(WorkspaceLayoutOperations.IMPORT))) { request, context ->
@@ -293,6 +298,8 @@ internal fun registerLayoutOperations(registry: WorkspaceOperationRegistry, port
         val state = request.getValue("state").jsonPrimitive.content
         val folder = request["folder_id"]?.takeUnless { it is JsonNull }
         val asReference = request["as_reference"]?.jsonPrimitive?.boolean == true
+        val under = request["reference_under"]?.jsonPrimitive?.boolean == true
+        require(!under || asReference) { "reference_under places a reference; set as_reference too" }
         startWorkspaceOperationJob(reads, jobs, WorkspaceLayoutOperations.IMPORT) {
             val coroutine = currentCoroutineContext()
             coroutine[WorkspaceJobContext]?.progress(0.05f, "Reading files")
@@ -300,6 +307,7 @@ internal fun registerLayoutOperations(registry: WorkspaceOperationRegistry, port
             val edits = listOf(WorkspaceDocumentOperation(WorkspaceMaterialEdits.ADD, buildJsonObject {
                 put("staging", WorkspaceMaterialStaging.stage(entries)); folder?.let { put("folder_id", it) }
                 if (asReference) put("as_reference", true)
+                if (under) put("reference_under", true)
             }))
             val execution = WorkspaceBatchJobExecution(edits, requireNotNull(coroutine[WorkspaceJobCompletion]), coroutine[WorkspaceJobContext])
             withContext(execution) {

@@ -1,5 +1,7 @@
 package io.github.psd2live.ui.views
 
+import io.github.psd2live.ui.components.AppMenuItem
+import io.github.psd2live.ui.components.AppDropdownMenu
 import io.github.psd2live.project.displayedRect
 import io.github.psd2live.project.canvasRect
 import io.github.psd2live.project.transform
@@ -99,8 +101,7 @@ internal fun ModelPresetsSection(
 
 	fun expandAll(expanded: Boolean) {
 		viewModel.setStrengthSubExpanded(expanded)
-		viewModel.setRigTuningExpanded(expanded)
-		viewModel.setRigTuningAdvancedExpanded(expanded)
+		viewModel.setRigModulesExpanded(expanded)
 		viewModel.setDynamicsSubExpanded(expanded)
 		viewModel.setSimulationPresetsExpanded(expanded)
 	}
@@ -333,11 +334,76 @@ internal fun ModelPresetsSection(
 						)
 					}
 				}
+
+				// Features shown through the bangs: copies over the front hair, clipped to it.
+				Row(
+					modifier = Modifier
+						.fillMaxWidth()
+						.padding(top = 2.dp),
+					verticalAlignment = Alignment.CenterVertically,
+					horizontalArrangement = Arrangement.spacedBy(8.dp),
+				) {
+					CompactCheckbox(
+						checked = state.seeThroughBrows,
+						onCheckedChange = { viewModel.setSeeThroughBrows(it) },
+						label = tr("seeThrough.brows"),
+						enabled = !isBusy && !state.meshOnly,
+						modifier = Modifier.weight(1f),
+					)
+					CompactCheckbox(
+						checked = state.seeThroughEyes,
+						onCheckedChange = { viewModel.setSeeThroughEyes(it) },
+						label = tr("seeThrough.eyes"),
+						enabled = !isBusy && !state.meshOnly,
+						modifier = Modifier.weight(1f),
+					)
+				}
+
+				if (state.seeThroughBrows || state.seeThroughEyes) {
+					Row(
+						modifier = Modifier.fillMaxWidth(),
+						verticalAlignment = Alignment.CenterVertically,
+					) {
+						Text(
+							text = tr("seeThrough.opacity"),
+							style = typography.body.copy(fontSize = 10.5.sp),
+							color = colors.textPrimary,
+							modifier = Modifier.width(76.dp),
+							textAlign = TextAlign.Right,
+						)
+						Spacer(Modifier.width(5.dp))
+						CompactSlider(
+							value = state.seeThroughOpacity,
+							onValueChange = { viewModel.setSeeThroughOpacity(it) },
+							onValueChangeStarted = viewModel::beginEditorGesture,
+							onValueChangeFinished = viewModel::endEditorGesture,
+							valueRange = 0f..1f,
+							enabled = !isBusy && !state.meshOnly,
+							height = 14.dp,
+							modifier = Modifier.weight(1f),
+						)
+						Spacer(Modifier.width(4.dp))
+						CompactNumberSpinner(
+							onEditStart = { viewModel.beginEditorField("setSeeThroughOpacity") },
+							onEditEnd = { viewModel.endEditorField("setSeeThroughOpacity") },
+							value = (state.seeThroughOpacity * 100f).toDouble(),
+							onValueChange = { viewModel.setSeeThroughOpacity(it.toFloat() / 100f) },
+							min = 0.0,
+							max = 100.0,
+							step = 5.0,
+							decimals = 0,
+							unit = "%",
+							enabled = !isBusy && !state.meshOnly,
+							modifier = Modifier.width(60.dp),
+							height = 20.dp,
+						)
+					}
+				}
 			}
 		}
 
 
-		RigTuningPresets(state, viewModel, isBusy)
+		RigModulePresets(state, viewModel, isBusy)
 
 
 		// Which generated motions the model has, by group; the animation panel lists, tunes and switches each one.
@@ -432,35 +498,18 @@ private fun CompactSwitchParamField(
 			},
 		)
 
-		DropdownMenu(
+		AppDropdownMenu(
 			expanded = expanded,
 			onDismissRequest = { expanded = false },
-			modifier = Modifier
-				.background(colors.panelElevated)
-				.border(BorderStroke(1.dp, colors.border)),
 		) {
 			if (existingParams.isEmpty()) {
-				DropdownMenuItem(enabled = false, onClick = {}) {
-					Text(
-						text = tr("layers.switch.noExisting"),
-						style = typography.caption.copy(fontSize = 11.sp),
-						color = colors.textMuted,
-					)
-				}
+				AppMenuItem(text = tr("layers.switch.noExisting"), enabled = false, onClick = {})
 			} else {
 				existingParams.forEach { param ->
-					DropdownMenuItem(
-						onClick = {
-							onValueChange(param)
-							expanded = false
-						},
-					) {
-						Text(
-							text = param,
-							style = typography.body.copy(fontSize = 11.5.sp),
-							color = if (param == value) colors.accent else colors.textPrimary,
-						)
-					}
+					AppMenuItem(text = param, isChecked = param == value, onClick = {
+						onValueChange(param)
+						expanded = false
+					})
 				}
 			}
 		}
@@ -621,6 +670,9 @@ internal fun LayersTableView(
 					val currentSide = override?.side ?: layer.semantic.side
 					val currentParam = override?.parameter ?: layer.semantic.parameter
 					val currentSwitchId = override?.switchId ?: layer.semantic.switchId
+					// The role the user set (null leaves it to the analysis); what the rig reads is the analysed layer's.
+					val currentRole = override?.role
+					val shownRole = when (currentRole) { null -> layer.semantic.role; io.github.psd2live.core.PartRole.PLAIN -> null; else -> currentRole }
 
 					val rowBg = when {
 						isSelected -> colors.selection
@@ -699,7 +751,7 @@ internal fun LayersTableView(
 						}
 
 						// 1. Semantic tags: the part and side words the generators read and the user's own (`layer_tag`).
-						val currentTags = io.github.psd2live.core.LayerTags.of(currentTag, currentSide) + state.layout.layerTags[layerId].orEmpty()
+						val currentTags = io.github.psd2live.core.LayerTags.of(currentTag, currentSide, shownRole) + state.layout.layerTags[layerId].orEmpty()
 						LayerTagCell(
 							tags = currentTags,
 							pending = layerId in state.layout.generation.pendingClassifications,
@@ -720,6 +772,7 @@ internal fun LayersTableView(
 										side = currentSide,
 										parameter = currentParam,
 										switchId = currentSwitchId,
+										role = currentRole,
 									),
 								)
 							},
@@ -757,6 +810,7 @@ internal fun LayersTableView(
 												side = currentSide,
 												parameter = nextParam,
 												switchId = currentSwitchId,
+												role = currentRole,
 											),
 										)
 									},
@@ -779,6 +833,7 @@ internal fun LayersTableView(
 												side = currentSide,
 												parameter = nextParam,
 												switchId = currentSwitchId,
+												role = currentRole,
 											),
 										)
 									},
@@ -802,6 +857,7 @@ internal fun LayersTableView(
 												side = currentSide,
 												parameter = currentParam,
 												switchId = parsed,
+												role = currentRole,
 											),
 										)
 									},

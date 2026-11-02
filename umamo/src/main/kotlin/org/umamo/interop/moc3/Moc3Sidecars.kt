@@ -1,5 +1,10 @@
 package org.umamo.interop.moc3
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.umamo.format.FileKind
 import org.umamo.format.moc3.Moc3
 import org.umamo.format.moc3.json.Cdi3Json
@@ -13,11 +18,13 @@ import org.umamo.format.moc3.json.UserData3Json
 import org.umamo.format.moc3.json.UserDataEntry
 import org.umamo.format.moc3.json.UserDataMeta
 import org.umamo.format.moc3.moc.MocVersion
+import org.umamo.interop.ExportNotice
 import org.umamo.interop.ExportReport
 import org.umamo.interop.moc3.export.CanvasToParentSpace
 import org.umamo.interop.moc3.export.Moc3Export
 import org.umamo.interop.moc3.export.Moc3WrittenIds
 import org.umamo.interop.mocVersion
+import org.umamo.runtime.model.DrawableId
 import org.umamo.runtime.model.ParameterNode
 import org.umamo.runtime.model.PuppetModel
 
@@ -140,6 +147,10 @@ object Moc3Sidecars {
 		// Lowered rather than written outright, because the cdi3 below has to name the objects by the ids
 		// the MOC actually got: an id the record width forced short is not the id the model carries.
 		val lowered = Moc3Export.toMocDocument(puppet, version, canvasToParentSpace, options)
+		// Most rigs are written under their own ids, and the preview rebuilds this bundle on every edit: only a rig
+		// with an id renamed or a part left out has its sidecars parsed.
+		val sidecars = if (writesModelIds(puppet, lowered.writtenIds)) sidecars
+			else sidecars.mapNotNull { sidecar -> withWrittenIds(sidecar, puppet, lowered.writtenIds) }
 		val mocBytes = Moc3.write(lowered.document)
 		val report = lowered.report
 		val mocFileName = "$basename$MOC3_EXTENSION"
@@ -173,6 +184,13 @@ object Moc3Sidecars {
 						}
 					}
 			}
+		// Each hit area names its ArtMesh as the moc wrote it; one the moc left out names nothing it contains and is
+		// reported. A manifest left with none has no HitAreas, as one that never had any.
+		val (written, dropped) = source?.hitAreas.orEmpty().partition { lowered.writtenIds.wroteDrawable(DrawableId(it.id)) }
+		val hitAreas = source?.hitAreas?.let { all ->
+			written.map { it.copy(id = lowered.writtenIds.drawableId(DrawableId(it.id))) }.takeIf { it.isNotEmpty() || all.isEmpty() }
+		}
+		val reported = if (dropped.isEmpty()) report else report.copy(notices = report.notices + dropped.map { ExportNotice.HitAreaDropped(it.name, it.id) })
 		val manifest =
 			Model3Json(
 				version = MODEL3_VERSION,
@@ -194,11 +212,108 @@ object Moc3Sidecars {
 				// the manifest.  Nothing in PuppetModel holds them, so dropping them here would quietly
 				// delete a rigger's eye-blink wiring on the first MOC3 round trip.
 				groups = source?.groups,
-				hitAreas = source?.hitAreas,
+				hitAreas = hitAreas,
 			)
 		files.add(BundleFile("$basename.model3.json", Moc3.writeModel3(manifest).encodeToByteArray()))
-		return Bundle(files, mocFileName, report)
+		return Bundle(files, mocFileName, reported)
 	}
+
+	/**
+	 * [sidecar] naming the model's parameters and parts by the ids the moc was written with, as [displayInfo] does.
+	 *
+	 * Expressions, poses and motions name objects by id; an id the record width forced short, or a part the
+	 * lowering left out (a hidden or guide part the options exclude), would otherwise leave the file naming
+	 * something the moc does not contain.  A pose drops such parts and the groups they empty, and goes when no
+	 * group is left; a motion drops the opacity curves of such parts, with its curve, segment and point counts;
+	 * expression entries are renamed only.  Ids the model does not hold are kept as they are, and a sidecar nothing
+	 * in it changed keeps its text byte for byte.
+	 *
+	 * @param PassThroughSidecar sidecar    The sidecar to rewrite.
+	 * @param PuppetModel        puppet     The rig.
+	 * @param Moc3WrittenIds     writtenIds What the lowering wrote each object's id as.
+	 * @return PassThroughSidecar? The sidecar as written, or null for a pose left without groups.
+	 */
+	fun withWrittenIds(sidecar: PassThroughSidecar, puppet: PuppetModel, writtenIds: Moc3WrittenIds): PassThroughSidecar? {
+		val parameters = puppet.parameters.associate { it.id.raw to writtenIds.parameterId(it.id) }
+		val parts = puppet.parts.associate { it.id.raw to (if (writtenIds.wrotePart(it.id)) writtenIds.partId(it.id) else null) }
+		fun parameter(id: String) = parameters[id] ?: id
+		fun part(id: String): String? = if (id in parts) parts[id] else id
+		val root = when (sidecar.kind) {
+			SidecarKind.Expression, SidecarKind.Pose, SidecarKind.Motion -> runCatching { Json.parseToJsonElement(sidecar.text) as? JsonObject }.getOrNull()
+			else -> null
+		} ?: return sidecar
+		fun JsonObject.withId(id: String): JsonObject = JsonObject(this + ("Id" to JsonPrimitive(id)))
+		fun JsonElement.id(): String? = ((this as? JsonObject)?.get("Id") as? JsonPrimitive)?.takeIf { it.isString }?.content
+		val rewritten: JsonObject? = when (sidecar.kind) {
+			SidecarKind.Expression -> if ("Parameters" !in root) root else JsonObject(root + ("Parameters" to JsonArray((root["Parameters"] as? JsonArray).orEmpty().map { entry ->
+				entry.id()?.let { (entry as JsonObject).withId(parameter(it)) } ?: entry
+			})))
+			SidecarKind.Motion -> if ("Curves" !in root) root else {
+				val curves = (root["Curves"] as? JsonArray).orEmpty().mapNotNull { curve ->
+					val id = curve.id() ?: return@mapNotNull curve
+					when (((curve as JsonObject)["Target"] as? JsonPrimitive)?.content) {
+						"Parameter" -> curve.withId(parameter(id))
+						"PartOpacity" -> part(id)?.let(curve::withId)
+						else -> curve
+					}
+				}
+				val dropped = curves.size != (root["Curves"] as? JsonArray).orEmpty().size
+				JsonObject(root + ("Curves" to JsonArray(curves)) + (if (!dropped) emptyMap() else mapOf("Meta" to motionMeta(root["Meta"], curves))))
+			}
+			else -> {
+				val groups = (root["Groups"] as? JsonArray).orEmpty().mapNotNull { group ->
+					(group as? JsonArray)?.mapNotNull { entry ->
+						val id = entry.id() ?: return@mapNotNull entry
+						val written = part(id) ?: return@mapNotNull null
+						val links = ((entry as JsonObject)["Link"] as? JsonArray)?.mapNotNull { link ->
+							val id = (link as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return@mapNotNull link
+							part(id)?.let(::JsonPrimitive)
+						}
+						JsonObject(entry.withId(written) + (links?.let { mapOf("Link" to JsonArray(it)) } ?: emptyMap()))
+					}?.takeIf { it.isNotEmpty() }?.let(::JsonArray)
+				}
+				if (groups.isEmpty()) null else JsonObject(root + ("Groups" to JsonArray(groups)))
+			}
+		}
+		if (rewritten == null) return null
+		if (rewritten == root) return sidecar
+		return PassThroughSidecar(sidecar.kind, sidecar.fileName, REWRITE_JSON.encodeToString(JsonObject.serializer(), rewritten))
+	}
+
+	/**
+	 * Whether the lowering wrote every object of [puppet] that a sidecar names under its own id: every parameter
+	 * unshortened, every part written and unshortened.  Then [withWrittenIds] changes nothing.
+	 */
+	private fun writesModelIds(puppet: PuppetModel, writtenIds: Moc3WrittenIds): Boolean =
+		puppet.parameters.all { writtenIds.parameterId(it.id) == it.id.raw } &&
+			puppet.parts.all { writtenIds.wrotePart(it.id) && writtenIds.partId(it.id) == it.id.raw }
+
+	/**
+	 * [meta] with the curve, segment and point counts of [curves], as a reader allocates from them.  A segment
+	 * list is a start point, then per segment its type and points: one for linear and both stepped kinds, three
+	 * for a bezier.
+	 */
+	private fun motionMeta(meta: JsonElement?, curves: List<JsonElement>): JsonObject {
+		var segments = 0
+		var points = 0
+		for (curve in curves) {
+			val values = ((curve as? JsonObject)?.get("Segments") as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.content?.toDoubleOrNull() }
+			if (values.size < 2) continue
+			points++
+			var at = 2
+			while (at < values.size) {
+				val bezier = values[at].toInt() == 1
+				segments++
+				points += if (bezier) 3 else 1
+				at += if (bezier) 7 else 3
+			}
+		}
+		return JsonObject((meta as? JsonObject).orEmpty() + mapOf("CurveCount" to JsonPrimitive(curves.size),
+			"TotalSegmentCount" to JsonPrimitive(segments), "TotalPointCount" to JsonPrimitive(points)))
+	}
+
+	/** How a rewritten sidecar is printed; number literals keep the text they were read with. */
+	private val REWRITE_JSON: Json = Json { prettyPrint = true }
 
 	/**
 	 * The `userdata3.json` for [puppet]: one `ArtMesh` entry per written drawable with user data.

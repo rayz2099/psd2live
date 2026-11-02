@@ -10,10 +10,14 @@ object PhysicsGenerator {
 	const val FRONT_HAIR_ID = "PhysicsHairFront"
 	const val BACK_HAIR_ID = "PhysicsHairBack"
 	const val EYE_JELLY_ID = "PhysicsEyeJelly"
+	const val EYE_L_BOUNCE_ID = "PhysicsEyeLBounce"
+	const val EYE_R_BOUNCE_ID = "PhysicsEyeRBounce"
+	const val MOUTH_SPRING_ID = "PhysicsMouthSpring"
 	val presetIds = listOf(BACK_HAIR_ID, FRONT_HAIR_ID, EYE_JELLY_ID)
 
 	/** One flag per preset: whether the art has the part, or whether the user left the preset on. */
-	data class Presets(val frontHair: Boolean, val backHair: Boolean, val eyeJelly: Boolean) {
+	data class Presets(val frontHair: Boolean, val backHair: Boolean, val eyeJelly: Boolean, val hairSoftness: Float = 0.5f,
+	                   val impulses: List<String> = emptyList()) {
 		operator fun get(id: String) = when (id) {
 			FRONT_HAIR_ID -> frontHair
 			BACK_HAIR_ID -> backHair
@@ -33,11 +37,90 @@ object PhysicsGenerator {
 
 			fun enabled(config: PipelineConfig) = Presets(config.physicsFrontHair, config.physicsBackHair, config.physicsEyeJelly)
 
+			/**
+			 * What [config] generates for the art of [analysis]: the legacy hair pendulums unless a simulation or the hair
+			 * chains move that hair.
+			 */
+			fun present(analysis: PipelineAnalysis?, config: PipelineConfig): Presets {
+				val chains = config.recipe.base("hair") === io.github.psd2live.core.recipe.RigModules.HAIR_CHAINS
+				val m = io.github.psd2live.core.recipe.RigModules
+				// Toggles and switches nudge the chains as they flip (`expression.toggles`).
+				val impulses = if (analysis == null || !m.builds(m.EXPRESSION_TOGGLES, config, io.github.psd2live.core.recipe.RecipeSubject.of(analysis))) emptyList()
+					else analysis.layers.mapNotNull { layer ->
+						val override = config.layerOverrides[layer.source.id.raw]
+						val type = override?.type ?: layer.semantic.type
+						(override?.parameter ?: layer.semantic.parameter).trim().takeIf { type != LayerType.PRESET && it.isNotBlank() }
+					}.distinct().sorted()
+				return present(analysis, config.hairSimulationFront || chains, config.hairSimulationBack || chains)
+					.copy(hairSoftness = if (chains) config.recipe.baseValue("hair", "softness") / 100f else 0.5f, impulses = impulses)
+			}
+
 			/** [present] without the hair the model preset simulates: that hair has no legacy pendulum. */
 			fun present(analysis: PipelineAnalysis?, simulatedFront: Boolean, simulatedBack: Boolean) = present(analysis).let {
 				it.copy(frontHair = it.frontHair && !simulatedFront, backHair = it.backHair && !simulatedBack)
 			}
 		}
+	}
+
+	/**
+	 * The pendulums of the rig modules that the model's parameters ([available]) call for: the aftershock of each eye's
+	 * blink (`eye.aftershock`), a short springy pendulum the openness swings, its angle the eye's bounce.
+	 */
+	internal fun moduleRules(available: Set<String>, hairSoftness: Float = 0.5f, impulses: List<String> = emptyList()): List<RigPhysicsEdit> = buildList {
+		for ((side, id) in listOf("L" to EYE_L_BOUNCE_ID, "R" to EYE_R_BOUNCE_ID)) {
+			val open = "ParamEye${side}Open"; val bounce = "ParamEye${side}Bounce"
+			if (open !in available || bounce !in available) continue
+			add(RigPhysicsEdit(id = id, name = tr("model.physics.eyeBounce", side),
+				inputs = listOf(PhysicsInput(open, 100f, PhysicsSourceType.X)),
+				outputs = listOf(PhysicsOutput(bounce, 2, 1.4f)),
+				segments = listOf(PhysicsSegment(1f, 0.9f, 0.6f, 1.6f), PhysicsSegment(1.2f, 0.85f, 0.45f, 1.8f)),
+				normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
+		}
+		addAll(io.github.psd2live.core.fit.HairChain.physics(available, hairSoftness, impulses))
+		// Each hanging arm swinging a little behind the body's turn and sway.
+		for (side in listOf("L", "R")) {
+			val swing = "ParamArm${side}Swing"
+			if (swing !in available) continue
+			val inputs = listOf(PhysicsInput("ParamBodyAngleX", 60f, PhysicsSourceType.X), PhysicsInput("ParamBodyAngleZ", 40f, PhysicsSourceType.ANGLE),
+				PhysicsInput("ParamAngleX", 15f, PhysicsSourceType.X)).filter { it.parameter in available }
+			if (inputs.isEmpty()) continue
+			add(RigPhysicsEdit(id = "PhysicsArm${side}Swing", name = tr("model.physics.armSwing", side), inputs = inputs,
+				outputs = listOf(PhysicsOutput(swing, 1, 1.2f)),
+				segments = listOf(PhysicsSegment(11f, 0.88f, 1.1f, 1.0f)),
+				normalization = PhysicsNormalization(angleMin = -20f, angleMax = 20f)))
+		}
+		// Each brow's overshoot as it stops: a short springy pendulum on its height and angle.
+		for (side in listOf("L", "R")) {
+			val spring = "ParamBrow${side}Spring"
+			if (spring !in available) continue
+			val inputs = listOf(PhysicsInput("ParamBrow${side}Y", 70f, PhysicsSourceType.X), PhysicsInput("ParamBrow${side}Angle", 30f, PhysicsSourceType.X))
+				.filter { it.parameter in available }
+			if (inputs.isEmpty()) continue
+			add(RigPhysicsEdit(id = "PhysicsBrow${side}Spring", name = tr("model.physics.browSpring", side), inputs = inputs,
+				outputs = listOf(PhysicsOutput(spring, 2, 1.2f)),
+				segments = listOf(PhysicsSegment(1f, 0.92f, 0.55f, 1.6f), PhysicsSegment(1f, 0.85f, 0.45f, 1.8f)),
+				normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
+		}
+		// The chest settling after the body moves and lifting with the breath: up and down on the nod, the lean and the
+		// breath, side to side on the body's turn and sway.
+		if ("ParamBustY" in available) add(RigPhysicsEdit(id = "PhysicsBustY", name = tr("model.physics.bust", "Y"),
+			inputs = listOf(PhysicsInput("ParamBodyAngleY", 50f, PhysicsSourceType.X), PhysicsInput("ParamAngleY", 20f, PhysicsSourceType.X),
+				PhysicsInput("ParamBreath", 30f, PhysicsSourceType.X)).filter { it.parameter in available },
+			outputs = listOf(PhysicsOutput("ParamBustY", 2, 1.2f)),
+			segments = listOf(PhysicsSegment(1f, 0.9f, 0.5f, 1.4f), PhysicsSegment(1.2f, 0.85f, 0.45f, 1.6f)),
+			normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
+		if ("ParamBustX" in available) add(RigPhysicsEdit(id = "PhysicsBustX", name = tr("model.physics.bust", "X"),
+			inputs = listOf(PhysicsInput("ParamBodyAngleX", 60f, PhysicsSourceType.X), PhysicsInput("ParamBodyAngleZ", 40f, PhysicsSourceType.ANGLE))
+				.filter { it.parameter in available },
+			outputs = listOf(PhysicsOutput("ParamBustX", 2, 1.1f)),
+			segments = listOf(PhysicsSegment(1f, 0.9f, 0.5f, 1.4f), PhysicsSegment(1.2f, 0.85f, 0.45f, 1.6f)),
+			normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
+		// The jaw's soft tissue settling after the mouth moves, mostly on the opening and a little on the form.
+		if ("ParamMouthOpenY" in available && "ParamMouthSpring" in available) add(RigPhysicsEdit(id = MOUTH_SPRING_ID, name = tr("model.physics.mouthSpring"),
+			inputs = listOf(PhysicsInput("ParamMouthOpenY", 80f, PhysicsSourceType.X), PhysicsInput("ParamMouthForm", 20f, PhysicsSourceType.X)),
+			outputs = listOf(PhysicsOutput("ParamMouthSpring", 2, 1.2f)),
+			segments = listOf(PhysicsSegment(1f, 0.9f, 0.5f, 1.6f), PhysicsSegment(1.1f, 0.85f, 0.4f, 1.8f)),
+			normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
 	}
 
 	/** The head and body sway every hanging part follows. */

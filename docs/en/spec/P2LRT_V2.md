@@ -386,7 +386,7 @@ Expressions match Cubism exp3. The weight w is the sine-eased fade factor; each 
 - Multiply: value · (1 + (v − 1)·w)
 - Overwrite: value · (1 − w) + v·w
 
-The runtime plays one expression at a time, and the previous expression fades out on a switch. The update order is: motion clips → expressions → procedural behaviors → physics. On export, the editor generates four expressions, smile, sad, angry and surprised, from the standard parameters present in the rig, each with 0.5 s fade in and fade out.
+The runtime plays one expression at a time, and the previous expression fades out on a switch. The update order is: motion clips → expressions → procedural behaviors → physics. On export, the editor generates four expressions, smile, sad, angry and surprised, from the parameters present in the rig, plus shy, sleepy and gloomy where the rig has the modules' parameters for them, each with 0.5 s fade in and fade out.
 
 ### `HITA`
 
@@ -394,7 +394,7 @@ The runtime plays one expression at a time, and the previous expression fades ou
 u32 n × { sref id, sref name, u32 n × ref mesh }
 ```
 
-A hit area covers the area its meshes draw. `p2l_hit_test(x, y)` returns, in file order, the first area with a visible mesh containing that canvas point. Export generates `HitAreaHead` (face) and `HitAreaBody` (top, otherwise neck or bottoms).
+A hit area covers the area its meshes draw. `p2l_hit_test(x, y)` returns, in file order, the first area with a visible mesh containing that canvas point. Export writes the hit areas the document set up (see [export targets](EXPORT_TARGETS.md#hit-areas)); without any it generates `HitAreaHead` (face) and `HitAreaBody` (top, otherwise neck or bottoms).
 
 ### `UDAT`
 

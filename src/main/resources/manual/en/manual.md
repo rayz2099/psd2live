@@ -205,7 +205,7 @@ The **View** menu in the title bar manages workspace tabs and the scale of the w
 | Workspace | Next workspace / Previous workspace | {key:NEXT_TAB} / {key:PREV_TAB} |
 | Interface and scale | Zoom in UI / Zoom out UI / Reset zoom | {key:ZOOM_IN} / {key:ZOOM_OUT} / {key:ZOOM_RESET} |
 ## Display toggles on the canvas
-Toggles for mesh wireframe, deformers, rotation deformers, deform paths, skeleton, texture density, source pixels, reference images and so on are in the display bar at the lower right of the canvas; the background (checkerboard / solid / transparent) is under "View ▾" in the canvas title bar. They are stored per canvas, so two canvases in the same workspace can show wireframe on one and the finished result on the other (see [[about-viewarea]]).
+Every display toggle - texture, mesh wireframe, deformers, rotation deformers, deform paths, skeleton, texture density, source pixels, reference images, grid, guides and so on - is under "View ▾" in the canvas title bar; the common ones are also in the display rail at the lower right of the canvas, and the pin at the right of each item in "View ▾" adds it to the rail or takes it off. The rail lists only the toggles the model can use: with no deform paths in the model there is no "Deform paths" row, for instance. The background (checkerboard / solid / transparent) is under "Background ▾" in the canvas title bar. The toggles are stored per canvas, so two canvases in the same workspace can show wireframe on one and the finished result on the other (see [[about-viewarea]]).
 
 @@ modeling-menu | Modeling Menu
 The **Model** menu in the title bar holds commands that act on the whole model. Modeling for a single object (creating deformers, editing meshes, making keyforms) is done on the canvas; see [[canvas-modes]].
@@ -250,7 +250,7 @@ Every layer already gets a mesh automatically when generated, so most of the tim
 ## Where the operations are
 | Operation | Where |
 |---|---|
-| Subdivide, cut, delete vertices | Edit mode toolbar and right-click menu: subdivide {key:TOOL_SUBDIVIDE}, knife {key:TOOL_KNIFE}, delete {key:DELETE_SELECTION} |
+| Subdivide, mesh points, delete vertices | Edit mode toolbar and right-click menu: subdivide {key:TOOL_SUBDIVIDE}, mesh points {key:TOOL_MESH_POINT} (Line {key:TOOL_KNIFE}), delete {key:DELETE_SELECTION} |
 | Point / edge / face selection | The Edit mode bar ({key:PICK_OPTION_1}–{key:PICK_OPTION_3}) |
 | Rebuild from current pixels | The right-click "Mesh" submenu, or the Mesh panel |
 | Split disconnected meshes… | The right-click "Mesh" submenu, or right-click in the hierarchy tree |
@@ -321,7 +321,7 @@ Deform changes shape and Edit changes mesh structure; this is the pair most easi
 2. Click to select; {kbd:Shift} adds, {kbd:Alt} subtracts, {kbd:Ctrl} + click cycles the hierarchy level among overlapping hit objects, drag for a box selection, {key:SELECT_ALL} selects all.
 3. The selection stays in sync with the hierarchy tree; press {key:FRAME_VIEW} to bring the selected objects to the center of the view.
 4. After choosing a target, switch to the mode you need. With no target selected, the mode tells you to select one first.
-In other modes, hold {key:TEMPORARY_SELECT} to switch to selection temporarily and release to return. Multi-step operations such as placing or cutting are finished with "Confirm" on the mode bar or {kbd:Enter}, and cancelled with {key:CANCEL}.
+In other modes, hold {key:TEMPORARY_SELECT} to switch to selection temporarily and release to return. {key:TOGGLE_OBJECT_MODE} switches between Object mode and the mode last used (Deform by default). Multi-step operations such as placing or drawing a mesh-points line are finished with "Confirm" on the mode bar or {kbd:Enter}, and cancelled with {key:CANCEL}.
 {tutorial=SELECT_MODE}
 *> Simulate, Skeleton and Paint are modes Cubism does not have; their results are baked into parameters, keyforms and pendulums on export, or written straight into the textures.
 
@@ -344,6 +344,21 @@ The bottom of the canvas shows the current runtime, physics state and zoom ratio
 !> The reference simulation runs only in the editor and is not exported; to carry it into the exported files, bake it in the Simulation panel.
 
 @@ guide-function | Guide line function
+Guides are horizontal or vertical reference lines dragged out of the rulers, for lining parts up, checking left-right symmetry or marking where a keyform should reach. Guides are saved with the project, stay out of the history and are never exported.
+## Showing the rulers and guides
+- Click **Guides** in the display rail at the lower right of the canvas ({key:TOGGLE_GUIDES}); rulers appear along the top and left edges, in canvas pixels.
+- Each edit canvas decides whether it shows them; the guides themselves belong to the project, and every edit canvas shares one set.
+## Operations
+| Operation | How |
+|---|---|
+| Add | Drag down from the top ruler for a horizontal guide, right from the left ruler for a vertical one |
+| Move | With a selection tool or **Transform**, drag a guide when the pointer over it turns into a double arrow. Brushes, creation tools, Paint mode and Shift or Alt presses keep working near a guide, and a handle under the pointer wins over it |
+| Remove | Drag the guide back onto its ruler, or choose **Clear all guides** in **Canvas aids…** of the display rail; **Restore cleared guides** in the same menu brings the last cleared set back |
+| Lock | Turn on **Lock guides** in **Canvas aids…** ({key:LOCK_GUIDES}); locked guides are dashed and can be neither added nor dragged |
+| Snap | With **Snap to grid and guides** on ({key:TOGGLE_SNAP}), a point you drag lines up with a guide it comes near |
+The guides' colour is picked among the theme colours in **Canvas aids…**, so they stay visible in any theme.
+*> Unlike Cubism, locking and colour are switched in the display rail's settings menu rather than a guide dialog; with snapping and the grid on, a dragged guide also snaps to the grid lines.
+
 @@ solo | Solo function
 Solo shows only the selected layer and temporarily hides the others, which makes it easy to check parts covered by hair or clothing.
 ## How to use
@@ -354,8 +369,34 @@ Solo affects only the current canvas; other canvases in the same workspace displ
 *> Solo is only a temporary show/hide while editing. To show or hide a part with a parameter, set up a variant or an opacity keyform (see [[variants]]).
 
 @@ grid | Grid Function
+The grid draws evenly spaced reference lines over the document, for lining up mesh points, deformers and parts. It shows on edit canvases only and changes neither the model nor the export.
+## Showing the grid
+Click **Grid** in the display rail at the lower right of the canvas ({key:TOGGLE_GRID}).
+## Settings
+In **Canvas aids…** of the display rail:
+| Item | Effect |
+|---|---|
+| Spacing | Canvas pixels between major grid lines (2–1024) |
+| Divisions | Smaller cells within each cell; 1 draws major lines only |
+| Opacity, colour | How strong the lines are and their colour, picked among the theme colours |
+Zoomed out, divisions that would crowd together are hidden and the major lines spread out as needed, so the grid never turns into a wash.
+## Snapping
+With **Snap to grid and guides** on ({key:TOGGLE_SNAP}), a mesh or deformer point you drag lands on a grid line once it comes within about 6 pixels of one. The point you grabbed is what snaps, not the pointer, so the point itself sits on the line, and the rest of the selection moves by the same amount. Clicks and picking use the pointer as it is. It snaps to the grid lines visible at the current zoom. Paint and the deform brushes do not snap, so strokes are not pulled onto the lines.
+
 @@ snapshot | Snapshot Function
 @@ onion-skin | Onion Skin
+The onion skin lays the shape at neighbouring keys or frames translucently over the current view: while shaping you see the keys either side, while animating the path through the neighbouring frames. It shows on edit canvases only, is not written to the project and is never exported.
+## Showing the onion skin
+Click **Onion skin** at the right end of the animation panel's toolbar ({key:TOGGLE_ONION_SKIN}). It acts on the current edit canvas; while the current canvas is a preview canvas, on the first edit canvas. What it shows depends on the moment:
+| State | Shapes laid over |
+|---|---|
+| A motion is open in the animation panel | Frames around the playhead, every "Frame step" frames |
+| No motion is open | The keys around the current value of the parameter last set in the parameters panel: the selected object's keys on it when it has any, else the whole model's |
+The onion skin button's tooltip says which of the two it is showing.
+## Settings
+Click the arrow beside the onion skin to set how many before and after (0–5), the frame step, the opacity, and a colour each for before and after. Layers farther from the current pose are fainter.
+*> The onion skin follows the canvas's display filters (selected only, layer visibility); it is not shown while a parameter snapshot is previewed on hover or in Paint mode.
+
 @@ multiview | Multiview
 One workspace can hold several canvases: for example an editing canvas and a preview canvas side by side, so you see the finished result while editing keyforms; or two editing canvases, one zoomed in on detail and one showing the full body.
 ## Adding a canvas
@@ -370,6 +411,19 @@ So when you drag a parameter on the editing canvas, the preview canvas shows the
 *> To compare two different parameter poses side by side, put them in two workspaces: each workspace keeps its own pose.
 
 @@ random-pose | Random Pose
+The random pose sets parameters to random values in their ranges, to check many parameter combinations at once and find clipping, tearing or runaway deformation.
+## How to use
+1. Click the die, **Random pose**, in the parameters panel's toolbar ({key:RANDOM_POSE}); each click gives a new pose.
+2. When done, click **Restore pose** in the arrow menu beside the die ({key:RESTORE_RANDOM_POSE}); the parameters return to the values they had before the first random pose.
+## Choosing the parameters
+In the arrow menu beside the die:
+| Item | Effect |
+|---|---|
+| All unlocked parameters | Every parameter takes part; parameters locked in the parameters panel stay put |
+| Parameters being edited | Only the parameters last set in the parameters panel; when none is set on this canvas, as on a preview canvas, all unlocked parameters move |
+| Range | How far each parameter may go from its default; 100% reaches both ends of its range |
+The random pose sets the current pose the way dragging sliders does, except that it never keys an open motion.
+
 @@ toolbar-folder | Toolbar
 @@ toolbar | About the Toolbar
 The toolbar sits at the upper left of each canvas, below the mode menu, and lists only the tools available in the current mode. Tools of the same kind share one slot that shows the one used last; click the slot again or right-click it to expand the rest, and hovering shows the name and shortcut.
@@ -378,7 +432,7 @@ The toolbar sits at the upper left of each canvas, below the mode menu, and list
 |---|---|
 | Object | Select, Transform, lasso select; Create Warp, Create Rotation, deform path |
 | Deform | Select, Transform, lasso select, brush select; push/pull brush, smooth brush, inflate/deflate |
-| Edit | The Deform mode tools, plus subdivide, knife and Glue (available when two meshes are selected) |
+| Edit | The Deform mode tools, plus mesh points, subdivide and Glue (available when two meshes are selected) |
 | Simulate | Weight brush, weight gradient, with the weight groups to paint listed below |
 | Skeleton | Bone pose, edit bones |
 | Paint | Brush, pencil, eraser; paint bucket, eyedropper; shapes |
@@ -547,6 +601,18 @@ The **Log** panel records program activity, edit operations and messages from AI
 *> When reporting a problem, attach the copied log (see [[fault-map]]).
 
 @@ convert-id | ID Conversion
+Gives parameters, parameter groups, parts, deformers and ArtMeshes new IDs, such as Cubism 2's `PARAM_ANGLE_X` to Cubism 3's standard `ParamAngleX`. Every reference follows: the parameters keyforms and blend shapes use, parents and parts, clipping masks, glue, paths, vertex groups, combined parameters and parameter groups, motion curves, your own physics groups and swing targets; the physics, motions and expressions generated on standard IDs find the converted parameters too.
+## Convert IDs
+1. **Model → Convert IDs…**.
+2. Under **Objects** pick parameters, parameter groups, ArtMeshes, warp deformers, rotation deformers or parts, and narrow the list with **Filter**.
+3. Type the new ID beside each object to change. **Cubism 3 standard IDs** fills in the standard ID for every Cubism 2 style parameter (`PARAM_…`) and part (`PARTS_01_…`).
+4. Click **Convert**. The whole batch is one history step you can undo.
+A new ID uses letters, digits and underscores, starts with a letter, and is not taken by another object of its kind (warp and rotation deformers share one set of IDs); the dialog says why when one is not. To change many IDs by a rule, see [[search-and-replace]].
+## Checked before export
+An export checks the IDs: objects of one kind sharing an ID stop the export, which names the conflicting IDs; an ID with characters other than letters, digits and underscores only warns.
+!> Parameters and meshes a swing, simulation or interior effect makes or reads cannot be converted on their own; remove them from that panel first. Meshes bound to the skeleton, bone parameters and bone deformers cannot be converted either. After a conversion, the current pose, parameter snapshots, timeline bookmarks and deformer visibility follow the new IDs, and an undo takes them back.
+*> Unlike Cubism, no conversion table file is read or written. The conversion is recorded in the project history: later edits use the new IDs, and a regenerated model replays it in order.
+
 @@ autosave | Automatic Backup Function
 While you edit, PSD2Live keeps writing unsaved changes into the local workspace storage. If the program crashes or the power fails, the next launch can recover those changes, so you do not have to dig through backup files by hand.
 ## Recovery
@@ -676,7 +742,7 @@ The **Model presets** panel decides in one place what is generated automatically
 ## Contents of each group
 | Group | Contents |
 |---|---|
-| Deformation and mouth shapes | Facial-feature offset deformer switches, head and body amounts (0–4×), upper and lower lip strokes with their line width and color, mouth shape settings |
+| Deformation and mouth shapes | Facial-feature offset deformer switches, head and body amounts (0–4×), upper and lower lip strokes with their line width and color, mouth shape settings, brows and eyes through the bangs with their opacity |
 | Rig values | Body X (turning left and right), body Y, body lean forward and back, size change (head-to-body ratio), body Z and breathing, depth and perspective; **Advanced** holds head turning, eyes, eyebrows and mouth |
 | Motions | Two groups, **Basic motions** and **Skeleton motions**; when turned off, that group's motions are removed from the Animation panel, preview and export |
 | Physics and simulation | Front hair and back hair each choose **Simulation** / **Classic sway** / **Off**; **Clothing** simulation (acts only on loose parts); jelly eyes; auto Pin physics weights |
@@ -831,7 +897,34 @@ Once set, dragging the parameter shows the effect in both editing and preview.
 !> A number in a layer name does not create a variant automatically: a Toggle Variant needs a parameter, and a Switch Variant needs a shared parameter with different IDs.
 
 @@ copy-and-paste | Copy and Paste Objects
+Copy ArtMeshes and deformers and paste copies of them. A copy keeps the original's keyforms, blend shapes, clipping masks, paths and vertex groups and shares its texture and layer; after pasting, each can be changed on its own.
+## Copy and paste
+1. In **Object** mode, select ArtMeshes (one or more) in the hierarchy or on the canvas, or one deformer in the hierarchy.
+2. Press {key:COPY}, or right-click in the hierarchy and choose **Copy**.
+3. Press {key:PASTE}, or right-click and choose **Paste**: each copy appears beside its original, under the same parent. Right-click a deformer and choose **Paste into this deformer** to hang the copies under it; ArtMeshes keep where they show on the canvas.
+A paste is one history step you can undo. A copy's ID is the original's with `_copy` (`_copy_2`, `_copy_3`… when taken); change it later with [[convert-id]].
+## What is copied
+| Copied object | Copied with it |
+|---|---|
+| ArtMesh | Keyforms, blend shapes, paths, vertex groups; glue between two meshes copied together |
+| Deformer | Every child deformer and ArtMesh under it, their parents pointing at the copies |
+| Part | Its child parts, ArtMeshes and the deformers organized in it |
+| Parameter | A new parameter with the same range and default beside the original; keyforms stay on the original |
+A clipping mask that names a mesh copied along points at its copy; otherwise it keeps the original mask. Parts are copied through MCP; the parameter panel also copies a parameter's definition.
+*> Swings, simulations and interior effects belong to the whole document and are not copied with an object. The paste copies objects as they are when you paste: changes made to an original after copying are in the copy too.
+
 @@ search-and-replace | Search and Replace Objects
+Find objects by name or ID and replace in bulk: tidy up naming, rename parts finished on one side for the other side, or prefix a group of parameters.
+## Use
+1. **Model → Find and Replace…**.
+2. Under **Search in** choose **Names** or **IDs**, and toggle the object kinds below; check **Selection only** to touch only the objects selected in the hierarchy.
+3. Fill **Find** and **Replace with**, or **Add prefix** and **Add suffix**; check **Regular expression** when needed (the replacement may use `$1` for groups) or uncheck **Match case**.
+4. The list shows, as you type, what each match becomes. Click **Replace All** to apply the whole batch as one history step.
+## Swap left and right
+**Swap left and right** exchanges the side marks that stand as words of their own in a name or ID: `L`/`R` (as in `ArmL`, `Hair_L_01`, `ParamEyeLOpen`), `Left`/`Right` and `左`/`右`; letters inside words such as `Lip` stay.
+Replacing IDs works as [[convert-id]] does: every reference follows.
+*> With nothing to replace, the list only shows what matches, so the dialog also serves as a search.
+
 @@ offscreen-drawing | Offscreen drawing
 @@ draw-order | Draw order
 @@ draworder | About Draw Order
@@ -874,7 +967,7 @@ When the mesh does not cover some visible pixels, the panel shows the proportion
 | Units | Scale with document size, trace outline by texture pixels, wrap | The length unit, the precision of the outline trace, and gaps between small protrusions such as closed eyelashes |
 
 @@ mesh-edit-manual | Edit Mesh manually
-Where the automatic mesh is not right in a few places, change the topology directly in **Edit** mode: subdivide, connect, merge, duplicate, delete and cut. Even when the mesh already has keyforms you can modify it — the vertex references of the UVs, keyforms, blend shapes and glue are updated along with it, and every operation goes straight into the history.
+Where the automatic mesh is not right in a few places, change the topology directly in **Edit** mode: subdivide, connect, merge, duplicate, delete and mesh points (adding points, drawing lines). Even when the mesh already has keyforms you can modify it — the vertex references of the UVs, keyforms, blend shapes and glue are updated along with it, and every operation goes straight into the history.
 ## Entering Edit mode
 1. Select one or more art meshes.
 2. In the mode menu choose **Edit** ({key:MODE_EDIT}); the mesh is forced to display.
@@ -887,11 +980,22 @@ Where the automatic mesh is not right in a few places, change the topology direc
 | Connect / merge | Creates connections between the selected points, or merges the selected vertices into one point |
 | Duplicate | Duplicates the selected vertices and the faces they fully cover; the new copy becomes the selection |
 | Delete ({key:DELETE_SELECTION}) | Deletes the selection and tries to fill the gap; refused when no valid topology can result |
-| Knife ({key:TOOL_KNIFE}) | Specify a polyline point by point, snapping near points or edges (hold {kbd:Shift} to turn this off temporarily); {key:FINISH_PATH} finishes and {key:CANCEL} cancels |
-When several art meshes are selected, clicking a vertex of one mesh makes it the primary mesh; the knife and edge and face selection act only on the primary mesh.
+| Mesh points · Points ({key:TOOL_MESH_POINT}) | Click on open canvas to add a vertex (inside a triangle, on an edge or outside the mesh), drag on open canvas to add points along the stroke at **Point spacing**, drag a vertex to move it; {kbd:Shift}+click connects from the selected vertex, {kbd:Alt}+click deletes a vertex or edge; **Mirror across centre** repeats it on the other side. The mesh tidies its own connections around new points, so they are not promised an edge between them |
+| Mesh points · Line ({key:TOOL_KNIFE}) | Click a polyline point by point; each point is joined to the last by an edge, so the mesh can fold along it (an eyelid, a mouth line, a crease). Snaps near points or edges (hold {kbd:Shift} to turn this off temporarily); {key:FINISH_PATH} finishes and {key:CANCEL} cancels |
+| Delete edges | {key:DELETE_SELECTION} in edge mode or the topology menu: an inner edge becomes the other diagonal of its quad, an outline edge removes its triangle; refused when it would break the mesh |
+| Re-triangulate | Topology menu: around the selected vertices (the whole mesh with none selected) turns slivers into more even triangles, leaving vertices and texture in place |
+When several art meshes are selected, clicking a vertex of one mesh makes it the primary mesh; a mesh-points line and edge and face selection act only on the primary mesh.
 !> Deleting outline points changes the boundary, so check under several parameter poses after changing it. Do everyday shape pulling in Deform mode, and use Edit mode only to change topology.
 
 @@ mesh-duplication | Mesh duplication
+Copy one ArtMesh's vertices and triangles onto other ArtMeshes, for variants of one shape such as an open and a closed eye or several expressions. Each target takes the same topology where the source sits on the canvas and samples its own texture; the target's keyforms, blend shapes, paths, vertex groups and glue migrate onto the new mesh.
+## Use
+1. In the hierarchy, select the source mesh together with one or more target meshes.
+2. Right-click the source mesh and choose **Duplicate this mesh onto N selected meshes**.
+The duplication is one history step you can undo.
+!> Target artwork outside the source mesh is not drawn, and source vertices outside the target artwork sample beyond it. Check the result in Edit mode and add points or cut with [[mesh-edit-manual]] where needed.
+*> What is copied is the mesh structure, not its deformation: the target's keyforms migrate by vertex position; the source's keyforms are not copied.
+
 @@ clipping-mask | Clipping Mask
 A clipping mask makes an ArtMesh show only within the area of another ArtMesh, for example a pupil showing only inside the eye white. The commonly used masks are already set automatically when the model is generated: a pupil is masked by the eye white on the same side, and inner-mouth parts such as teeth and tongue are masked by the mouth.
 ## Setting manually
@@ -931,6 +1035,15 @@ References of different angles, such as front, side and looking up, can be stack
 *> The **Pin to Keyform** submenu of the canvas context menu is the same panel. Pins only decide when the editor shows a reference; they are not exported.
 
 @@ hittest | Preparation for Setting Up Collision Detection
+Hit areas tell an app which part of the model was clicked: change the expression when the head is tapped, play a motion when the body is. PSD2Live keeps the hit areas in the project and writes them on export to model3.json's `HitAreas` (the VTube Studio package carries them too) and to the `.p2lrt` runtime model.
+## Setting up hit areas
+- **Inspector**: select an ArtMesh and choose the area it belongs to in **Hit area**, or **New hit area** to start one with it. While there is none, **Set up Head and Body** creates Head and Body from the recognized face and top (the neck or the bottom when there is no top). Once the mesh is in an area, edit its **Hit area name** (what an app asks for; Head and Body are usual) and **Hit area ID**.
+- **Hierarchy**: right-click an ArtMesh and, under **Hit areas**, check or uncheck the areas it belongs to, or choose **New hit area from this mesh**.
+An area can cover several ArtMeshes; areas are tested in list order and the first hit wins. Each change is one history step and can be undone. Without any area, the `.p2lrt` runtime uses automatic Head and Body areas and model3.json gets no hit areas.
+## Checking in the preview
+Click the model on a preview canvas without dragging: the area hit is highlighted in the accent color and the log reads "Hit area: name (ID)"; a miss logs that there is no hit area there. The test is the runtime's: a mesh that is visible, has an opacity above 0 and has the point inside one of its triangles is hit.
+*> A model3.json hit area names a single ArtMesh, so an area of several meshes is written as several entries of the same name, which the export report notes. The Cubism SDK samples test a mesh's bounding rectangle, which can differ slightly from the preview. Cubism models often use a dedicated hit mesh at opacity 0: such a mesh is never hit in the PSD2Live preview or the `.p2lrt` runtime, and once exported to model3.json the host decides. When a mesh is split its pieces take its place in its areas, and a deleted layer's meshes leave them; an area that still names meshes the rig no longer has lists them as **Missing meshes** in the inspector, and export leaves them out and notes them in the export report.
+
 @@ blend-mode | Blend mode
 The blend mode decides how an ArtMesh's color combines with what has already been drawn beneath it, and is often used for shadows and highlights. Select an ArtMesh and choose in **Blend Mode** in the **Inspector**:
 | Mode | Effect |
@@ -1134,6 +1247,7 @@ A parameter's name, range and keys are changed in **Parameter Properties**; once
 3. At the two ends of the **Key points** axis, change the minimum, default and maximum; the default must lie within the range.
 4. Click **Save**; this is one undoable history step.
 The dialog also has **Lock parameter value** (only keeps the preview at the current value; it is not part of the definition), **Duplicate definition** (copies the name and range, not component bindings or deformation data) and **Delete Parameter** (also removes the associated keyframes and links).
+An ordinary parameter can also **Repeat**, its value running on from the minimum past the maximum; see [[repeat]].
 !> Shrinking the range also limits the key values and Bezier control points in animations; deleting a parameter removes the corresponding animation tracks.
 ## Tidy the Parameters panel
 - Create parameters or folders from the toolbar; right-click a folder to create a parameter / folder inside it, set a label color, rename it or dissolve it.
@@ -1165,6 +1279,18 @@ Generated models use the Cubism standard parameter IDs, so after export they can
 @@ extended-interpolation | About Extended Interpolation
 @@ extended-type | Interpolation Type
 @@ repeat | Repeat
+With **Repeat** on, a parameter's value runs on past its maximum from its minimum, and past its minimum from its maximum: for a wheel that keeps turning, a windmill or a tail that swings round and round.
+## Set it
+1. Click the parameter's name in the Parameters panel to open **Parameter properties**.
+2. Tick **Repeat (wrap from the maximum back to the minimum)** and click **Save**. This is one undoable history step; only ordinary parameters can repeat, blend-shape parameters cannot.
+## What it does
+- The preview and the runtimes wrap the value into the range. The maximum and the minimum are the same pose, so the shapes at both ends should match.
+- A motion may key the parameter past its range, up to 64 turns, for a continuous spin; see [[timeline-basic-operation-repeat]].
+- The `moc3` gets the parameter repeat flag (the format from Cubism 5.3), the `cmo3` its `isRepeat`.
+- The value wraps as in Cubism: exactly whole turns past the maximum land on the minimum, and below the minimum on the maximum.
+- Physics inputs and motion fades take the wrapped value, so across the ends they work from the other end, which may differ from a continuous spin.
+- Exporting to a target without repeat, the downgrade report lists each motion curve keyed past the range.
+!> Exporting for an SDK target before Cubism 5.3 drops the setting and lists it in the downgrade report; the runtime then clamps motion values past the range to its ends.
 @@ recording-parameters | Record Parameter Operations and Generate Animations
 @@ copy-and-paste-parameter-values | Copy/Paste Parameter Values
 After you have dialed in a pose or expression you like, save it as a parameter snapshot and return to that state with one click later; this is easier than copying parameter values one by one, and suits comparing back and forth between several poses while correcting shapes. A snapshot records only parameter values and does not change the model.
@@ -1213,7 +1339,9 @@ All keyforms are made in Deform mode: set a parameter to a key, then change the 
 - A warp deformer can switch between the **Vertices** and **Bezier** edit levels; for a rotation deformer, drag the origin and the endpoint.
 - **Precise Transform** in **Tool Details** moves, scales and rotates the selected points by numeric values; see [[edit-vertices]].
 - The canvas right-click menu **Mirror keyform** mirrors a finished side to the other; see [[motion-mirroring]].
-*> Changing the mesh structure (adding points, cutting) happens in Edit mode, separate from changing shapes; for everyday shape correction stay in Deform mode. When you edit a keyform owned by a generator, the change is recorded as a generated override and survives regeneration; see [[generated-overrides]].
+- The canvas right-click menu **Keyform** copies, pastes, resets or interpolates the shape at the current key; see [[copy-and-blend-shape]].
+- With **Soft selection** on ({key:SOFT_SELECTION_TOGGLE}), dragging or transforming selected points also moves the points around them, less the further away they are; set the reach in the tool options bar or with {key:BRUSH_RADIUS_DOWN} / {key:BRUSH_RADIUS_UP}. The falloff curve is shared with the deform brush, and the affected points are ringed in red.
+*> Changing the mesh structure (adding points, drawing lines) happens in Edit mode, separate from changing shapes; for everyday shape correction stay in Deform mode. When you edit a keyform owned by a generator, the change is recorded as a generated override and survives regeneration; see [[generated-overrides]].
 
 @@ keyform-parent-chilid-relation | Keyforms (Parent-Child Hierarchy Movement)
 A parent deformer and a child object can be bound to the same parameter, each recording shapes on the keys; when the parameter changes, the overall motion brought by the parent and the child's own shape are combined into the final result. This way the parent handles the large motion and the child only needs small corrections.
@@ -1234,8 +1362,44 @@ When an object is bound to two parameters at once (such as Angle X and Angle Y),
 *> The shapes of the four diagonals have to be made one by one; PSD2Live does not synthesize them automatically as Cubism does.
 
 @@ copy-and-blend-shape | Edit Form
+The **Keyform** submenu of the Deform mode canvas right-click menu copies the shape at one key to another key or to a like object, resets a key to its default shape, or interpolates a middle key from the keys on either side. The result is written as ordinary keyforms and can be undone.
+## How to use
+1. Select the object in Deform mode and set the parameters onto one of its keys.
+2. Choose an operation in the canvas right-click menu **Keyform**, or use the shortcuts below.
+| Action | Shortcut | What it does |
+|---|---|---|
+| Copy keyform | {key:KEYFORM_COPY} | Records each selected object's shape, opacity and colors at the current parameters; later changes to the source do not reach the paste |
+| Paste keyform | {key:KEYFORM_PASTE} | Writes the copied shape onto the current key as moves (a mesh's from its rest, a Warp's or rotation deformer's from its default-key shape); onto the same object, or one of its kind with the same triangles (a Warp: rows and columns) under the same parent |
+| Reset to the default-key shape | {key:KEYFORM_RESET} | Puts the current key back to the shape at the parameters' defaults |
+| Reset to the mesh rest shape | — | Meshes only: puts the current key back to the undeformed mesh |
+| Interpolate from neighbouring keys of (parameter) | {key:KEYFORM_INTERPOLATE} | Remakes the current key from the keys on either side along that parameter; with several such parameters the menu lists each (blend shape parameters excepted) |
+- With points selected, paste, reset and interpolate change only those points, and the menu rows show how many; a Warp at the Bezier level and a rotation deformer are always handled whole.
+- When the object binds no parameter or the parameters are between its keys, the menu says so and the shape rows are off.
+- A shape edit on keyforms a generator owns is recorded as a generated override; see [[generated-overrides]].
+- **Paste with options…** pastes only some contents, blends by a ratio or flips, and sets where several shapes go; see [[paste-form-special]] and [[confirm-target-for-pasting-multiple-forms]]. **Restore every key to the default-key shape**: [[restore-deformer-shape]]; **Multi-key editing…**: [[multi-key]].
+
 @@ paste-form-special | Paste Form Special
+**Paste with options** pastes only the checked contents, and can blend by a ratio or flip before pasting.
+## How to use
+1. Select the object in Deform mode and copy with {key:KEYFORM_COPY} or the canvas right-click menu **Keyform → Copy keyform**.
+2. Set the parameters onto the key to write, and choose **Paste with options…** under **Keyform**.
+3. Set the options in the dialog and click **Paste** (or press Enter).
+| Option | What it does |
+|---|---|
+| What to paste | Any of shape (points), opacity, draw order, multiply color and screen color; without the shape the channels go onto any selected object (draw order onto meshes only) |
+| Blend ratio | 100% pastes; less moves the current key that share of the way toward the copied values, blending the forms |
+| Flip | Left to right reverses a Warp's columns, top to bottom its rows; a mesh pairs vertices by their mirrored rest places (its rest must be symmetric that way, or the paste is refused); each point takes its partner's move turned around; a rotation deformer's angle change is reversed |
+*> Unlike Cubism the flip works on the moves, so it needs no flip line, and there is no Warp "flip over" option; mirror an asymmetric mesh with [[motion-mirroring]]. A plain paste after the dialog closes still pastes the shape only.
+
 @@ confirm-target-for-pasting-multiple-forms | Where to apply form pasting
+After copying several objects' shapes together, the **Paste with options** dialog shows and lets you change which object each shape is pasted onto.
+## How pairs are made
+- Copying records one shape per selected mesh (the first is the current target).
+- When pasting, a source that is itself selected and sits on one of its keys gets its own shape back; otherwise each shape goes to the next selected object not yet taken that can take it: the same kind, the same triangles (a Warp: rows and columns), the same parent.
+- The dialog's **Paste onto** rows list source → target; pick another fitting object, or **Do not paste** to leave a shape out. Without the shape any selected object can take the channels.
+- Every shape is written as it was copied, so pasting A onto B and B onto A swaps them.
+*> A plain paste ({key:KEYFORM_PASTE}) uses the automatic pairing without a dialog.
+
 @@ synthesize-corners | Automatic Generation of Four Corner Forms
 @@ face-auto-edit | Auto generation of facial motion
 Head turns, blinks, eyeballs, eyebrows, mouth shapes and lip sync are all generated when the PSD is imported; you do not have to make the up, down, left and right shapes by hand first. What you do is adjust the range with numbers and then correct a few places by hand.
@@ -1243,6 +1407,7 @@ Head turns, blinks, eyeballs, eyebrows, mouth shapes and lip sync are all genera
 - Head X / Y: the end and middle points combine into nine poses, based on the head tilt in the original art, with extra correction for the diagonals.
 - The face is corrected with a lat-long grid and by region; eyes and brows, pupils, mouth and ears each have their own compensation or masking.
 - Mouth: opening and mouth form are generated from the mouth shape settings, and upper and lower lip outlines can optionally be generated.
+- Brows through the bangs: each brow the front hair covers gets a copy drawn just above the bangs at partial opacity and clipped to them, so it shows through the hair as in anime. The copy follows its brow through every deformer, form and edit; edit the brow, not the copy. Eyes through the bangs: the bangs fade over every part of the eyes - whites, irides and highlights, lashes - so the whole eye shows through the hair; closed-eye lines are copied over the bangs like the brows. New models have both on; models made before keep what they had (eyes off) until you turn them on.
 - Front and back hair are separated from strong face deformation and each outputs its own sway parameter.
 ## Adjust the range
 1. Open the **Rigging & Facial** group in the **Model presets** panel and adjust the **Facial Feature Displacement Deformer** switch and **Head range** and **Body range**.
@@ -1280,6 +1445,12 @@ Rotation and scaling are centered on the anchor of the transform box; when the t
 While dragging the transform box, the rotation angle, scale ratio or moved canvas pixels are shown beside the pointer; dragging the anchor changes the center, and it snaps when near the center, a corner or an edge midpoint.
 
 @@ restore-deformer-shape | Restore deformer shape
+When a deformer's (or mesh's) keyforms have gone wrong and you want to start over, **Restore every key to the default-key shape** puts each key of the object back to its shape at the parameters' defaults, as one history step that can be undone.
+## How to use
+1. Select the deformer or mesh in Deform mode.
+2. Canvas right-click menu **Keyform → Restore every key to the default-key shape**.
+*> Unlike Cubism no separate original shape is recorded: the object's current default-key shape (usually its shape when it was first keyed) is what it restores to. MCP: `keyform_apply op=reset all_keys=true`.
+
 @@ glue | Glue
 When two parts split apart at their seam as soon as they move, use glue to stick the vertices of the two meshes together. A glue point is one point shared by both meshes, drawn as a diamond on the canvas, and when it is selected or dragged the vertices on both sides always move together.
 ## Create
@@ -1319,7 +1490,7 @@ When a whole mesh that spans a joint (such as an arm that has not been split, or
 2. Weights are computed automatically over the whole limb: each vertex follows at most the two bones on either side of the joint, with a smooth transition within the **Joint band**.
 3. To correct them, use the **Weights** sub-tool: select a bound mesh and a bone in the same limb, and paint with add, subtract, replace or smooth.
 4. In **Tool Details** you can clean up and restore the automatic weights, or copy / mirror the weights to another mesh.
-5. While posing, turn on **Show skin weights** in the display bar to check the transitions at the joints by bone color.
+5. While posing, turn on **Show skin weights** under "View ▾" (or pin it to the display rail) to check the transitions at the joints by bone color.
 {tutorial=SKELETON}
 Vertices inside the joint band blend by angle and rotate around the joint, so the limb keeps its width when it bends.
 *> Cubism's skinning converts the mesh directly into a chain of rotation deformers and you then edit on that chain; here the weights belong to the skeleton, and changing the bones bakes again. For the full description see [[skeleton]].
@@ -1371,6 +1542,21 @@ When there are problems, the Inspector toolbar shows an **n override issue(s)** 
 Related: [[auto-generation-of-sway-motion]] · [[simulation]] · [[update-generated-rig]]
 
 @@ multi-key | Multiple Keys Editing Function
+Changes the opacity, draw order, multiply color and screen color of many keyforms of several objects at once, for example bringing the eyelashes in front of the bangs on every blink key together.
+## How to use
+1. Select the objects to change in Deform mode (several meshes can be selected).
+2. Canvas right-click menu **Keyform → Multi-key editing…**.
+3. **Keys to edit** lists each parameter's key values; click values off to narrow the range. The number of keyforms that will change is shown below.
+4. Check what to change and set the values, pick a method and click **Apply**.
+| Method | What it does |
+|---|---|
+| Overwrite | Each keyform takes the value |
+| Add | The value is added to each keyform's own |
+| Multiply | Multiplied with each keyform's own (draw order takes only overwrite and add) |
+| Screen | 1 − (1 − own) × (1 − value), mostly for colors |
+- The result is one history step. It writes channel keyforms as ordinary keyforms, not as generated overrides; each channel is written on the axes it already has, and on the object's shape keys only while it has no track.
+*> Deformers have no draw order; with deformers in the dialog the draw order cannot be changed. MCP: `keyform_apply op=multi_key`.
+
 @@ motion-mirroring | Motion Mirroring
 For left-right symmetric motion, make one side only: make the shape for Angle X 30 and mirror it to -30, or mirror the left eye's shape to the right eye. The symmetric key and the opposite object are decided automatically from the parameter and layer semantics, the result is written as ordinary keyforms, and it can be undone.
 ## How to use
@@ -1389,6 +1575,14 @@ For left-right symmetric motion, make one side only: make the shape for Angle X 
 - Only the object's own deformation is handled, and the parent's keyforms must be mirrored separately; when several layers are selected, each is mirrored in turn and committed in one history step.
 
 @@ temporary-deform-tool | Temporary deform tool
+The temporary deform tool lays a disposable lattice over the selected points (or the whole object); dragging its points bends those points together, for broad changes of shape. The lattice itself is not kept.
+## How to use
+1. Select a mesh or Warp in Deform mode (a Warp at the **Vertices** level), and the points to deform if only some.
+2. Press {key:TEMPORARY_DEFORM} or choose **Temporary deform (lattice)** in the canvas right-click menu.
+3. Drag lattice points: the points inside follow by bilinear interpolation, each release one history step. When the parameters are between keys a press first snaps them onto the keys, and when the shape changed (another key, an undo, another edit) a press lays the lattice again over it; such a press does not start a drag, so press again.
+4. **Lattice** in the toolbar switches between 1×1 and 4×4 (laying the lattice again over the current shape); Enter, {key:CANCEL} or **Done** ends it.
+*> Unlike Cubism there is only the temporary lattice (warp) mode; scale and rotate with the Transform tool {key:TOOL_TRANSFORM}, and bend along a path with deform paths.
+
 @@ deform-brush | Deform brushes
 For places that need broad, soft adjustment, such as hair and face contours, the deform brush pushes the shape around like a brush, much faster than dragging point by point. It changes only geometry, not the texture.
 ## How to use
@@ -1500,6 +1694,10 @@ Open the **Animation Editor** from the **Windows** menu, or use the **Animation*
 | Loop | Export as a looping motion |
 | Snap to Frames | Align to whole frames when dragging keyframes and the playhead |
 | Dopesheet / Curves | Switch between [[timeline-basic-operation-dopesheet]] and [[grapheditor]] |
+| Hide Shy / Bookmarks | See [[timeline-basic-operation-shy]] and [[parameter-bookmark]] |
+| Trajectory | See [[locus-of-tracks]] |
+| Marker / Close loop | See [[marker]] and [[loop-editing-support]] |
+Each track row also has bookmark, shy and freeze buttons; see [[parameter-bookmark]], [[timeline-basic-operation-shy]] and [[freeze]].
 ## Shortcuts (when the timeline has focus)
 | Action | Key |
 |---|---|
@@ -1507,6 +1705,9 @@ Open the **Animation Editor** from the **Windows** menu, or use the **Animation*
 | Jump to start / end | {key:MOTION_GO_START} / {key:MOTION_GO_END} |
 | Fit the timeline | {key:MOTION_FIT_VIEW} |
 | Zoom / pan the timeline | {kbd:Ctrl+Wheel} / {kbd:Shift+Wheel} |
+| Add / previous / next marker | {key:MOTION_ADD_MARKER} / {key:MOTION_PREV_MARKER} / {key:MOTION_NEXT_MARKER} |
+| Hide shy tracks | {key:MOTION_HIDE_SHY} |
+| Close the loop | {key:MOTION_CLOSE_LOOP} |
 @@ timeline-basic-operation-dopesheet | Basic Dope Sheet Operation
 The dopesheet lays out each track's keyframes as a row of dots and is best for arranging timing: shifting the rhythm, copying a stretch of motion, changing the interpolation in one go. Click **Dopesheet** on the animation editor toolbar to switch here.
 | Operation | How |
@@ -1518,9 +1719,36 @@ The dopesheet lays out each track's keyframes as a row of dots and is best for a
 | Delete | {key:MOTION_DELETE_KEYS}, or **Delete Keys** at the bottom |
 With keyframes selected, the bottom shows **n keys selected**, and you can type the **Time** and **Value** directly and set the interpolation for all of them. One drag or one input is recorded as one history step.
 @@ parameter-bookmark | Parameter Bookmarks
+Once a model has many parameters, bookmark the ones you use: the animation editor can show only their tracks, and they lead the list when you add a track.
+## Use
+| Action | How |
+|---|---|
+| Bookmark / remove | The bookmark button on a track row, or click the row and press {key:MOTION_TOGGLE_BOOKMARK} |
+| Bookmarks only | **Bookmarks** on the toolbar shows only the tracks of bookmarked parameters |
+| Add tracks | In the **Track** menu bookmarked parameters come first, marked ★; **Add bookmarked tracks** adds every bookmarked parameter that has no track yet |
+Bookmarks belong to the whole project and every motion shares them; they are saved with the project but are not model data, so they take no history step and never export.
+*> Unlike Cubism there is one set of bookmarks: a parameter is bookmarked or not.
 @@ timeline-basic-operation-shy | Shy function
+Mark the tracks you don't need to see as **shy**, turn on **Hide Shy**, and the timeline keeps only the tracks you are editing. Shy tracks still play and export.
+## Use
+1. Click the shy button (a lowered eye) on a track row, or click the row and press {key:MOTION_TOGGLE_SHY}.
+2. **Hide Shy** on the toolbar ({key:MOTION_HIDE_SHY}) hides them or shows them again; the track list's header says how many are hidden.
+Shy tracks are kept per motion and saved with the project; they take no history step.
 @@ freeze | Freeze function
+Freezing holds one track at a fixed value while the motion plays or the playhead moves, so you can check the rest on its own: stop the blink, say, and watch the head turn.
+## Use
+1. Move the playhead to a time where the track has the value you want.
+2. Click the freeze button (a snowflake) on the track row, or click the row and press {key:MOTION_TOGGLE_FREEZE}. The track freezes at its value at the playhead: the row shows the value, the dopesheet hatches the track and the curves view draws the value as a dashed line.
+3. Click again to unfreeze.
+While frozen the track's keys cannot be selected, dragged or keyed, and Auto Key passes it by; the keys themselves stay as they are and so does the exported motion. Frozen tracks are kept per motion and saved with the project; they take no history step.
+*> Freezing applies to the motion open in the animation editor; keys edited through MCP are not held back by it.
 @@ timeline-basic-operation-repeat | Animation of parameter repeat
+For a parameter set to [[repeat]], a motion's keys may go past the parameter's range, for motions that keep turning: a wheel with a range of 0–360 keyed 0 at 0 s and 720 at 1 s turns twice a second.
+- Keys may go up to 64 turns past the range; the curves view draws a dashed line at each whole turn.
+- The preview shows the value wrapped into the range; the exported `motion3.json` keeps the keyed values and the runtime wraps them.
+- Keying on the timeline (auto-key too) writes the turn nearest the curve's own value, never the 180 the preview shows for 540.
+- When [[loop-editing-support]] closes a looping motion, such a parameter ends on the next whole turn in the way it is going (0→170 closes at 360), so the spin never winds back; past 64 turns it fails and changes nothing.
+!> Turning the parameter's repeat off or narrowing its range clamps keys past the range to its ends.
 @@ grapheditor | Graph Editor
 The curve view draws a track as a curve of the value over time, used to tune easing and overshoot. It shares the same area, selection and shortcuts as the dopesheet; click **Curves** on the animation editor toolbar to switch.
 ## Operations
@@ -1537,7 +1765,22 @@ The curve view draws a track as a curve of the value over time, used to tune eas
 | Inverse stepped | Jumps to the next key's value immediately and holds it |
 *> The handle time is limited to within its segment (consistent with `AreBeziersRestricted` in `motion3.json`), so the curve shape does not change after export.
 @@ marker | Marker Function
+Markers are named, coloured times on the timeline, to line keys up with a beat, a line of dialogue or another motion.
+## Use
+| Action | How |
+|---|---|
+| Add | The marker button on the toolbar or {key:MOTION_ADD_MARKER} adds one at the playhead (on a whole frame while **Snap to Frames** is on) |
+| Move | Drag its flag on the ruler |
+| Edit | Click its flag: the playhead jumps there and its label, time, colour and **Delete Marker** open |
+| Jump | {key:MOTION_PREV_MARKER} / {key:MOTION_NEXT_MARKER} go to the previous / next marker |
+Markers are kept per motion and saved with the project; they take no history step and never export: they are not `motion3.json` events (for user data see [[userdata]]).
 @@ locus-of-tracks | Track Trajectory
+The trajectory draws, on the preview canvas, the path the selected object takes through the motion: a dot for every frame and a ring at the playhead's frame, to check that a movement's arc is smooth.
+## Use
+1. Open the motion in the animation editor and turn on **Trajectory** on its toolbar.
+2. Select one or more layers (the centre of their meshes is followed) or a deformer (a rotation deformer's pivot, a warp deformer's middle).
+3. Look at the preview canvas; the path follows as you change keys or move the playhead.
+The path follows the motion's keys, frozen tracks held at their value, without physics or mouse tracking.
 @@ template-making-and-management | Animation Templates
 @@ about-fade | About Fading
 Fading decides how smoothly the runtime switches between motions: the new motion takes effect gradually during the fade-in time and the old motion fades out during the fade-out time, so the pose does not jump suddenly.
@@ -1565,7 +1808,8 @@ All motions are written into `Motions` in `model3.json`; `Groups` gets `EyeBlink
 - Bezier handles are limited within the segment (`AreBeziersRestricted: true`), so every SDK version plays them correctly.
 - Parameters driven by physics are not written into the idle animation.
 - Motions unticked in the **Animation** panel are not exported; mesh-only export writes no motions.
-- Motions contain no events (user data events); see [[userdata]].
+- A motion's events are written into the `UserData` of that motion's `motion3.json`; see [[userdata]].
+- Expressions are written as `<model name>.<expression ID>.exp3.json` and listed in the `Expressions` of `model3.json` in the order of the expression list; when there are pose groups, `<model name>.pose3.json` is written too. See [[setting-and-exporting-facial-expressions]] and [[pose-setting]].
 @@ parameter-controller | Parameter Controller
 @@ about-the-parameter-controller | About the parameter controller
 @@ parameter-controller-target-setting | Controller target settings
@@ -1580,6 +1824,15 @@ All motions are written into `Motions` in `model3.json`; `Groups` gets `EyeBlink
 @@ physics-operation-bake | Bake Animation from Physics
 @@ motion-sync-bake | Motion-sync Animation Bake
 @@ loop-editing-support | Loop editing support
+A looping motion (an idle, a walk, a spin) has to end where it starts, or every cycle jumps. With **Loop** on, the timeline shows the seam and mends it.
+## See the seam
+- A band along the foot of the ruler marks the loop, from 0 to the end; outside it the cycles before and after are drawn faintly, curves and keys, so you see at once whether the seam is smooth.
+- A track whose end differs from its start shows its value in the warning colour, and the dopesheet marks the end of its row.
+## Change the loop
+Drag the grip at the end on the ruler to change the loop's length, the same as the toolbar's duration; shortening it removes the keys past the end.
+## Close the loop
+The close-loop button on the toolbar ({key:MOTION_CLOSE_LOOP}) mends every track that is not frozen at once: it keys 0 and the end, the end taking the start's value ([[repeat]] parameters whole turns on in the way they go), and where the segment into the end eases, the end arrives at the slope the start leaves with, so the curve meets itself smoothly. This is one undoable history step.
+*> The loop is the whole motion: `motion3.json` cannot loop part of one.
 @@ export | Export
 @@ exporting-images | Image and video export
 To post a model's motion to social platforms, turn it into stickers or put it in a video, you can export an image sequence, an animation or a video directly. The picture is drawn by the editor's own renderer, with physics advanced between frames, and no Cubism SDK is needed.
@@ -1615,7 +1868,10 @@ To put a model into an application, streaming software or a game, you export emb
 | `<name>.model3.json` | Model settings, referencing the files below |
 | `<name>.physics3.json` | Physics; `Fps` is the project's physics frame rate |
 | `<name>.<motion>.motion3.json` | One per motion; see [[notes-for-sdk]] |
+| `<name>.<expression ID>.exp3.json` | One per expression; see [[setting-and-exporting-facial-expressions]] |
+| `<name>.pose3.json` | Pose groups, written only when there are groups; see [[pose-setting]] |
 | `<name>.cdi3.json` | Display names of parameters, parts and meshes |
+| `<name>.userdata3.json` | Mesh user data, written only when there is some; see [[userdata]] |
 | `<name>.<width>/texture_00.png` etc. | Texture atlas pages; see [[texture-atlas-edit]] |
 | `<name>.cmo3` / `<name>.can3` | Cubism Editor project and Animator project |
 What is exported is the currently committed model; it is not regenerated from the PSD. The Cubism SDK preview in the editor and the moc3 export are the same compilation, so what you see in the preview is the export result.
@@ -1629,7 +1885,7 @@ The same model can be exported directly for VTube Studio, the web, Unity and so 
 ## Runtimes and players
 | Menu item | Output | Main limits |
 |---|---|---|
-| VTube Studio… | The full set of moc3 files + `.vtube.json` | Face tracking maps only standard parameters; one hotkey per motion |
+| VTube Studio… | The full set of moc3 files + `.vtube.json` | Face tracking maps only standard parameters; one hotkey per motion and one toggle hotkey per expression |
 | PSD2Live runtime rig… | `.p2lrt` | Without the data the editor attaches; optional compression, stripping names and so on |
 | Web player… | `index.html`, the player script, the WebAssembly runtime and `.p2lrt` | Must be accessed over http |
 | Unity prefab… | `.p2lunity`, textures and an install script | Needs Unity 6.0 or later; parameters are baked into Blend Shapes and combinations are approximated additively; masks and physics are not written |
@@ -1645,7 +1901,12 @@ User data is a piece of text attached to an ArtMesh that an application can read
 ## Export
 - User data is saved with the project and written into the exported `.cmo3`.
 - When exporting MOC3, if **Include userdata3.json** is ticked (the default) and some mesh has user data filled in, `<name>.userdata3.json` is written and referenced in `model3.json`; without user data this file is not generated.
-*> Motions cannot hold events, and the exported `motion3.json` contains no user data; to notify the application at a moment in a motion, handle it by time on the application side.
+## Motion events
+An event is a piece of text at a moment in a motion: when the SDK plays to that moment it hands the text to the application, for example to play a sound at the top of a wave.
+1. In the Animation panel, expand the settings of a custom motion.
+2. Under **Events**, click **Add event at playhead**; drag the playhead in the Animation Editor first to pick the moment.
+3. Change the time or text; click x to delete. Each change is recorded as one history entry.
+On export the events are written into the `UserData` of that motion's `motion3.json` (`UserDataCount` and `TotalUserDataSize` are updated too), and into the matching frames in the `.can3`. All events and mesh user data can be reviewed in one place in [[userdata-event-information]].
 @@ physics-playlist | Physics Settings and Playlists
 @@ switch-viewer-setting | Physics Settings
 Physics is part of the project: in the **Physics** panel you tune while pulling on the model, changes go into the undo history, and on export they are written to `physics3.json` and `.cmo3` automatically, with no separate Viewer and no separate physics file to save.
@@ -1761,7 +2022,8 @@ The table below lists the main MCP tools by purpose (names in the compact tool s
 | Edit | `workspace_apply_edits`, `workspace_preview_edits`, `rig_deform`, `keyform_apply` | Atomic batch edits, trial runs, editing keyforms |
 | Intent tools | `author_axis`, `author_physics`, `author_compile` | Create parameter-axis shapes and physics groups and fit them in one step |
 | Parameters and preview | `parameter`, `preview_set`, `preview_reset`, `snapshot_*` | Parameters, preview pose and parameter snapshots |
-| Motion | `motion` | Motion clips and keyframes |
+| Motion | `motion` | Motion clips, keyframes and events |
+| Expression / pose | `expression`, `pose` | Expressions (exp3) and pose groups (pose3) |
 | Skeleton / path | `skeleton`, `path` | Skeleton and deform paths |
 | Physics / swing / simulation | `physics`, `swing`, `simulation` | Physics groups, swing, cloth and hair simulation and baking |
 | Painting | `source_paint` | Source layer pixels |
@@ -1772,7 +2034,59 @@ The table below lists the main MCP tools by purpose (names in the compact tool s
 | Other | `workspace_call` | Call operations not published directly as tools |
 @@ viewer | Expressions and Poses
 @@ pose-setting | Pose Settings
+A pose makes a group of parts show only one at a time, such as arm A and arm B, or two outfits. The SDK reads the exported `pose3.json`: on load each group shows its first part, and on switching the new part fades in and the old one fades out within the set time.
+## Setting up pose groups
+1. Open the Animation panel and expand the **Pose** section.
+2. Click **New group** and choose the first part of the group; the first part in a group is marked **Shown first**.
+3. Expand the group and click **Add part** to add the other parts of the group. A part can appear only once across all groups.
+4. For a part that should show and hide together with another (for example the hand of arm A), click **Link** on that row and pick it; click again to unlink.
+5. At the bottom of the section set **Switch fade (s)** (seconds, default 0.5).
+Each change is recorded as one history entry, can be undone, and is saved with the project. When a part is deleted, the group marks it **(missing)** and export skips it.
+## Differences from Cubism
+- It is set in the editor, with no separate Viewer and no separately saved `pose3.json`.
+- The editing canvas and preview do not apply poses: all parts show at their own opacity as usual, and the pose only takes effect when the SDK loads the model.
+- Exporting moc3 writes `<name>.pose3.json` and references it in the `Pose` of `model3.json`; with no groups it is not written.
 @@ facial-expression-system | Facial Expression Mechanism
+An expression is a set of parameter values that the host layers on top of a motion, for example switching to "smile" while the idle motion keeps playing. The SDK reads the exported `exp3.json`, and each parameter is combined with the value the motion gives according to its blend:
+| Blend | Result |
+|---|---|
+| Add | motion value + expression value |
+| Multiply | motion value x expression value |
+| Overwrite | expression value, motion ignored |
+When switching expressions, the new one fades in during its fade-in time and the old one fades out during its fade-out time, so you do not need a separate motion for each mood.
+## Standard expressions
+A generated model comes with four standard expressions (Smile, Sad, Angry, Surprised, named in the interface language), made from the mouth shape, eye opening and eyebrow parameters the model already has; missing parameters are left out automatically. An imported CMO3 model has no standard expressions. The first time you change the expression list (create, delete or edit any), the standard expressions are taken into the project as ordinary expressions and from then on only the project's expressions are exported; choose **Back to standard expressions** in the expression's right-click menu to return to the automatically generated set.
+## When a parameter is deleted or its range changes
+Deleting a parameter also deletes its entry in the expressions; narrowing a parameter's range pulls Overwrite values into the new range.
 @@ create-facial-expressions | Create Facial Expressions in Animation View
+Expressions are made straight from the parameter state: pose the face the way you want on the Parameters panel or the canvas, then save it as an expression.
+## New from the current parameters
+1. Adjust the expression on the Parameters panel (eyes, eyebrows, mouth and so on). While a motion plays in the preview, the values currently shown in the panel are taken.
+2. In the Animation panel toolbar click **+** and choose **New expression from current parameters**.
+3. Every parameter that differs from its default becomes an Add entry whose value is the difference from the default, matching the starting point of making expressions in Cubism's animation view.
+## Other ways to create
+- **New expression from snapshot**: uses the values of a parameter snapshot saved in the snapshot bar of the Parameters panel; the expression takes the snapshot's name.
+- **New empty expression**: an expression with no parameters, which the host can reset to as "no expression".
+- Right-click an existing expression and choose **Set from current parameters** to regenerate all its entries from the current parameters.
+## Previewing
+Click the eye icon at the right of an expression row (or right-click and choose **Preview on the parameters**); the expression is applied to the current parameters by its blends, so you see the effect directly on the canvas and in the preview. This changes only the preview parameters and is not recorded in history.
 @@ setting-and-exporting-facial-expressions | Expression Settings and Export
+Each expression's entries, blends and fades are set in the **Expressions** section of the Animation panel and written automatically on export.
+## Settings
+1. Click an expression row to expand its settings.
+2. **Fade In Time** and **Fade Out Time**: the seconds taken to switch to and away from this expression (default 0.5).
+3. Each entry is one row: parameter name, blend buttons (Add / Multiply / Overwrite), value, remove. When you change the blend without changing the value, the value is converted so that the parameter default gives the same result.
+4. **Add parameter** adds a parameter that is not set yet.
+5. The right-click menu can rename, duplicate, **Move up** / **Move down** and delete. The order of expressions is the order in `model3.json`.
+Each change is recorded as one history entry, can be undone, and is saved with the project.
+## Export
+- Exporting moc3 writes each expression as `<name>.<expression ID>.exp3.json` (`Type`, `FadeInTime`, `FadeOutTime`, `Parameters`) and references it by name in the `Expressions` of `model3.json`. Parameters that no longer exist in the model are skipped; an expression with no entries is still written.
+- The VTube Studio package adds a hotkey per expression that toggles it.
+- The PSD2Live runtime model (`.p2lrt`) and the web player carry the expressions as well.
+- `.cmo3` / `.can3` do not store expressions, and the export report says so; to hand them to the SDK, export moc3.
+*> Mesh-only export writes no expressions or poses.
 @@ userdata-event-information | Check User Data and Event Information
+The **User data and events** section at the bottom of the Animation panel lists in one place all the text the host can receive from the model: each motion's events (motion name, time, value) and each ArtMesh's user data (mesh name, value).
+- Click an event to open that motion and move the playhead to that moment.
+- Events are edited in a custom motion's settings and mesh user data in the Inspector; see [[userdata]].
+- After export, events are in each motion's `motion3.json` `UserData` and mesh user data is in `userdata3.json`.

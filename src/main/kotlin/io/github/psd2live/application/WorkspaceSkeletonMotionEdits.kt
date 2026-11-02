@@ -5,6 +5,7 @@ import io.github.psd2live.core.BoneEnd
 import io.github.psd2live.core.MotionClip
 import io.github.psd2live.core.MotionClips
 import io.github.psd2live.core.MotionCurve
+import io.github.psd2live.core.MotionEvent
 import io.github.psd2live.core.MotionHandle
 import io.github.psd2live.core.MotionInterpolation
 import io.github.psd2live.core.MotionKey
@@ -64,6 +65,10 @@ internal object WorkspaceSkeletonMotionEdits {
         ranges: Map<String, ClosedFloatingPointRange<Float>>,
         skeleton: SkeletonSpec?,
         presets: Map<String, MotionPresetSettings> = emptyMap(),
+        /** The values keys may hold: [ranges], widened for repeating parameters. */
+        limits: Map<String, ClosedFloatingPointRange<Float>> = ranges,
+        parameters: List<org.umamo.runtime.model.Parameter> = emptyList(),
+        renames: Map<String, String> = emptyMap(),
     ): List<MotionClip> {
         val mode = request.requiredText("mode")
         val next = when (mode) {
@@ -73,7 +78,7 @@ internal object WorkspaceSkeletonMotionEdits {
                 val builtin = request["from_builtin"]?.jsonPrimitive?.content
                 require(builtin == null || builtin in MotionClips.BUILTIN_NAMES) { "Unknown generated motion" }
                 val source = builtin?.let { MotionClips.overrideOf(current, it) ?: MotionPresets.clip(id, it, skeleton,
-                    (presets[it] ?: MotionPresetSettings()).copy(deleted = false)) }
+                    (presets[it] ?: MotionPresetSettings()).copy(deleted = false), renames) }
                 val name = request["name"]?.jsonPrimitive?.content ?: builtin ?: "New motion"
                 val clip = source?.copy(id = id, name = MotionClips.uniqueName(current, name), builtin = null, enabled = true)
                     ?: MotionClip(id, MotionClips.uniqueName(current, name))
@@ -100,8 +105,8 @@ internal object WorkspaceSkeletonMotionEdits {
                     duration = duration, fps = request["fps"]?.jsonPrimitive?.float ?: source.fps,
                     fadeIn = request["fade_in"]?.jsonPrimitive?.float ?: source.fadeIn,
                     fadeOut = request["fade_out"]?.jsonPrimitive?.float ?: source.fadeOut,
-                    enabled = request["enabled"]?.jsonPrimitive?.boolean ?: source.enabled,
-                    curves = if (duration != source.duration) MotionKeyEdits.withDuration(source, duration).curves else source.curves)
+                    enabled = request["enabled"]?.jsonPrimitive?.boolean ?: source.enabled)
+                    .let { if (duration != source.duration) MotionKeyEdits.withDuration(it.copy(duration = source.duration), duration) else it }
                 current.map { if (it.id == source.id) updated else it }
             }
             "put" -> {
@@ -152,6 +157,23 @@ internal object WorkspaceSkeletonMotionEdits {
                     if (kept.isEmpty()) emptyList() else listOf(MotionCurve(parameter, kept)))
                 current.map { if (it.id == clip.id) updated else it }
             }
+            "set_event" -> {
+                val clip = requireClip(current, request.requiredText("id"))
+                val event = MotionEvent(request.getValue("time").jsonPrimitive.float, request.requiredText("value"))
+                require(event.value.isNotEmpty()) { "An event needs a value" }
+                require(event.time <= clip.duration + MotionClips.TIME_EPSILON) { "Event time must lie within the clip" }
+                // Moving an event takes it from its old time first; one at the new time is replaced.
+                val from = request["from_time"]?.jsonPrimitive?.float
+                require(from == null || clip.events.any { abs(it.time - from) < MotionClips.TIME_EPSILON }) { "Motion event not found at $from" }
+                val kept = if (from == null) clip.events else clip.events.filterNot { abs(it.time - from) < MotionClips.TIME_EPSILON }
+                current.map { if (it.id == clip.id) clip.copy(events = MotionClips.normalizedEvents(kept + event.copy(time = event.time.coerceAtMost(clip.duration)))) else it }
+            }
+            "delete_event" -> {
+                val clip = requireClip(current, request.requiredText("id"))
+                val time = request.getValue("time").jsonPrimitive.float
+                require(clip.events.any { abs(it.time - time) < MotionClips.TIME_EPSILON }) { "Motion event not found at $time" }
+                current.map { if (it.id == clip.id) clip.copy(events = clip.events.filterNot { e -> abs(e.time - time) < MotionClips.TIME_EPSILON }) else it }
+            }
             "remove_curve" -> {
                 val clip = requireClip(current, request.requiredText("id"))
                 val parameter = request.requiredText("parameter")
@@ -169,7 +191,7 @@ internal object WorkspaceSkeletonMotionEdits {
                     "pose" -> MotionKeyEdits.pose(clip, request.getValue("values").jsonObject.mapValues { it.value.jsonPrimitive.float },
                         request.getValue("time").jsonPrimitive.float)
                     "move_keys" -> MotionKeyEdits.move(clip, selection, request.getValue("dt").jsonPrimitive.float,
-                        request["dv"]?.jsonPrimitive?.float ?: 0f, ranges, request["normalized"]?.jsonPrimitive?.boolean ?: false).first
+                        request["dv"]?.jsonPrimitive?.float ?: 0f, ranges, request["normalized"]?.jsonPrimitive?.boolean ?: false, limits).first
                     "delete_keys" -> MotionKeyEdits.delete(clip, selection)
                     "paste_keys" -> MotionKeyEdits.paste(clip, request.getValue("keys").jsonArray.map {
                         val key = it.jsonObject; key.requiredText("parameter") to parseKey(key.getValue("key").jsonObject)
@@ -188,9 +210,16 @@ internal object WorkspaceSkeletonMotionEdits {
                 }
                 current.map { if (it.id == clip.id) next else it }
             }
+            "close_loop" -> {
+                val clip = requireClip(current, request.requiredText("id"))
+                val chosen = request["parameters"]?.jsonArray?.mapTo(LinkedHashSet()) { it.jsonPrimitive.content }
+                chosen?.forEach { require(clip.curve(it) != null) { "Motion curve not found: $it" } }
+                val closed = io.github.psd2live.core.MotionLoops.closeLoop(clip, parameters, chosen)
+                current.map { if (it.id == clip.id) closed else it }
+            }
             else -> error("Unknown motion mode: $mode")
         }
-        return validated(next, ranges)
+        return validated(next, limits)
     }
 
     /** Generated-motion knobs and lifecycle share the same candidate as timeline edits. */
@@ -217,7 +246,10 @@ internal object WorkspaceSkeletonMotionEdits {
         return document.copy(rigEdits = document.rigEdits.copy(motionPresets = presets, motionClips = clips))
     }
 
-    /** [next] once every clip is known to fit the model's parameters and the limits a request may not pass. */
+    /**
+     * [next] once every clip is known to fit the model's parameters and the limits a request may not pass. [ranges] are
+     * the values a key may hold ([io.github.psd2live.core.MotionLoops.keyLimits]).
+     */
     fun validated(next: List<MotionClip>, ranges: Map<String, ClosedFloatingPointRange<Float>>): List<MotionClip> {
         require(next.map { it.id }.distinct().size == next.size) { "Duplicate motion IDs" }
         require(next.mapNotNull { it.builtin }.distinct().size == next.count { it.builtin != null }) { "Duplicate built-in override" }

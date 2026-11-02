@@ -40,7 +40,9 @@ internal object WorkspaceDepthSplitEdits {
             val frozen = WorkspaceLayerInsertionEdits.freeze(document, model)
             val placed = WorkspaceArtPrimitives.replaceLayer(frozen, model, slices.sourceLayerId, listOf(slices.front, slices.back),
                 listOf(Side.NONE, Side.NONE))
-            val overlay = MeshGenerationBaseline.preserve(frozen.rigEdits.copy(simEdits = slices.simulations.simEdits), model.config)
+            // Both slices take the source's place in its hit areas.
+            val overlay = RigHitAreas.replacingMeshes(MeshGenerationBaseline.preserve(frozen.rigEdits.copy(simEdits = slices.simulations.simEdits), model.config),
+                mapOf(requireNotNull(slices.source).raw to slices.sliceIds.map { it.raw }))
             val layers = listOf(slices.back.id.raw, slices.front.id.raw)
             fun documentWith(placed: WorkspaceDocument, rigEdits: RigEditOverlay, parents: Map<String, String?>) = placed.copy(
                 layerOverrides = placed.layerOverrides + layers.associateWith { slices.classification },
@@ -72,7 +74,9 @@ internal object WorkspaceDepthSplitEdits {
         return document.copy(source = WorkspaceSourceArt(document.source.widthPx, document.source.heightPx,
             document.source.layers + front, document.source.groups), layerVisibility = prepared.config.layerVisibility,
             layerOverrides = prepared.config.layerOverrides, parentOverrides = prepared.config.parentOverrides,
-            meshOverrides = prepared.config.meshOverrides, rigEdits = RigLayerDeletion.preserve(model, prepared.config),
+            // The source stays as the back slice; the front joins it in its hit areas.
+            meshOverrides = prepared.config.meshOverrides, rigEdits = RigHitAreas.replacingMeshes(RigLayerDeletion.preserve(model, prepared.config),
+                mapOf(sourceId to listOf(sourceId, frontMeshId))),
             generationSource = if (prepared.config.rigEdits.importedCmo3 == null) document.generationSource else document.generationSource ?: document.source,
             settings = JsonObject(document.settings + ("drawOrderOverrides" to JsonObject(prepared.config.drawOrderOverrides.mapValues { JsonPrimitive(it.value) }))))
     }

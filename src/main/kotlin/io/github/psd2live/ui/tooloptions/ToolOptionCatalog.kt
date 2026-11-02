@@ -46,12 +46,26 @@ internal val BRUSH_FALLOFF = ChoiceOption("brush.falloff", "editor.falloff", { B
 
 internal val BRUSH_CONNECTED = ToggleOption("brush.connected", "editor.connectedOnly", { it.connectedOnly }, { e, on -> e.connectedOnly = on })
 
+internal val TEMPORARY_WARP_DIVISIONS = ChoiceOption("tempWarp.divisions", "editor.tempWarp.divisions", { (1..4).toList() },
+    { _, n -> "$n×$n" }, { it.temporaryWarpDivisions }, { e, n -> e.changeTemporaryWarpDivisions(n) })
+
+internal val SOFT_SELECTION = ToggleOption("soft.selection", "editor.softSelection", { it.softSelection }, { e, on -> e.softSelection = on })
+
+internal val SOFT_RADIUS = SliderOption("soft.radius", "editor.softRadius", OptionUnit.PX, { 1f..it },
+    { it.softRadius }, { e, v -> e.softRadius = v }, logarithmic = true, role = OptionRole.SIZE)
+
 internal val INFLATE_DIRECTION = ChoiceOption("brush.inflate", "editor.tool.inflate", { listOf(false, true) },
     { _, shrink -> tr(if (shrink) "editor.inflate.shrink" else "editor.inflate.grow") },
     { it.inflateInvert }, { e, shrink -> e.inflateInvert = shrink })
 
-internal val KNIFE_SNAP = SliderOption("knife.snap", "editor.knifeSnapRadius", OptionUnit.PX, { 3f..30f },
+/** Points and lines snap through one radius, so both faces of the point tool place a vertex by one rule. */
+internal val POINT_SNAP = SliderOption("point.snap", "editor.knifeSnapRadius", OptionUnit.PX, { 3f..30f },
     { it.knifeSnapRadius }, { e, v -> e.knifeSnapRadius = v }, step = 1f, integer = true)
+
+internal val POINT_SPACING = SliderOption("point.spacing", "editor.pointSpacing", OptionUnit.PX, { 4f..200f },
+    { it.pointSpacing }, { e, v -> e.pointSpacing = v }, logarithmic = true, role = OptionRole.SIZE)
+
+internal val POINT_MIRROR = ToggleOption("point.mirror", "editor.pointMirror", { it.pointMirror }, { e, on -> e.pointMirror = on })
 
 internal val GLUE_DISTANCE = SliderOption("glue.distance", "editor.glueDistance", OptionUnit.PX, { 0.5f..200f },
     { it.glueDistance }, { e, v -> e.glueDistance = v }, logarithmic = true, role = OptionRole.SIZE)
@@ -77,6 +91,9 @@ internal val SKELETON_WEIGHT_VALUE = SliderOption("skeleton.weightValue", "skele
 
 internal val BRUSH_TIP = ChoiceOption("variant.brushTip", "editor.brushShape", { BrushShape.entries }, { _, s -> tr(s.labelKey) },
     { it.brushShape }, { e, s -> e.brushShape = s }, variant = true, place = OptionPlace.MENU)
+
+internal val MESH_POINT_MODE = ChoiceOption("variant.meshPoint", "editor.tool.mesh_point", { io.github.psd2live.ui.MeshPointMode.entries },
+    { _, m -> tr(m.labelKey) }, { it.meshPointMode }, { e, m -> e.selectMeshPointMode(m) }, variant = true, place = OptionPlace.MENU)
 
 internal val PAINT_SHAPE_KIND = ChoiceOption("variant.paintShape", "editor.tool.paint_shape", { io.github.psd2live.ui.PaintShape.entries },
     { _, s -> tr(s.labelKey) }, { it.paintShape }, { e, s -> e.selectPaintShape(s) }, variant = true, place = OptionPlace.MENU)
@@ -114,6 +131,46 @@ internal val PAINT_TOLERANCE = SliderOption("paint.tolerance", "editor.tolerance
 internal val PAINT_FILL = ChoiceOption("paint.fill", "editor.tool.paint_shape", { listOf(false, true) },
     { _, filled -> tr(if (filled) "editor.filled" else "editor.outline") }, { it.paintShapeFilled }, { e, f -> e.paintShapeFilled = f })
 
+// Painting assists, the selection, the gradient and the blur tip.
+
+internal val PAINT_STABILIZER = SliderOption("paint.stabilizer", "editor.paint.stabilizer", OptionUnit.COUNT,
+    { 0f..io.github.psd2live.core.PaintStabilizer.MAX_LEVEL.toFloat() }, { it.paintStabilizer.toFloat() },
+    { e, v -> e.paintStabilizer = v.toInt() }, step = 1f, integer = true)
+
+internal val PAINT_SYMMETRY = ChoiceOption("paint.symmetry", "editor.paint.symmetry", { io.github.psd2live.ui.PAINT_SYMMETRY_LABELS.map { it.first } },
+    { _, m -> tr(io.github.psd2live.ui.PAINT_SYMMETRY_LABELS.first { it.first == m }.second) }, { it.paintSymmetry },
+    { e, m -> e.paintSymmetry = m }, inline = false)
+
+internal val PAINT_LOCK_ALPHA = ToggleOption("paint.lockAlpha", "editor.paint.lockAlpha", { it.paintLockAlpha }, { e, on -> e.paintLockAlpha = on })
+
+internal val PAINT_CONTIGUOUS = ToggleOption("paint.contiguous", "editor.paint.contiguous", { it.paintContiguous }, { e, on -> e.paintContiguous = on })
+
+internal val PAINT_SELECT_KIND = ChoiceOption("variant.paintSelect", "editor.tool.paint_select", { io.github.psd2live.ui.PaintSelectShape.entries },
+    { _, s -> tr(s.labelKey) }, { it.paintSelectShape }, { e, s -> e.paintSelectShape = s }, variant = true, place = OptionPlace.MENU)
+
+internal val PAINT_SELECT_OP = ChoiceOption("paint.selectOp", "editor.paintSelect.op", { io.github.psd2live.ui.PAINT_SELECT_OP_LABELS.map { it.first } },
+    { _, op -> tr(io.github.psd2live.ui.PAINT_SELECT_OP_LABELS.first { it.first == op }.second) }, { it.paintSelectOp },
+    { e, op -> e.paintSelectOp = op }, inline = false)
+
+internal val PAINT_FEATHER = SliderOption("paint.feather", "editor.paintSelect.feather", OptionUnit.PX, { 1f..256f },
+    { it.paintFeather }, { e, v -> e.paintFeather = v }, logarithmic = true)
+
+internal val PAINT_SELECT_GROW = SliderOption("paint.selectGrow", "editor.paintSelect.grow", OptionUnit.PX, { 1f..256f },
+    { it.paintSelectGrow }, { e, v -> e.paintSelectGrow = v }, logarithmic = true)
+
+internal val PAINT_TRANSFORM_SMOOTH = ToggleOption("paint.transformSmooth", "editor.paintTransform.smooth",
+    { it.paintTransformSmooth }, { e, on -> e.paintTransformSmooth = on })
+
+internal val PAINT_GRADIENT_KIND = ChoiceOption("paint.gradientKind", "editor.paintGradient.kind", { listOf(false, true) },
+    { _, radial -> tr(if (radial) "editor.paintGradient.radial" else "editor.paintGradient.linear") }, { it.paintGradientRadial },
+    { e, radial -> e.paintGradientRadial = radial })
+
+internal val PAINT_GRADIENT_END = ChoiceOption("paint.gradientEnd", "editor.paintGradient.end", { io.github.psd2live.ui.PaintGradientEnd.entries },
+    { _, end -> tr(end.labelKey) }, { it.paintGradientEnd }, { e, end -> e.paintGradientEnd = end })
+
+internal val PAINT_BLUR_STRENGTH = SliderOption("paint.blurStrength", "editor.strength", OptionUnit.PERCENT, { 0.05f..1f },
+    { it.paintBlurStrength }, { e, v -> e.paintBlurStrength = v }, role = OptionRole.OPACITY)
+
 // ─── The catalog ────────────────────────────────────────────────────────────
 
 /** The options of the tool in hand on [editor], in bar order. Empty when the tool has nothing to set or do. */
@@ -133,6 +190,14 @@ internal fun toolOptions(editor: CanvasEditor): List<ToolOption> = buildList {
         }
         CanvasTool.GLUE -> {
             addGlue(editor)
+            return@buildList
+        }
+        CanvasTool.INTERIOR -> {
+            addInterior(editor)
+            return@buildList
+        }
+        CanvasTool.FEATURE -> {
+            addFeature(editor)
             return@buildList
         }
         else -> Unit
@@ -235,7 +300,9 @@ internal fun CanvasEditor.pickVariant(n: Int): Boolean {
         tool == CanvasTool.GLUE -> pick(GlueSubTool.entries) { glueSubTool = it }
         tool == CanvasTool.SKELETON_EDIT -> pick(SkeletonEditSubTool.entries) { skeletonEditSubTool = it }
         tool == CanvasTool.SKELETON_POSE -> pick(SkeletonPoseSubTool.entries) { skeletonPoseSubTool = it }
+        tool == CanvasTool.MESH_POINT -> pick(io.github.psd2live.ui.MeshPointMode.entries) { selectMeshPointMode(it) }
         tool == CanvasTool.PAINT_SHAPE -> pick(io.github.psd2live.ui.PaintShape.entries) { selectPaintShape(it) }
+        tool == CanvasTool.PAINT_SELECT -> pick(io.github.psd2live.ui.PaintSelectShape.entries) { paintSelectShape = it }
         else -> false
     }
 }
@@ -283,7 +350,7 @@ private fun MutableList<ToolOption>.addGlue(editor: CanvasEditor) {
  * submenu, then the selection.
  */
 private fun MutableList<ToolOption>.addObjectMode(editor: CanvasEditor) {
-    val target = editor.target()
+    val target = editor.selectionTarget()
     if (target?.kind == "mesh") addLayerActions(editor, editor.targetLayerId(target), target.id)
     if (target?.kind == "mesh" || target?.kind == "warp") {
         add(SectionOption("object.create", "editor.toolbar.create", OptionPlace.MENU, submenu = true, icon = OptionIcon.CREATE, alwaysFolds = true))
@@ -363,7 +430,7 @@ private fun createAction(id: String, labelKey: String, icon: OptionIcon, kind: C
         e.target()?.id?.let { meshId -> e.beginTreeCreate(kind, relation, false, meshId) }
     }, icon, place = OptionPlace.MENU)
 
-private fun MutableList<ToolOption>.addSelectionActions(objectMode: Boolean) {
+private fun MutableList<ToolOption>.addSelectionActions(objectMode: Boolean, mesh: Boolean = false) {
     add(SectionOption("selection", "editor.selectionMode", OptionPlace.MENU, submenu = true, icon = OptionIcon.SELECTION))
     add(ActionOption("selection.all", "shortcut.selectAll", { it.editable }, { it.selectAll(invert = false) }, OptionIcon.SELECT_ALL,
         place = OptionPlace.MENU))
@@ -372,6 +439,12 @@ private fun MutableList<ToolOption>.addSelectionActions(objectMode: Boolean) {
     if (!objectMode) {
         add(ActionOption("selection.linked", "shortcut.selectLinked", { it.editable && it.vertices.isNotEmpty() }, { it.selectLinked() },
             OptionIcon.LINKED, place = OptionPlace.MENU))
+    }
+    if (mesh) {
+        add(ActionOption("selection.outline", "editor.selectOutline", { it.editable }, { it.selectOutline() }, OptionIcon.SELECTION,
+            place = OptionPlace.MENU))
+        add(ActionOption("selection.inner", "editor.selectInner", { it.editable }, { it.selectOutline(inner = true) }, OptionIcon.SELECTION,
+            place = OptionPlace.MENU))
     }
     add(ActionOption("selection.none", "editor.deselect",
         { if (objectMode) it.objects.isNotEmpty() else it.vertices.isNotEmpty() },
@@ -384,7 +457,7 @@ private fun MutableList<ToolOption>.addSelectionActions(objectMode: Boolean) {
 /** Deform and Edit: the pose a deformation keys, the brush or edit tool in hand, then topology and the selection. */
 private fun MutableList<ToolOption>.addPointModes(editor: CanvasEditor) {
     val editing = editor.hierarchyMode == EditHierarchyMode.EDIT
-    val target = editor.target()
+    val target = editor.selectionTarget()
     val mesh = target?.kind == "mesh"
     if (mesh && (editor.tool in SELECTION_TOOLS || editor.tool == CanvasTool.TRANSFORM)) add(ELEMENT_MODE)
     when (editor.tool) {
@@ -404,8 +477,14 @@ private fun MutableList<ToolOption>.addPointModes(editor: CanvasEditor) {
             add(ActionOption("subdivide.run", "editor.subdivide", { it.editable && it.vertices.isNotEmpty() }, { it.topology("subdivide") },
                 OptionIcon.SUBDIVIDE, primary = true))
         }
-        CanvasTool.KNIFE -> {
-            add(KNIFE_SNAP)
+        CanvasTool.MESH_POINT -> if (editor.meshPointMode == io.github.psd2live.ui.MeshPointMode.POINT) {
+            add(MESH_POINT_MODE)
+            add(POINT_SPACING)
+            add(POINT_SNAP)
+            add(POINT_MIRROR)
+        } else {
+            add(MESH_POINT_MODE)
+            add(POINT_SNAP)
             add(ActionOption("knife.finish", "editor.finishCut", { it.editable && it.knifeDraft.size >= 2 }, { it.finishKnife() },
                 OptionIcon.CONFIRM, primary = true, place = OptionPlace.TOP))
             add(ActionOption("knife.undoPoint", "editor.undoPoint", { !it.busy && it.knifeDraft.isNotEmpty() }, { it.undoDraftPoint() },
@@ -414,18 +493,41 @@ private fun MutableList<ToolOption>.addPointModes(editor: CanvasEditor) {
         }
         else -> Unit
     }
-    if (editing && mesh && editor.tool != CanvasTool.KNIFE) {
+    // Deform's soft selection: the points around the picked ones follow a drag of them.
+    if (!editing && target?.kind != "rotation" && (editor.tool in SELECTION_TOOLS || editor.tool == CanvasTool.TRANSFORM)) {
+        add(SOFT_SELECTION)
+        if (editor.softSelection) {
+            add(SOFT_RADIUS)
+            add(BRUSH_FALLOFF)
+        }
+    }
+    if (editing && mesh && !editor.knifing) {
         add(SectionOption("topology", "editor.topology", OptionPlace.MENU, submenu = true, icon = OptionIcon.TOPOLOGY))
         for (action in TOPOLOGY_ACTIONS) {
             if (editor.tool == CanvasTool.SUBDIVIDE && action.first == "subdivide") continue
             add(ActionOption("topology.${action.first}", "editor.${action.first}", { it.editable && it.vertices.isNotEmpty() },
                 { it.topology(action.first) }, action.second, danger = action.first == "delete", place = OptionPlace.MENU))
         }
+        add(ActionOption("topology.delete_edges", "editor.delete_edges", { it.editable && it.elementMode == 1 && it.selectedEdges.isNotEmpty() },
+            { it.topology("delete_edges") }, OptionIcon.DELETE, danger = true, place = OptionPlace.MENU))
+        // No selection re-triangulates the whole mesh, so this one is on whenever the mesh can be edited.
+        add(ActionOption("topology.retriangulate", "editor.retriangulate", { it.editable }, { it.topology("retriangulate") },
+            OptionIcon.TOPOLOGY, place = OptionPlace.MENU))
         // The whole mesh, made again from the layer's pixels, beside the edits to its points.
         addLayerActions(editor, editor.targetLayerId(target), target?.id)
     }
-    if (!editing && target != null) addKeyformMirror()
-    if (editor.tool in SELECTION_TOOLS || editor.tool == CanvasTool.TRANSFORM) addSelectionActions(objectMode = false)
+    if (!editing && editor.activeTemporaryWarp() != null) {
+        add(TEMPORARY_WARP_DIVISIONS)
+        add(ActionOption("tempWarp.end", "editor.tempWarp.end", { true }, { it.endTemporaryWarp() }, OptionIcon.CONFIRM, primary = true, place = OptionPlace.TOP))
+    } else if (!editing && editor.canBeginTemporaryWarp()) {
+        add(ActionOption("tempWarp.begin", "editor.tempWarp.begin", { it.editable }, { it.beginTemporaryWarp() }, OptionIcon.WARP, place = OptionPlace.MENU))
+    }
+    if (!editing && target != null) {
+        addKeyformTools(editor)
+        addKeyformMirror()
+    }
+    if (editor.tool in SELECTION_TOOLS || editor.tool == CanvasTool.TRANSFORM || (editor.tool == CanvasTool.MESH_POINT && !editor.knifing))
+        addSelectionActions(objectMode = false, mesh = mesh)
 }
 
 /**
@@ -445,6 +547,39 @@ private fun MutableList<ToolOption>.addKeyformMirror() {
     )) add(ActionOption("mirror.${action.name.lowercase()}", labelKey, { it.editable && it.keyformMirrorPlan(action) != null },
         { it.mirrorKeyform(action) }, OptionIcon.MIRROR, labelArgs = { e -> listOf(e.keyformMirrorPlan(action)?.label ?: "…") },
         place = OptionPlace.MENU))
+}
+
+/**
+ * Deform: the keyform tools, in one submenu - copy the shapes in hand, paste the copied ones onto the keys in hand
+ * (or with options: what to carry, a blend ratio, a flip and which shape goes where), reset the key to its default-key
+ * shape (a mesh also to its rest), interpolate it from the keys on either side along each parameter it sits between
+ * keys of, restore every key of the object, and edit the opacity, draw order and colours of many keyforms at once.
+ * With points picked, the shape rows keep to them, as the rows say.
+ */
+private fun MutableList<ToolOption>.addKeyformTools(editor: CanvasEditor) {
+    add(SectionOption("keyform", "editor.keyform.menu", OptionPlace.MENU, submenu = true, icon = OptionIcon.KEYFORM, alwaysFolds = true))
+    fun scope(e: CanvasEditor): String = e.keyformPointCount().let { if (it > 0) tr("editor.keyform.points", it) else "" }
+    // Why the shape rows are off: nothing bound yet, or the pose between keys.
+    add(NoteOption("keyform.offKey", { it.keyformOffKeyNote() }, warning = { true }, place = OptionPlace.MENU))
+    fun tool(id: String, labelKey: String, icon: OptionIcon, action: CanvasEditor.KeyformToolAction, parameter: String? = null,
+             args: (CanvasEditor) -> List<Any> = { listOf(scope(it)) }) =
+        ActionOption("keyform.$id", labelKey, { it.editable && it.keyformToolCommands(action, parameter).isNotEmpty() },
+            { it.runKeyformTool(action, parameter) }, icon, labelArgs = args, place = OptionPlace.MENU)
+    add(ActionOption("keyform.copy", "editor.keyform.copy", { it.canCopyKeyform() }, { it.copyKeyform() }, OptionIcon.DUPLICATE, place = OptionPlace.MENU))
+    add(tool("paste", "editor.keyform.paste", OptionIcon.KEYFORM_PASTE, CanvasEditor.KeyformToolAction.PASTE) { e ->
+        listOf(e.keyformClipboardLabel(), scope(e))
+    })
+    add(ActionOption("keyform.pasteOptions", "editor.keyform.pasteOptions", { it.editable && it.keyformClipboard.isNotEmpty() },
+        { e -> io.github.psd2live.ui.components.KeyformDialogs.request = io.github.psd2live.ui.components.KeyformDialogs.Request.Paste(e) },
+        OptionIcon.KEYFORM_PASTE, place = OptionPlace.MENU, opensDialog = true))
+    add(tool("resetDefault", "editor.keyform.resetDefault", OptionIcon.RESET, CanvasEditor.KeyformToolAction.RESET_DEFAULT))
+    if (editor.selectionTarget()?.kind == "mesh") add(tool("resetRest", "editor.keyform.resetRest", OptionIcon.RESET, CanvasEditor.KeyformToolAction.RESET_REST))
+    for (parameter in editor.keyformInterpolationAxes()) add(tool("interpolate.$parameter", "editor.keyform.interpolate", OptionIcon.INTERPOLATE,
+        CanvasEditor.KeyformToolAction.INTERPOLATE, parameter) { e -> listOf(e.parameterLabel(parameter), scope(e)) })
+    add(tool("restore", "editor.keyform.restore", OptionIcon.RESET, CanvasEditor.KeyformToolAction.RESTORE) { emptyList() })
+    add(ActionOption("keyform.multiKey", "editor.keyform.multiKey", { it.editable && it.multiKeyTargets().isNotEmpty() },
+        { e -> io.github.psd2live.ui.components.KeyformDialogs.request = io.github.psd2live.ui.components.KeyformDialogs.Request.MultiKey(e) },
+        OptionIcon.KEYFORM, place = OptionPlace.MENU, opensDialog = true))
 }
 
 private val TOPOLOGY_ACTIONS = listOf(
@@ -506,31 +641,141 @@ private fun MutableList<ToolOption>.addSkeleton(editor: CanvasEditor) {
     }
 }
 
+/** What every stroke tool offers past its tip: the stabilizer, the mirror and - for the colour tips - lock transparency. */
+private fun MutableList<ToolOption>.addStrokeAssists(lockAlpha: Boolean) {
+    add(PAINT_STABILIZER)
+    add(PAINT_SYMMETRY)
+    if (lockAlpha) add(PAINT_LOCK_ALPHA)
+}
+
 private fun MutableList<ToolOption>.addPaint(editor: CanvasEditor) {
     // Paint mode cannot start without a layer, so until one is picked that is all the bar has to say.
     add(NoteOption("paint.layer", { if (it.paintSession == null) tr("editor.paintSelectLayerHint") else null }, warning = { true }))
+    // A selection softer than half everywhere still confines the tools, though it has no edge to show.
+    add(NoteOption("paint.faintSelection", { e -> e.paintSession?.takeIf { it.hasSelection && it.selectionOutline.isEmpty() }
+        ?.let { tr("editor.paintSelect.faint") } }, warning = { true }))
     when (editor.tool) {
         CanvasTool.PAINT_BRUSH, CanvasTool.PAINT_ERASER -> {
             add(PAINT_BRUSH_SIZE)
             add(PAINT_HARDNESS)
             add(PAINT_OPACITY)
+            addStrokeAssists(lockAlpha = true)
         }
         CanvasTool.PAINT_PENCIL -> {
             add(PAINT_BRUSH_SIZE)
             add(PAINT_OPACITY)
+            addStrokeAssists(lockAlpha = true)
         }
-        CanvasTool.PAINT_BUCKET -> add(PAINT_TOLERANCE)
+        CanvasTool.PAINT_BLUR -> {
+            add(PAINT_BRUSH_SIZE)
+            add(PAINT_HARDNESS)
+            add(PAINT_BLUR_STRENGTH)
+            addStrokeAssists(lockAlpha = false)
+        }
+        CanvasTool.PAINT_BUCKET -> {
+            add(PAINT_TOLERANCE)
+            add(PAINT_CONTIGUOUS)
+            add(PAINT_LOCK_ALPHA)
+        }
+        CanvasTool.PAINT_GRADIENT -> {
+            add(PAINT_GRADIENT_KIND)
+            add(PAINT_GRADIENT_END)
+            add(PAINT_OPACITY)
+            add(PAINT_LOCK_ALPHA)
+        }
         CanvasTool.PAINT_SHAPE -> {
             add(PAINT_SHAPE_KIND)
             add(PAINT_SHAPE_SIZE)
             add(PAINT_OPACITY)
             if (editor.paintShape.canFill) add(PAINT_FILL)
+            add(PAINT_LOCK_ALPHA)
+        }
+        CanvasTool.PAINT_TRANSFORM -> {
+            add(NoteOption("paint.transformHint", { e -> tr(if (e.paintTransform == null) "editor.paintTransform.start" else "editor.paintTransform.hint") }))
+            add(PAINT_TRANSFORM_SMOOTH)
+            add(ActionOption("paint.transformApply", "editor.paintTransform.apply", { it.paintTransform != null }, { it.applyPaintTransform() },
+                OptionIcon.CONFIRM, primary = true, place = OptionPlace.TOP))
+            add(ActionOption("paint.transformCancel", "action.cancel", { it.paintTransform != null }, { it.cancelPaintTransform() },
+                OptionIcon.CANCEL, place = OptionPlace.TOP))
+        }
+        CanvasTool.PAINT_SELECT -> {
+            add(PAINT_SELECT_KIND)
+            add(PAINT_SELECT_OP)
+            if (editor.paintSelectShape == io.github.psd2live.ui.PaintSelectShape.WAND) {
+                add(PAINT_TOLERANCE)
+                add(PAINT_CONTIGUOUS)
+            }
+            if (editor.paintSelectShape == io.github.psd2live.ui.PaintSelectShape.QUICK) {
+                add(PAINT_BRUSH_SIZE)
+                add(PAINT_TOLERANCE)
+            }
+            add(PAINT_FEATHER)
+            add(PAINT_SELECT_GROW)
         }
         else -> Unit
     }
+    // The selection's commands, as Photoshop's Select menu has them; every tool lands through the selection.
+    add(SectionOption("paint.selection", "editor.paintSelect.section", OptionPlace.MENU))
+    val session: (CanvasEditor) -> Boolean = { it.paintSession != null }
+    add(ActionOption("paint.selectAll", "shortcut.selectAll", session, { it.selectAllPaint() }, OptionIcon.SELECT_ALL, place = OptionPlace.MENU))
+    add(ActionOption("paint.deselect", "editor.paintSelect.deselect", { it.paintHasSelection }, { it.deselectPaint() }, OptionIcon.DESELECT,
+        place = OptionPlace.MENU))
+    add(ActionOption("paint.invert", "editor.paintSelect.invert", { it.paintHasSelection }, { it.invertPaintSelection() }, OptionIcon.INVERT,
+        place = OptionPlace.MENU))
+    add(ActionOption("paint.featherSelection", "editor.paintSelect.featherAction", { it.paintHasSelection }, { it.featherPaintSelection() },
+        labelArgs = { listOf(it.paintFeather.toInt()) }, place = OptionPlace.MENU))
+    add(ActionOption("paint.expandSelection", "editor.paintSelect.expandAction", { it.paintHasSelection }, { it.growPaintSelection() },
+        labelArgs = { listOf(it.paintSelectGrow.toInt()) }, place = OptionPlace.MENU))
+    add(ActionOption("paint.contractSelection", "editor.paintSelect.contractAction", { it.paintHasSelection },
+        { it.growPaintSelection(contract = true) }, labelArgs = { listOf(it.paintSelectGrow.toInt()) }, place = OptionPlace.MENU))
+    add(ActionOption("paint.selectOpaque", "editor.paintSelect.opaque", session, { it.selectOpaquePaint() }, place = OptionPlace.MENU))
+    add(ActionOption("paint.fillSelection", "editor.paintSelect.fill", session, { it.fillPaintSelection() }, OptionIcon.FILL, place = OptionPlace.MENU))
+    add(ActionOption("paint.deleteSelection", "editor.paintSelect.delete", { it.paintHasSelection }, { it.deletePaintSelection() },
+        OptionIcon.ERASE, danger = true, place = OptionPlace.MENU))
     add(SectionOption("paint.layerActions", "editor.paintTargetLayer", OptionPlace.MENU))
     add(ActionOption("paint.clear", "editor.paintClear", { it.paintSession != null }, { it.clearCurrentLayerPaint() }, OptionIcon.CLEAR,
         danger = true, place = OptionPlace.MENU))
     // A mesh rebuilt from the pixels just painted, or the material they reach.
     addLayerActions(editor, editor.paintSession?.layerId?.takeUnless { it.startsWith(io.github.psd2live.application.WorkspacePaintSession.MATERIAL_PREFIX) })
+}
+
+// ─── Interior ───────────────────────────────────────────────────────────────
+
+/** The interior tool: what is missing to edit, the line being drawn, and the selected guide's purpose. */
+/** The feature tool: what to drag, and putting the last feature handled - or every one - back to the art's fit. */
+private fun MutableList<ToolOption>.addFeature(editor: CanvasEditor) {
+    val tool = editor.featureTool
+    add(NoteOption("feature.hint", { tool.hint() }, warning = { tool.handles.isEmpty() }, place = OptionPlace.BAR))
+    // The last feature's base values beside its handles: a drag on one is one history step.
+    val area = tool.last?.substringBefore('.')
+    val base = area?.let { a -> editor.state.recipe.base(a).takeIf { it.id.endsWith("/fitted") } }
+    if (area != null && base != null) for (knob in base.knobs.filter { it.unit == io.github.psd2live.core.RigTuning.Unit.PERCENT && !it.advanced }) {
+        add(SliderOption("feature.knob.${knob.id}", "settings.rig.knob.${base.id.replace('/', '.')}.${knob.id}", OptionUnit.PERCENT,
+            { knob.range.start / 100f..knob.range.endInclusive / 100f },
+            { e -> e.state.recipe.baseValue(area, knob.id) / 100f },
+            { e, v -> tool.beginKnob(); e.viewModel.setRigBaseValue(area, knob.id, v * 100f) },
+            step = 0.05f, place = OptionPlace.BAR, finish = { tool.endKnob() }))
+    }
+    add(ActionOption("feature.reset", "editor.tool.feature.reset", { e -> e.editable && tool.last?.let { e.state.recipe.moves(it).isNotEmpty() } == true },
+        { e -> tool.last?.let { e.viewModel.resetFeatureMoves(listOf(it)) } }, OptionIcon.RESET))
+    add(ActionOption("feature.resetAll", "editor.tool.feature.resetAll", { e -> e.editable && e.state.recipe.moves.isNotEmpty() },
+        { e -> e.viewModel.resetFeatureMoves(e.state.recipe.moves.keys) }, OptionIcon.RESET, danger = true))
+}
+
+private fun MutableList<ToolOption>.addInterior(editor: CanvasEditor) {
+    val tool = editor.interiorTool
+    add(NoteOption("interior.missing", { tool.missing() }, warning = { true }, place = OptionPlace.BAR))
+    add(ActionOption("interior.enable", "interior.canvas.enable", { it.editable && tool.canEnable() },
+        { tool.enable() }, OptionIcon.CREATE, primary = true))
+    add(ActionOption("interior.finishLine", "interior.canvas.finishLine", { it.editable && tool.drawing.size >= 2 }, { tool.finish() },
+        OptionIcon.CONFIRM, primary = true, place = OptionPlace.TOP))
+    add(ActionOption("interior.undoPoint", "editor.undoPoint", { tool.drawing.isNotEmpty() }, { tool.deleteSelection() },
+        OptionIcon.UNDO, keepsMenu = true, place = OptionPlace.TOP))
+    add(ActionOption("interior.cancelLine", "action.cancel", { tool.drawing.isNotEmpty() }, { it.cancelInterior() }, OptionIcon.CANCEL,
+        place = OptionPlace.TOP))
+    if (tool.selected != null) {
+        add(ToggleOption("interior.fold", "interior.markFold", { tool.selectedIsFold() }, { e, on -> if (e.editable) tool.markFold(on) }))
+        add(ActionOption("interior.deleteGuide", "interior.canvas.delete", { it.editable }, { tool.deleteSelection() }, OptionIcon.DELETE,
+            danger = true))
+    }
 }

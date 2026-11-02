@@ -69,6 +69,7 @@ public object P2lrt {
 		for (c in ir.clips.filter(::extends)) {
 			add(LossEntry(c.id, Feature.TIMELINE, Handling.DROPPED, note = "Version 1 has no clip events, part or rig opacity curves, blink or lip sync effects or curve fades"))
 		}
+		for (h in ir.hitAreas) add(LossEntry(h.id, Feature.STRUCTURE, Handling.DROPPED, note = "Version 1 has no hit areas"))
 	}
 
 	public fun write(ir: RigIR, options: Options = Options()): ByteArray =
@@ -225,7 +226,8 @@ public object P2lrt {
 					out.u32(parameters.size); parameters.forEach { out.u32(parameter(it.parameter)); out.u8(it.blend.ordinal); out.f32(it.value) }
 				}
 			}
-			val hitAreas = ir.advanced.hitAreas.map { h -> h to h.meshes.filter { it in meshIndex } }.filter { it.second.isNotEmpty() }
+			// The document's own hit areas, else those derived from the rig.
+			val hitAreas = ir.hitAreas.ifEmpty { ir.advanced.hitAreas }.map { h -> h to h.meshes.filter { it in meshIndex } }.filter { it.second.isNotEmpty() }
 			if (hitAreas.isNotEmpty()) chunks += chunk("HITA", required = false) {
 				out.u32(hitAreas.size)
 				for ((h, meshes) in hitAreas) { out.str(h.id); name(h.name); out.u32(meshes.size); meshes.forEach { out.u32(mesh(it)) } }
@@ -649,7 +651,7 @@ public object P2lrtTarget : ExportTarget {
 	override val description: String = "PSD2Live runtime rig (.p2lrt)"
 	override val capabilities: CapabilityProfile = CapabilityProfile(
 		warpLattice = true, parameterGrid = 8, blendShapes = true, timeline = true, physics = PhysicsSupport.PARAMETER_PENDULUM,
-		blendModes = ColorBlend.entries.toSet(), masks = MaskSupport.TEXTURE_ALPHA, keyedDrawOrder = true, glue = true,
+		blendModes = ColorBlend.entries.toSet(), masks = MaskSupport.TEXTURE_ALPHA, keyedDrawOrder = true, glue = true, hitAreas = true,
 	)
 
 	/**

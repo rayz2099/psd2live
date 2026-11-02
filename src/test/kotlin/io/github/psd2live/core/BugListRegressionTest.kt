@@ -6,6 +6,9 @@ import io.github.psd2live.format.model.Clip
 import io.github.psd2live.format.model.Curve
 import io.github.psd2live.format.model.CurveSegment
 import io.github.psd2live.targets.raster.gifCentisecondDelays
+import io.github.psd2live.ui.state.AppSettings
+import io.github.psd2live.ui.state.WindowMode
+import io.github.psd2live.ui.utils.MainWindowModes
 import java.awt.image.BufferedImage
 import java.nio.file.Files
 import kotlin.test.Test
@@ -20,6 +23,41 @@ class BugListRegressionTest {
 			commandArguments(arrayOf("--lang", "zh", "export", "model.psd2live", "--target", "gif")))
 		assertEquals(listOf("export", "model.psd", "--target", "png-sequence"),
 			commandArguments(arrayOf("export", "model.psd", "--lang", "en", "--target", "png-sequence")))
+	}
+
+	@Test
+	fun aSavedWindowLargerThanTheScreenOpensWithinIt() {
+		val area = java.awt.Rectangle(0, 0, 1707, 1019)
+		assertEquals(java.awt.Rectangle(0, 0, 1707, 1019), MainWindowModes.windowedBounds(java.awt.Dimension(2560, 1500), null, area))
+		assertEquals(java.awt.Rectangle(213, 99, 1280, 820), MainWindowModes.windowedBounds(java.awt.Dimension(1280, 820), null, area))
+		assertEquals(java.awt.Rectangle(40, 30, 1280, 820),
+			MainWindowModes.windowedBounds(java.awt.Dimension(1280, 820), java.awt.Point(40, 30), area))
+		// A spot that no longer fits (the window was on another screen) is centred instead.
+		assertEquals(java.awt.Rectangle(213, 99, 1280, 820),
+			MainWindowModes.windowedBounds(java.awt.Dimension(1280, 820), java.awt.Point(1900, 30), area))
+	}
+
+	@Test
+	fun windowModesPlaceTheWindowWithoutTheSystemMaximize() {
+		val screen = java.awt.Rectangle(1707, 0, 1707, 1067)
+		val taskbar = java.awt.Insets(0, 0, 48, 0)
+		assertEquals(null, MainWindowModes.boundsFor(WindowMode.WINDOWED, screen, taskbar, windows = true))
+		assertEquals(java.awt.Rectangle(1707, 0, 1707, 1019), MainWindowModes.boundsFor(WindowMode.MAXIMIZED, screen, taskbar, windows = true))
+		assertEquals(screen, MainWindowModes.boundsFor(WindowMode.FULLSCREEN, screen, taskbar, windows = true))
+		// An auto-hidden taskbar reserves nothing; maximized still leaves the bottom row so it is not full screen.
+		assertEquals(java.awt.Rectangle(1707, 0, 1707, 1066),
+			MainWindowModes.boundsFor(WindowMode.MAXIMIZED, screen, java.awt.Insets(0, 0, 0, 0), windows = true))
+		assertEquals(screen, MainWindowModes.workArea(screen, java.awt.Insets(0, 0, 0, 0), windows = false))
+		// A native frame in full screen puts its invisible resize edges past the monitor, so its content covers it.
+		assertEquals(java.awt.Rectangle(1700, 0, 1721, 1074), MainWindowModes.coverWithBorder(screen, java.awt.Insets(0, 7, 7, 7)))
+	}
+
+	@Test
+	fun aWindowSavedMaximizedBeforeModesOpensMaximized() {
+		assertEquals(WindowMode.MAXIMIZED, AppSettings.windowModeOf(null, legacyMaximized = true))
+		assertEquals(WindowMode.WINDOWED, AppSettings.windowModeOf(null, legacyMaximized = false))
+		assertEquals(WindowMode.FULLSCREEN, AppSettings.windowModeOf("FULLSCREEN", legacyMaximized = true))
+		assertEquals(WindowMode.WINDOWED, AppSettings.windowModeOf("UNKNOWN", legacyMaximized = false))
 	}
 
 	@Test

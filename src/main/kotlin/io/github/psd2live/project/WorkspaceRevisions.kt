@@ -37,11 +37,18 @@ internal object WorkspaceRevisions {
 
 	// An empty optional field must not change the identity of pre-feature documents.
 	private fun rigText(rig: RigEditOverlay): String {
-		val text = rig.toString()
-		if (rig.interiorEffects.isNotEmpty()) return text
-		val token = ", interiorEffects=[]"
-		val index = text.lastIndexOf(token)
-		return if (index < 0) text else text.removeRange(index, index + token.length)
+		var text = rig.toString()
+		fun strip(token: String) {
+			val index = text.lastIndexOf(token)
+			if (index >= 0) text = text.removeRange(index, index + token.length)
+		}
+		if (rig.hitAreas.isEmpty()) strip(", hitAreas=[]")
+		if (rig.interiorEffects.isEmpty()) strip(", interiorEffects=[]")
+		if (rig.pose == null) strip(", pose=null")
+		if (rig.expressions == null) strip(", expressions=null")
+		// A motion clip without events reads as clips did before they had them.
+		if (rig.motionClips.any { it.events.isEmpty() }) text = text.replace(", events=[])", ")")
+		return text
 	}
 
 	/** Everything after the rig overlay in the canonical text. */

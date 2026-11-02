@@ -46,7 +46,7 @@ internal object WorkspaceInspectionResultSchemas {
         "switch_id" to s.integer(), "mesh" to WorkspaceSettingsResultTypes.layerMesh, "bounds" to s.vector(4),
         "tags" to s.array(s.string()), "pending" to s.constant(true), "material_id" to s.handle()),
         setOf("id", "name", "visible", "role", "side", "type", "parameter", "switch_id", "mesh", "bounds", "tags"))
-    private val parameter = s.obj(mapOf("id" to s.handle(), "name" to s.string(), "min" to s.number(), "max" to s.number(), "default" to s.number()))
+    private val parameter = s.obj(mapOf("id" to s.handle(), "name" to s.string(), "min" to s.number(), "max" to s.number(), "default" to s.number(), "repeat" to s.boolean()))
     private val group = s.obj(mapOf("target" to s.handle(), "name" to s.string(),
         "kind" to s.choices(*VertexGroupKind.entries.map { it.jsonName }.toTypedArray()), "vertices" to s.integer(0), "weighted" to s.integer(0), "max" to s.number()))
     private fun page(scope: String, item: JsonObject) = scoped(scope,
@@ -93,12 +93,12 @@ internal object WorkspaceSettingsResultTypes {
     // TextureUpscaleConfig serialization intentionally omits default values.
     private val upscale = s.obj(upscaleFields, emptySet())
     private val booleanFields = listOf("meshSuppressBoundaryDiagonals", "meshOnly", "generateDeformers", "featureDisplacementEnabled", "mouthOutlineEnabled",
-        "exportMotions", "motionBasic", "motionIdle", "motionBlink", "motionNod", "motionShake", "motionSkeleton", "generatePhysics",
+        "seeThroughBrows", "seeThroughEyes", "exportMotions", "motionBasic", "motionIdle", "motionBlink", "motionNod", "motionShake", "motionSkeleton", "generatePhysics",
         "physicsFrontHair", "physicsBackHair", "physicsEyeJelly", "hairSimulationFront", "hairSimulationBack", "exportCmo3", "exportMoc3", "exportJson", "exportCan3",
         "exportHiddenParts", "exportHiddenDrawables", "exportGuideImageParts", "exportIncludePhysics", "exportIncludeUserData", "exportIncludeDisplayInfo")
     private val settingFields = booleanFields.associateWith { s.boolean() } +
         listOf("atlasSize", "meshSpacing", "texturePadding", "alphaThreshold").associateWith { s.integer() } +
-        listOf("meshOuterMargin", "meshEdgeWidth", "meshMaxEdgeDistance", "meshInteriorDensity", "headStrength", "bodyStrength", "mouthThickness").associateWith { s.number() } +
+        listOf("meshOuterMargin", "meshEdgeWidth", "meshMaxEdgeDistance", "meshInteriorDensity", "headStrength", "bodyStrength", "mouthThickness", "seeThroughOpacity").associateWith { s.number() } +
         mapOf("textureUpscale" to upscale, "meshEdgeMode" to meshFields.getValue("edgeMode"), "meshFillAlgorithm" to meshFields.getValue("fillAlgorithm"),
             "meshUnits" to s.choices(*io.github.psd2live.core.MeshUnits.entries.map { it.name }.toTypedArray()),
             "meshFillParameters" to fill, "meshOverrides" to s.dictionary(storedMesh), "drawOrderOverrides" to s.dictionary(s.number()),
@@ -106,7 +106,10 @@ internal object WorkspaceSettingsResultTypes {
             "mouthCurve" to s.array(s.obj(mapOf("x" to s.number(), "y" to s.number()))), "mouthColor" to s.nullable(s.integer(0, 0xFFFFFF)),
             "runtimeTarget" to s.choices(*RuntimeTarget.entries.map { it.name }.toTypedArray()), "exportPixelsPerUnit" to s.nullable(s.number()),
             "meshTrace" to s.choices(*io.github.psd2live.core.MeshTrace.entries.map { it.name }.toTypedArray()),
-            "meshWrap" to s.number())
-    /** A canvas-traced project leaves the trace out, and one without wrap the wrap, as projects saved before them did. */
-    val settings = s.obj(settingFields, settingFields.keys - "meshTrace" - "meshWrap")
+            "meshWrap" to s.number(), "rig" to RigModuleSchemas.stored)
+    /**
+     * A canvas-traced project leaves the trace out, one without wrap the wrap, as projects saved before them did, and one
+     * saved before rig modules the rig.
+     */
+    val settings = s.obj(settingFields, settingFields.keys - "meshTrace" - "meshWrap" - "rig")
 }

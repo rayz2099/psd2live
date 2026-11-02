@@ -244,8 +244,16 @@ data class RigEditOverlay(
     /** Simulated bodies; they read the rebuilt rig and, once baked, write back through their own generator. */
     val simEdits: List<io.github.psd2live.core.sim.RigSimEdit> = emptyList(),
     val interiorEffects: List<io.github.psd2live.core.interior.NativeInteriorEffect> = emptyList(),
+    /** The hit areas the user set up, in test order; they do not touch the rig. Empty leaves the runtime its automatic ones. */
+    val hitAreas: List<RigHitArea> = emptyList(),
+    /** The model's expressions; null until first edited, when the model has the standard ones ([ModelExpressions]). */
+    val expressions: List<ModelExpression>? = null,
+    /** The part groups of which one shows at a time; like the motions and expressions, they do not touch the rig. */
+    val pose: ModelPose? = null,
 ) {
 	init {
+        RigHitAreas.problem(hitAreas)?.let { throw IllegalArgumentException(it) }
+        expressions?.let(ModelExpressions::validated)
         require(motionClips.map { it.id }.distinct().size == motionClips.size) { "Duplicate motion IDs" }
         require(motionClips.mapNotNull { it.builtin?.lowercase() }.let { it.distinct().size == it.size }) { "A generated motion has one override" }
 		require(warpEdits.map { it.id }.distinct().size == warpEdits.size) { "Duplicate Warp IDs" }
@@ -337,6 +345,12 @@ data class RigEditOverlay(
 		}
 	}
 
+	/**
+	 * Where the journal's ID conversions took each object: what generators naming standard parameters by their
+	 * standard IDs (physics presets, motion presets, expressions) look them up through.
+	 */
+	internal val idRenames: RigIdConversion.Renames by lazy { RigIdConversion.renames(authoringJournal) }
+
 	/** Generated axes do not exist until swing/simulation materialization: panel moves and links that name them. */
 	private val generatedIds: Set<String> by lazy { swingEdits.flatMap { it.parameterIds }.toSet() + simEdits.flatMap { it.outputParameters } + interiorEffects.flatMap { it.parameterIds } }
 
@@ -348,6 +362,9 @@ data class RigEditOverlay(
 			(command[PANEL_AFTER_GENERATION] as? kotlinx.serialization.json.JsonArray)?.forEach {
 				retained += it.jsonPrimitive.content
 			}
+			// A converted parameter keeps its phase under its new ID.
+			if (RigIdConversion.isConversion(command)) for (rename in RigIdConversion.renames(command))
+				if (rename.kind == "parameter" && retained.remove(rename.from)) retained += rename.to
 			if (command["op"]?.jsonPrimitive?.contentOrNull == "structure") {
 				for (entry in (command["edits"] as? kotlinx.serialization.json.JsonArray).orEmpty()) {
 					val edit = entry.jsonObject
@@ -360,7 +377,7 @@ data class RigEditOverlay(
 		generatedIds + retained
 	}
 
-	private fun generatedPanelEdit(edit: kotlinx.serialization.json.JsonObject): Boolean =
+	internal fun generatedPanelEdit(edit: kotlinx.serialization.json.JsonObject): Boolean =
 		edit["kind"]?.jsonPrimitive?.contentOrNull == "parameter" &&
 			edit["action"]?.jsonPrimitive?.contentOrNull in setOf("move", "link") &&
 			listOf("id", "partner_id", "before_id").any { field ->
@@ -504,16 +521,23 @@ data class RigEditOverlay(
 	internal fun finish(authored: PuppetModel, notes: List<SupersededEntryNote> = emptyList()): GeneratedOverrides.Outcome {
 		// Generated axes exist only now: their panel placement and links replay afterwards, including moves of
 		// another parameter relative to them.
-		val generatedPanelEdits = structureEdits.filter(::generatedPanelEdit)
+		// They replay after the whole journal, so they name what its ID conversions after them made of their objects.
+		val forwarded = RigIdConversion.forwarded(authoringJournal)
+		val generatedPanelEdits = structureEdits.filter(::generatedPanelEdit).let { edits ->
+			if (edits.isEmpty() || forwarded === authoringJournal) edits
+			else RigIdConversion.forwarded(listOf(kotlinx.serialization.json.buildJsonObject {
+				put("op", kotlinx.serialization.json.JsonPrimitive("structure")); put("edits", kotlinx.serialization.json.JsonArray(edits))
+			}) + authoringJournal).first().getValue("edits").jsonArray.map { it.jsonObject }
+		}
 		val deferredJournalEdits = mutableListOf<kotlinx.serialization.json.JsonObject>()
-		for (command in authoringJournal) if (command["op"]?.jsonPrimitive?.contentOrNull == "structure")
+		for (command in forwarded) if (command["op"]?.jsonPrimitive?.contentOrNull == "structure")
 			deferredJournalEdits += command.getValue("edits").jsonArray.map { it.jsonObject }.filter(::generatedPanelEdit)
 		var model = authored
 		// Swings and simulations write their keyforms onto the replayed rig, in the document graph's order.
 		model = DocumentGenerators.generate(model, this)
 		// Edits of generated keyforms merge with what the generators produce now.
 		val overrides = if (authoringJournal.none(GeneratedOverrides::isOverride)) GeneratedOverrides.Outcome(model, emptyList())
-			else GeneratedOverrides.applyAll(model, authoringJournal, ArtPrimitiveJournal.replacementDrawables(this).keys)
+			else GeneratedOverrides.applyAll(model, forwarded, ArtPrimitiveJournal.replacementDrawables(this).keys)
 		model = overrides.model
 		return GeneratedOverrides.Outcome(RigStructureEdits.replay(model, generatedPanelEdits + deferredJournalEdits).withParametersSyncedFromTree(), overrides.issues, notes)
 	}
@@ -545,9 +569,10 @@ data class RigEditOverlay(
 }
 
 internal fun BuiltRig.withRigEdits(overlay: RigEditOverlay, layerVisibility: Map<String, Boolean> = emptyMap(),
-                                 drawOrderOverrides: Map<String, Float> = emptyMap()): BuiltRig {
-	if (overlay == RigEditOverlay.Empty) return withDrawOrderOverrides(drawOrderOverrides)
-	return authoredRig(overlay).finished(overlay, layerVisibility, drawOrderOverrides)
+                                 drawOrderOverrides: Map<String, Float> = emptyMap(),
+                                 seeThrough: SeeThroughLayers.Settings = SeeThroughLayers.Settings.OFF): BuiltRig {
+	if (overlay == RigEditOverlay.Empty) return withDrawOrderOverrides(drawOrderOverrides).withSeeThrough(seeThrough)
+	return authoredRig(overlay).finished(overlay, layerVisibility, drawOrderOverrides, seeThrough)
 }
 
 /**
@@ -564,7 +589,8 @@ internal fun BuiltRig.authoredRig(overlay: RigEditOverlay): AuthoredRig {
 	// After a checkpoint its rig's maps hold every mesh up to it; the base's would miss what it stores.
 	val start = if (overlay.checkpointIndex < 0) AuthoredRig(this, emptyList()) else
 		RigCheckpoint.decode(overlay.authoringJournal[overlay.checkpointIndex]).authored.reboundTo(puppet.atlas, puppet.sources)
-			.let { it.copy(rig = it.rig.copy(primitiveSkins = primitiveSkins)) }
+			// What the bangs cover is the base's: a checkpoint stored before it was recorded has none.
+			.let { it.copy(rig = it.rig.copy(primitiveSkins = primitiveSkins, seeThrough = seeThrough ?: it.rig.seeThrough)) }
 	return AuthoredRig(start.rig.copy(puppet = replayed.model, supersededEntryNotes = replayed.notes), start.visibilityTargets)
 		.withJournalMeshes(overlay.afterCheckpoint)
 }
@@ -575,13 +601,35 @@ internal fun AuthoredRig.withJournalMeshes(commands: List<JsonObject>): Authored
 	val bounds = rig.sourceBoundsByDrawableId.toMutableMap()
 	val layers = rig.layerIdByDrawableId.toMutableMap()
 	val pages = rig.pageByDrawableId.toMutableMap()
+	val copied = rig.copiedDrawableIds.toMutableSet()
 	val visible = visibilityTargets.toMutableList()
 	for (command in commands) {
 		val op = command["op"]?.jsonPrimitive?.contentOrNull
 		if (op == LayerDeletionJournal.OP) {
 			for (id in LayerDeletionJournal.meshes(command)) {
-				layers -= id; bounds -= id; pages -= id
+				layers -= id; bounds -= id; pages -= id; copied -= id
 				visible.removeAll { it.first == id }
+			}
+			continue
+		}
+		// A pasted mesh shows its original's layer without becoming that layer's mesh; a converted one keeps its layer
+		// under the new ID.
+		if (op == RigObjectPaste.OP) {
+			for (copy in RigObjectPaste.copies(command)) if (copy.kind == "mesh") {
+				copied += copy.newId
+				layers[copy.id]?.let { layers[copy.newId] = it; visible += copy.newId to it }
+				bounds[copy.id]?.let { bounds[copy.newId] = it }
+				pages[copy.id]?.let { pages[copy.newId] = it }
+			}
+			continue
+		}
+		if (op == RigIdConversion.OP) {
+			for (rename in RigIdConversion.renames(command)) if (rename.kind == "mesh") {
+				layers.remove(rename.from)?.let { layers[rename.to] = it }
+				if (copied.remove(rename.from)) copied += rename.to
+				bounds.remove(rename.from)?.let { bounds[rename.to] = it }
+				pages.remove(rename.from)?.let { pages[rename.to] = it }
+				visible.replaceAll { if (it.first == rename.from) rename.to to it.second else it }
 			}
 			continue
 		}
@@ -629,14 +677,19 @@ internal fun AuthoredRig.withJournalMeshes(commands: List<JsonObject>): Authored
 		}
 		if (model.drawables.any { it.id.raw == id }) bounds[id] = Bounds(numbers[0], numbers[1], numbers[2], numbers[3])
 	}
-	return AuthoredRig(rig.copy(sourceBoundsByDrawableId = bounds, layerIdByDrawableId = layers, pageByDrawableId = pages), visible)
+	return AuthoredRig(rig.copy(sourceBoundsByDrawableId = bounds, layerIdByDrawableId = layers, pageByDrawableId = pages,
+		copiedDrawableIds = copied), visible)
 }
 
-/** The finished rig: [overlay]'s generators, overrides and deferred panel edits on the authored state, then layer visibility and draw orders. */
+/**
+ * The finished rig: [overlay]'s generators, overrides and deferred panel edits on the authored state, then layer
+ * visibility and draw orders, then the copies over the bangs [seeThrough] asks for, made from all of that.
+ */
 internal fun AuthoredRig.finished(overlay: RigEditOverlay, layerVisibility: Map<String, Boolean> = emptyMap(),
-                                  drawOrderOverrides: Map<String, Float> = emptyMap()): BuiltRig {
+                                  drawOrderOverrides: Map<String, Float> = emptyMap(),
+                                  seeThrough: SeeThroughLayers.Settings = SeeThroughLayers.Settings.OFF): BuiltRig {
 	// Without edits the base is the rig: no generator runs (as [withRigEdits] has it).
-	if (overlay == RigEditOverlay.Empty) return rig.withDrawOrderOverrides(drawOrderOverrides)
+	if (overlay == RigEditOverlay.Empty) return rig.withDrawOrderOverrides(drawOrderOverrides).withSeeThrough(seeThrough)
 	val outcome = overlay.finish(rig.puppet, rig.supersededEntryNotes)
 	var model = outcome.model
 	for ((id, layer) in visibilityTargets) {
@@ -644,24 +697,36 @@ internal fun AuthoredRig.finished(overlay: RigEditOverlay, layerVisibility: Map<
 		model = model.copy(drawables = model.drawables.map { if (it.id.raw == id) it.copy(isVisible = visible) else it })
 	}
 	model = ArtPrimitiveJournal.pruneAtlas(model, overlay)
-	return rig.copy(puppet = model, overrideIssues = outcome.issues, supersededEntryNotes = outcome.notes)
-		.withDrawOrderOverrides(drawOrderOverrides)
+	// The base found the brows and bangs under the generators' IDs; the journal's conversions may have renamed them.
+	val renamed = overlay.idRenames.of("mesh")
+	val candidates = if (renamed.isEmpty()) rig.seeThrough else rig.seeThrough?.map { candidate ->
+		candidate.copy(original = renamed[candidate.original] ?: candidate.original, bangs = candidate.bangs.map { renamed[it] ?: it })
+	}
+	return rig.copy(puppet = model, overrideIssues = outcome.issues, supersededEntryNotes = outcome.notes, seeThrough = candidates)
+		.withDrawOrderOverrides(drawOrderOverrides).withSeeThrough(seeThrough)
+}
+
+/**
+ * The channel a journal entry names, in any case, camel or snake (`drawOrder`, `draw_order`, `DRAW_ORDER`); null for
+ * `geometry`. Every reader of a channel name goes through this, so a check and the edit it guards agree on the name.
+ */
+internal fun keyformChannelOf(name: String): FormChannel? {
+    if (name.equals("geometry", ignoreCase = true)) return null
+    val canonical = when (name.lowercase()) {
+        "draworder" -> "DRAW_ORDER"
+        "multiplycolor" -> "MULTIPLY_COLOR"
+        "screencolor" -> "SCREEN_COLOR"
+        "glueintensity" -> "GLUE_INTENSITY"
+        "flipx" -> "FLIP_X"
+        "flipy" -> "FLIP_Y"
+        else -> name.uppercase()
+    }
+    return FormChannel.entries.firstOrNull { it.name == canonical }
+        ?: throw IllegalArgumentException("Unknown keyform channel: $name")
 }
 
 internal fun applyKeyformDelete(model: PuppetModel, delete: RigKeyformDeleteEdit): PuppetModel {
-    val requestedChannel = delete.channel?.takeUnless { it.equals("geometry", ignoreCase = true) }?.let { name ->
-        val canonical = when (name.lowercase()) {
-            "draworder" -> "DRAW_ORDER"
-            "multiplycolor" -> "MULTIPLY_COLOR"
-            "screencolor" -> "SCREEN_COLOR"
-            "glueintensity" -> "GLUE_INTENSITY"
-            "flipx" -> "FLIP_X"
-            "flipy" -> "FLIP_Y"
-            else -> name.uppercase()
-        }
-        FormChannel.entries.firstOrNull { it.name == canonical }
-            ?: throw IllegalArgumentException("Unknown keyform channel: $name")
-    }
+    val requestedChannel = delete.channel?.let(::keyformChannelOf)
 	val paramId = ParameterId(delete.parameterId)
 	val param = model.parameters.firstOrNull { it.id == paramId } ?: return model
 	val owner = delete.target.asKeyformOwner()

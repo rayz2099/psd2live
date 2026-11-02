@@ -97,6 +97,8 @@ internal class WorkspaceRuntime<M>(
     private var version = 0L
     private var tree: WorkspaceHistoryTree<WorkspaceDocument>? = null
     private val mutableState = MutableStateFlow(WorkspaceRuntimeState<M>(token()))
+    /** For tests: runs between a commit's [commitPrepared] beforeCommit and its publication. */
+    @Volatile internal var beforePublish: (() -> Unit)? = null
     @Volatile private var publishedRead = WorkspaceReadCapture(mutableState.value, null)
     val state: StateFlow<WorkspaceRuntimeState<M>> = mutableState.asStateFlow()
 
@@ -282,6 +284,7 @@ internal class WorkspaceRuntime<M>(
             if (!documentChanged && auxiliary == before.auxiliary) return@synchronized WorkspaceCommit(before, false)
             // Projection validation is atomic and must fail before touching the authoritative history.
             beforeCommit(before, document, model)
+            beforePublish?.invoke()
             val head = if (documentChanged) requireNotNull(tree).commit(before.historyHead, document, revision, revision, summary, author.historyActor, taskId)
                 else requireNotNull(tree).head()
             version++
@@ -366,7 +369,11 @@ internal class WorkspaceRuntime<M>(
     private fun adoptedAuxiliary(previous: M, next: M, auxiliary: JsonObject): JsonObject {
         val before = previous as? io.github.psd2live.core.RigPreviewModel ?: return auxiliary
         val after = next as? io.github.psd2live.core.RigPreviewModel ?: return auxiliary
-        return PreviewSessions.migrate(before.rig.puppet.parameters, after.rig.puppet.parameters, auxiliary)
+        val parameters = before.rig.puppet.parameters
+        // Only a version that names other parameters can hold a conversion the editor data must follow.
+        val renamed = if (parameters.map { it.id } == after.rig.puppet.parameters.map { it.id }) emptyMap()
+            else WorkspaceConvertedIds.parameters(before.config.rigEdits.authoringJournal, after.config.rigEdits.authoringJournal)
+        return PreviewSessions.migrate(parameters, after.rig.puppet.parameters, WorkspaceConvertedIds.auxiliary(auxiliary, renamed), renamed)
     }
 
     private fun token(): String = "$instanceId:$generation:$version"

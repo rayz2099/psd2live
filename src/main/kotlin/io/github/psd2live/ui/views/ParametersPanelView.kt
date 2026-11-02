@@ -143,6 +143,13 @@ import io.github.psd2live.ui.components.TreeContextMenu
 import io.github.psd2live.ui.componentsAtParameterKey
 import io.github.psd2live.ui.componentsAtParameterKeys
 import io.github.psd2live.ui.selectedParameterOwner
+import io.github.psd2live.ui.utils.DesktopUtils
+import io.github.psd2live.ui.state.ShortcutAction
+import io.github.psd2live.ui.views.texture.FloatingMenu
+import io.github.psd2live.ui.views.texture.FloatingMenuDivider
+import io.github.psd2live.ui.views.texture.FloatingMenuRow
+import io.github.psd2live.ui.views.tooloptions.GlidingColumn
+import io.github.psd2live.ui.views.tooloptions.invokeMenuAction
 import org.umamo.runtime.model.ParameterId
 import org.umamo.runtime.model.ParameterLabelColor
 import io.github.psd2live.ui.parameterKeyMarks
@@ -199,6 +206,12 @@ private data class ParameterPhysicsStatus(
 )
 
 private val LocalParameterPhysicsStatus = compositionLocalOf { ParameterPhysicsStatus() }
+
+/**
+ * Puts input focus back on the parameter panel after a menu row has run, so a popped menu does not leave focus with
+ * its dismissed popup (the canvas asks for its own focus the same way). Provided by [ParametersListView].
+ */
+private val LocalParameterPanelFocus = compositionLocalOf<() -> Unit> { {} }
 
 /** Layout bounds of one parameter-panel row, in the drag container's local coordinates. */
 private data class ParamItemLayout(
@@ -442,7 +455,7 @@ internal fun ParametersListView(
 		}
     }
 	val owner = remember(puppet, state.selectedLayerId, state.selectedDeformerId, model?.rig?.layerIdByDrawableId) {
-        puppet?.selectedParameterOwner(state.selectedLayerId, state.selectedDeformerId, model.rig.layerIdByDrawableId.orEmpty())
+        puppet?.selectedParameterOwner(state.selectedLayerId, state.selectedDeformerId, model.rig.ownLayerIdByDrawableId.orEmpty())
     }
     val keyMarksByParameter = remember(puppet) { puppet?.parameterKeyMarks().orEmpty() }
     val selectedKeyMarks = remember(puppet, owner) { if (owner == null) emptyMap() else puppet?.parameterKeyMarks(owner).orEmpty() }
@@ -462,6 +475,10 @@ internal fun ParametersListView(
 	var folderMenuFor by remember { mutableStateOf<String?>(null) }
 	var folderMenuOffset by remember { mutableStateOf(Offset.Zero) }
 	val focusManager = LocalFocusManager.current
+	// The panel itself takes focus back after a menu or dialog it opened from a row: the rows are pointer-driven,
+	// so the panel root is the focus target of its own (as the canvas root is for the canvas).
+	val panelFocus = remember { FocusRequester() }
+	val restorePanelFocus: () -> Unit = remember(panelFocus) { { panelFocus.requestFocus() } }
 	val renameEditorRegions = remember { InlineEditorRegions() }
 	fun startFolderRename(groupId: String, name: String) {
 		renamingGroupId = groupId
@@ -556,10 +573,13 @@ internal fun ParametersListView(
 		LocalParameterNameWidth provides shownNameWidth,
 		LocalInlineEditorRegions provides renameEditorRegions,
 		LocalParameterPhysicsStatus provides ParameterPhysicsStatus(physicsOutputs, physicsControlled),
+		LocalParameterPanelFocus provides restorePanelFocus,
 	) {
 	Column(
 		modifier = Modifier
 			.fillMaxSize()
+			.focusRequester(panelFocus)
+			.focusable()
 			.onPointerEvent(PointerEventType.Press, pass = PointerEventPass.Initial) {
 				if (renamingGroupId != null || renamingSnapshotId != null) renameEditorRegions.pressedInside = false
 			}
@@ -574,7 +594,7 @@ internal fun ParametersListView(
 		val labels = listOf(tr("parameters.newParameterShort"), tr("parameters.newFolderShort"), tr("parameters.relatedOnly"))
 		PanelToolbar(
 			labels = labels,
-			iconCount = if (state.previewLive) 7 else 6,
+			iconCount = if (state.previewLive) 9 else 8,
 			search = PanelSearch(state.parameterSearchQuery, viewModel::setParameterSearchQuery, tr("parameters.search")),
 			secondary = { ParameterSnapshotBar(state, viewModel, renamingSnapshotId) { renamingSnapshotId = it } },
 		) { labelsShown ->
@@ -619,6 +639,8 @@ internal fun ParametersListView(
 				)
 			}
 			Spacer(Modifier.weight(1f))
+			RandomPoseButtons(state, viewModel, enabled = puppet != null)
+			PanelToolbarSeparator()
 			PanelExpandCollapseButtons(
 				onExpandAll = { for (id in collectParameterGroupIds(puppet)) openOverrides[id] = true },
 				onCollapseAll = { for (id in collectParameterGroupIds(puppet)) openOverrides[id] = false },
@@ -2365,6 +2387,11 @@ private class ParameterRowState(private val source: State<PSD2LiveState>) {
 	val authored: Map<ParameterId, Float> by derivedStateOf(referentialEqualityPolicy()) { source.value.parameterValues }
 	val locked: Set<ParameterId> by derivedStateOf { source.value.lockedParameters }
 	val editable: Boolean by derivedStateOf { source.value.historySnapshot != null && !source.value.canvasEditBusy }
+	/** Menu rows act only while the document can take edits and no analysis, generation or edit is in flight. */
+	val menuEnabled: Boolean by derivedStateOf {
+		val state = source.value
+		state.historySnapshot != null && !state.isBusy && !state.workspaceEditBusy && !state.editorDraftBusy
+	}
 	/** The whole state, for the dialog a row opens. */
 	val current: PSD2LiveState get() = source.value
 }
@@ -2383,12 +2410,22 @@ private fun EditableParameterName(
     viewModel: PSD2LiveViewModel,
     related: Boolean,
 ) {
-    var editing by remember(param.id) { mutableStateOf(false) }
+    // A click opens the definition, a right click the parameter's menu; the menu's dialog rows reuse the same
+    // dialog with the state they need (properties, duplicate, delete confirmation).
+    var dialogAction by remember(param.id) { mutableStateOf<ParameterDefinitionInitialAction?>(null) }
+    var dialogFromMenu by remember(param.id) { mutableStateOf(false) }
+    var menuOpen by remember(param.id) { mutableStateOf(false) }
+    var menuAt by remember(param.id) { mutableStateOf(Offset.Zero) }
+    var menuAnchor by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var nameCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val restorePanelFocus = LocalParameterPanelFocus.current
     val editable = rowState.editable
+    val menuEnabled = rowState.menuEnabled
     val physics = LocalParameterPhysicsStatus.current
     val physicsOutput = param.id.raw in physics.outputs
     val controlled = param.id.raw in physics.controlled
     val colors = LocalToolColors.current
+    Box(Modifier.onGloballyPositioned { menuAnchor = it }) {
     TooltipArea(
         tooltip = { ParameterTooltip(param.name + if (physicsOutput) " · " +
             tr(if (controlled) "parameters.physicsControlled" else "parameters.physicsOutput") else "") },
@@ -2405,21 +2442,94 @@ private fun EditableParameterName(
         locked = locked,
         modifier = Modifier
             .weight(1f)
+            .onGloballyPositioned { nameCoordinates = it }
             .semantics {
                 contentDescription = param.name + " — " + tr("parameters.properties") +
                     if (related) " — " + tr("parameters.related") else ""
             }
-            .clickable(enabled = editable, onClickLabel = tr("parameters.properties")) { editing = true }
+            .clickable(enabled = editable, onClickLabel = tr("parameters.properties")) {
+                dialogFromMenu = false
+                dialogAction = ParameterDefinitionInitialAction.PROPERTIES
+            }
             .onPointerEvent(PointerEventType.Press) { event ->
                 if (event.button == PointerButton.Secondary && editable) {
-                    editing = true
+                    // The menu opens at the press: translate it from the name into the layout that holds the popup.
+                    val click = event.changes.firstOrNull()?.position ?: Offset.Zero
+                    val anchor = menuAnchor
+                    val name = nameCoordinates
+                    menuAt = if (anchor != null && name != null && anchor.isAttached && name.isAttached)
+                        anchor.localPositionOf(name, click) else click
+                    menuOpen = true
                     event.changes.forEach { it.consume() }
                 }
             },
     )
     }
     }
-    if (editing) ParameterDefinitionDialog(param, rowState.current, viewModel, lockValue = value()) { editing = false }
+    PressMenu(expanded = menuOpen, press = menuAt, onDismissRequest = { menuOpen = false }) {
+        ParameterNameMenu(param, locked, menuEnabled, related, viewModel, value, close = { menuOpen = false }) { action ->
+            menuOpen = false
+            dialogFromMenu = true
+            dialogAction = action
+        }
+    }
+    }
+    val openDialog = dialogAction
+    if (openDialog != null) {
+        ParameterDefinitionDialog(param, rowState.current, viewModel, lockValue = value(), initialAction = openDialog) {
+            dialogAction = null
+            // A dialog opened from the menu gives the panel its focus back once it closes; the click path keeps its
+            // existing focus behavior.
+            if (dialogFromMenu) {
+                dialogFromMenu = false
+                restorePanelFocus()
+            }
+        }
+    }
+}
+
+/**
+ * The parameter name's right-click menu: the actions the definition dialog also holds, next to the ones the panel can
+ * do itself. Rows act only while [enabled] (the document is editable and no edit is in flight); an ordinary row hands
+ * focus back to the panel, a row that opens the dialog leaves focus to it.
+ */
+@Composable
+private fun ParameterNameMenu(
+    param: Parameter,
+    locked: Boolean,
+    enabled: Boolean,
+    /** Whether the selected mesh or deformer is keyed on [param]: only then can it be unbound. */
+    related: Boolean,
+    viewModel: PSD2LiveViewModel,
+    currentValue: () -> Float,
+    close: () -> Unit,
+    openDialog: (ParameterDefinitionInitialAction) -> Unit,
+) {
+    val restorePanelFocus = LocalParameterPanelFocus.current
+    val rows = mutableListOf<Triple<Boolean, Boolean, @Composable () -> Unit>>()
+    fun add(highlight: Boolean, danger: Boolean = false, content: @Composable () -> Unit) {
+        rows += Triple(highlight, danger, content)
+    }
+    fun act(action: () -> Unit) = invokeMenuAction(close, restorePanelFocus, action = action)
+    fun showDialog(action: ParameterDefinitionInitialAction) =
+        invokeMenuAction(close, restorePanelFocus, opensDialog = true) { openDialog(action) }
+    add(enabled) { FloatingMenuRow(tr("parameters.menu.properties"), { showDialog(ParameterDefinitionInitialAction.PROPERTIES) }, enabled = enabled) }
+    add(enabled) { FloatingMenuRow(tr("parameters.menu.reset"), { act { viewModel.resetParameter(param.id) } }, enabled = enabled) }
+    add(enabled) {
+        FloatingMenuRow(tr(if (locked) "parameters.menu.unlock" else "parameters.menu.lock"),
+            { act { viewModel.toggleParameterLock(param.id, currentValue()) } }, enabled = enabled)
+    }
+    add(enabled) { FloatingMenuRow(tr("parameters.menu.duplicate"), { showDialog(ParameterDefinitionInitialAction.COPY) }, enabled = enabled) }
+    add(enabled) { FloatingMenuRow(tr("parameters.menu.copyId"), { act { DesktopUtils.copyToClipboard(param.id.raw) } }, enabled = enabled) }
+    if (related) add(enabled) {
+        FloatingMenuRow(tr("parameters.menu.unbind"), { act { viewModel.unbindParameterFromSelection(param.id) } },
+            enabled = enabled, hint = tr("parameters.menu.unbindHint"))
+    }
+    add(false) { FloatingMenuDivider() }
+    add(enabled, danger = true) {
+        FloatingMenuRow(tr("parameters.delete"), { showDialog(ParameterDefinitionInitialAction.DELETE) }, enabled = enabled, danger = true)
+    }
+    GlidingColumn(Modifier.width(236.dp), rows.size, { rows[it].first }, dangers = { rows[it].second }) { rows[it].third() }
 }
 
 private fun ParameterNode.Group.containsParameter(ids: Set<ParameterId>): Boolean = children.any {
@@ -2571,3 +2681,29 @@ private fun ParameterKeyOwnerIcon(component: ParameterKeyBoundComponent, tint: C
 	}
 }
 
+/**
+ * The random pose: a press sets the unlocked parameters to random values to look for the combinations that break;
+ * the menu beside it picks which parameters move and how far, and puts back the pose the first one replaced.
+ */
+@Composable
+private fun RandomPoseButtons(state: PSD2LiveState, viewModel: PSD2LiveViewModel, enabled: Boolean) {
+	val colors = LocalToolColors.current
+	val canvasId = (viewModel.aidCanvas(state) ?: state.activeCanvas).id
+	val keyLabel = state.keymap::labelFor
+	var menu by remember { mutableStateOf(false) }
+	val apply = { viewModel.applyRandomPose(canvasId) }
+	val restore = viewModel.randomPose.restore?.takeIf { viewModel.randomPoseRestorable(it, state) }?.let { { viewModel.restoreRandomPose() } }
+	PanelIconButton(onClick = apply, enabled = enabled,
+		tooltip = tr("canvas.aids.random.apply") + (keyLabel(ShortcutAction.RANDOM_POSE)?.let { " ($it)" } ?: "")) {
+		IconRandomPose(colors.textPrimary)
+	}
+	Box {
+		PanelIconButton(onClick = { menu = !menu }, enabled = enabled, tooltip = tr("canvas.aids.random.settings")) {
+			IconChevron(expanded = true, modifier = Modifier.size(10.dp))
+		}
+		FloatingMenu(expanded = menu, onDismiss = { menu = false }, width = 260.dp, alignment = Alignment.TopEnd) {
+			RandomPoseMenuContent(viewModel.randomPose, viewModel.canvasEditorFor(canvasId).deformationParameterIds().size,
+				apply, restore, keyLabel)
+		}
+	}
+}

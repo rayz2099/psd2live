@@ -23,6 +23,8 @@ internal enum class OptionIcon {
     CONFIRM, CANCEL, UNDO, CLEAR,
     FILL, ERASE, SWAP, REMERGE, RESET, SELECTION, TOPOLOGY, CREATE, GROUP,
     MESH, REFERENCE, REBUILD, MATERIAL, UNLINK, PIN, MIRROR,
+    // Deform's keyform tools.
+    KEYFORM, KEYFORM_PASTE, INTERPOLATE,
 }
 
 /**
@@ -72,6 +74,8 @@ internal class SliderOption(
     val role: OptionRole? = null,
     val integer: Boolean = false,
     override val place: OptionPlace = OptionPlace.BOTH,
+    /** Run when a drag or an entry on the bar ends: what a value that records history closes its one step with. */
+    val finish: ((CanvasEditor) -> Unit)? = null,
 ) : ToolOption {
     fun range(editor: CanvasEditor): ClosedFloatingPointRange<Float> = bounds(editor.brushSizeLimit)
 

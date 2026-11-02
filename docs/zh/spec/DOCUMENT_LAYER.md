@@ -43,10 +43,12 @@
 | `swing:<ID>`（每个未烘焙摆动） | `rig:authored`、该摆动的设置 | 其参数，及其参数在每个目标 Warp 上的关键形 |
 | `simulation:<ID>`（每个已烘焙且启用的模拟） | `rig:authored`、该模拟的设置与烘焙 | 其模式参数，及模式参数在烘焙网格上的关键形 |
 | `overrides`（覆盖合并） | 所有生成的关键形、覆盖、生成器集合 | `rig:final` |
-| `physics`（物理组） | `rig:final`、生成的参数、物理与骨架设置 | `physics` |
-| `motions`（生成动作） | `rig:final`、`physics`、动作设置、骨架定义 | `motions` |
+| `seeThrough`（透过刘海的复制件） | `rig:final`、设置 | `rig:seeThrough` |
+| `physics`（物理组） | `rig:final`、`rig:seeThrough`、生成的参数、物理与骨架设置 | `physics` |
+| `motions`（生成动作） | `rig:final`、`rig:seeThrough`、`physics`、动作设置、骨架定义 | `motions` |
 
 - 重放（`RigEditOverlay.applyTo`）按图的拓扑顺序运行日志之后的节点：先 `skeleton.skin`，再摆动与模拟，与此前“先全部摆动、再全部模拟”的顺序一致；声明顺序打破平局。
+- 透过刘海的复制件（`SeeThroughLayers`，见[变形器与参数参考](DEFORMER_AND_PARAMETER_SPEC.md#自动形变)）：`rig` 节点只记录候选（被刘海覆盖的眉毛与各眼部图层及其刘海），`seeThrough` 节点在覆盖合并、图层显隐与绘制顺序覆盖之后（`AuthoredRig.finished` 末尾，`withSeeThrough`）按设置从原件制作复制件、为眼睛在刘海上开窗（刘海反向剪切，`BuiltRig.seeThroughWindows`），蒙版、绘制顺序与不透明度都由当时的原件与刘海得出；开窗改的刘海蒙版只在成品 Rig 中，作者态与日志里的刘海不带它们，检查器经 `authoredMasksOf` 显示和编辑文档自己的蒙版，旧版软删除删去全部开窗眼部图层时收回窗口（`withSeeThroughWindowsPruned`）；复制件不在作者态 Rig 中，不拥有任何 `keyform:` 对象，在引用字段（拆分的引用字段与 `id`、`masked_by` 等）点名它的任何文档操作（`WorkspaceDocumentEdits` 分发处与日志记录处）以 `WorkspaceGeneratedCopyEdit`（`generated_copy`）拒绝；三项设置只触发重放，不算生成设置。复制件没有自己的图层条目，按图层处理网格的地方经 `BuiltRig.layerOf` 取原件的图层（旧版软删除随原件删去复制件、图集压缩与重新绑定）；生成迁移读作 Rig 数据的构建不制作复制件（`SeeThroughLayers.withoutCopies`）。未提交的预览（画布各工具经 `CanvasEditor.preview` 的赋值、检查器实时字段、Warp 控制场）统一经 `SeeThroughLayers.refresh` 按预览中的原件与刘海重做沿用下来的复制件，蒙版、顺序与外观同提交时一致；整个重建的预览（摆动、内部造型试播）其复制件已是新实例，原样返回同一模型，按引用识别预览的地方不受影响。
 - 文档若让两个生成器声明同一参数，先声明者保留拥有权，后者的声明被丢弃，重建仍可进行，冲突由生成器自身报告。
 - `DocumentGenerators.stale(before, after)` 给出一次文档变化后需要重跑的生成器：读取了变化部分的生成器及其全部下游；被修改或删除的生成器原先拥有的对象也视为变化。例如调整一个摆动只重跑该摆动、覆盖合并、物理与动作，不重跑 Rig 生成、骨架或其他模拟。
 - Rig 生成按阶段登记为节点（见下文[Rig 生成阶段](#rig-生成阶段)）；`graph(overlay, layers)` 给出图层列表时每层一个 `mesh:<图层>` 节点，某层像素变化只让该层网格、组装及其下游过期。
@@ -107,6 +109,7 @@
 - 关键形的拥有者由图决定：编辑的键中某个参数离开默认值，且图中有生成器拥有 `keyform:<类型>:<目标>@<该参数>`，该格点就是生成的格点。
 - **摆动**：拥有其参数轴在目标 Warp 上增加的关键形。覆盖记录生成器、目标 `warp:<ID>`、完整键、当时生成的格子（`base`）与用户格子（`points`），逐控制点合并。
 - **烘焙模拟**：拥有模式参数在烘焙网格上的关键形（以关键形轴写回的模拟；以混合形写回时网格格子里没有该轴，编辑不会被识别为覆盖）。覆盖记录目标 `mesh:<ID>`、当时生成的顶点偏移（`base`）与用户编辑后的偏移（`points`，由在当前模型上套用该画布编辑得到），逐顶点合并。重新烘焙或改变增益后，用户没动过的顶点跟随新烘焙，用户动过而烘焙未改的顶点保留，两边都改的保留用户值并报告冲突。
+- **通道**：生成器在自己的轴上键入的透明度、绘制顺序、乘算色与屏幕色关键形同样归它所有。某个通道的轨道在日志之后才有生成器的轴（作者态 Rig 的同一轨道没有这根轴）、编辑的键中该参数离开默认值时，该格点是生成的；关键形 `set` 写入它时，每个这样的通道写成一条带 `channel`（`opacity` / `draw_order` / `multiply_color` / `screen_color`）的覆盖：`base` 为当时生成的值、`points` 为用户的值（标量一个数，颜色三个分量），重放时逐分量三方合并，冲突与孤立照常报告（`GeneratedOverrideIssue.channel`，质量报告的 `evidence.channel`）。同一条 `set` 中生成器没有键入的通道、日志自己在该轴上建立的轨道仍是普通日志编辑。复制到或复制自生成的通道格点、删除生成器在通道上的键同样在记录时拒绝。没有作者态 Rig 的调用方（`ownedWrites` 不传 `authored`）不识别通道覆盖，行为与之前相同。目前没有生成器在日志之后键入通道，这条路径为静态主光、穿透显示等会写颜色 / 透明度关键形的生成器准备。
 - 此前在这些关键形上的画布编辑写成普通 `canvas_geometry`，重放时参数尚不存在，整个重建失败，编辑无法提交；现在提交时改写为覆盖。
 - 生成器被删除、烘焙（摆动）、取消烘焙（模拟）或改变轴后，键不再对应生成的格点，覆盖不生效并报告为孤立，不会落到其下的静止形上。网格重新生成后顶点数变化同样报告为孤立。
 - 生成参数在默认值处的编辑仍是普通编辑，修改的是静止形状。旧工程中的命令不变；只有新的提交会写出覆盖。
@@ -114,7 +117,7 @@
 - 在其他对象上使用生成参数（打键、通道关键形、改名、改范围）时，先在日志中按生成器当前定义创建该参数（`GeneratedParameterAdoption`），之后参数属于文档，生成器沿用它；见[固化 Rig](MATERIALIZED_RIG.md#41-记录层与作用层)。
 - 覆盖不影响基础 Rig 生成：生成几何缓存的键忽略覆盖命令，增删覆盖不会让基础 Rig 重新生成。
 - **问题报告**：每次重放把未按记录生效的覆盖作为结构化记录（`GeneratedOverrideIssue`：类型 `conflict` / `orphaned`、生成器 ID、目标、完整键、冲突点数或孤立覆盖的点数、形状总点数，孤立时附原因 `missing_keyform` / `shape_mismatch` / `superseded`）存入 `BuiltRig.overrideIssues`，按日志顺序排列，不改变合并语义。被拆分取代的网格上的覆盖原因为 `superseded`。
-- `core/quality/GeneratedOverrideQuality` 把这些记录转为观察报告（版本 3，领域 `overrides`，两项检查：`generated_overrides`，以及 `superseded_entries`——版本 2 拆分之前、只因其取代的网格失败而按空操作重放的条目，等级 info）：冲突为 `GENERATED_OVERRIDE_CONFLICT`，孤立为 `GENERATED_OVERRIDE_ORPHANED`，等级由规则枚举唯一决定（均为 warning，`can_proceed` 恒为 true），不从文本推断；没有问题时报告完整且 findings 为空。MCP `workspace_inspect`（scope `project`，工程已加载时）返回 `quality.overrides`；严格结构见 `WorkspaceQualitySchemas`。
+- `core/quality/GeneratedOverrideQuality` 把这些记录转为观察报告（版本 4，领域 `overrides`，三项检查：`generated_overrides`；`superseded_entries`——版本 2 拆分之前、只因其取代的网格失败而按空操作重放的条目，等级 info；`see_through`——设置要求却没能制作的透过刘海复制件，`SEE_THROUGH_DROPPED`，等级 info）：冲突为 `GENERATED_OVERRIDE_CONFLICT`，孤立为 `GENERATED_OVERRIDE_ORPHANED`，等级由规则枚举唯一决定（均为 warning，`can_proceed` 恒为 true），不从文本推断；没有问题时报告完整且 findings 为空。MCP `workspace_inspect`（scope `project`，工程已加载时）返回 `quality.overrides`；严格结构见 `WorkspaceQualitySchemas`。
 - 检查器工具栏在有问题时显示计数徽标，选中对象的问题在检查器顶部列出；点击徽标切换为列出全部问题。文案按类型与原因代码本地化（中/英/日）。
 
 骨架烘焙的修正关键形没有改为覆盖（`skeleton.skin` 写在日志安放网格上的关键形除外，见[日志安放的网格](#日志安放的网格)）：骨架在编辑日志之前运行，日志中的画布编辑本来就在骨架之后重放，并会随网格重建一起迁移到新拓扑；改为覆盖反而会在重新划分网格后变成孤立。物理组与生成动作沿用已有的整体覆盖（同 ID 的用户物理组取代生成组，`builtin` 动作片段取代生成动作）。
@@ -414,6 +417,9 @@
 
 - 分类修改的剩余耗时在分析：生成的模型改为合并后不再走生成迁移，剩下导入 CMO3 模型的迁移与拆分基线对新栅格重复运行 `CharacterAnalyzer.analyze`（逐层分类约 0.5 s/次）；可按图层元数据与栅格摘要缓存分类结果。
 - 以混合形写回的模拟关键形的覆盖；覆盖报告并入统一质量检验框架后改用其规则注册表与栅栏。
+- 通道覆盖的已知限制（目前没有生成器在日志之后键入通道，这条路径不会触发；第一个这样的生成器加入前处理）：
+  - 关键形 `set` 写在生成通道轨道的静止格点（键中生成器的参数在默认值）时，`journalOnly` 只为几何编辑剥离生成器在默认值处的轴，通道编辑的键仍带这根轴，日志重放时会在用户自己的轨道上建出这根轴。
+  - 加入通道覆盖之前的版本把每条覆盖当作顶点或控制点坐标读取，要求数值个数为偶数：标量（1 个）与颜色（3 个）覆盖都会报“Invalid override form”，含通道覆盖的工程在旧版本中重放失败。
 - 打开工程时直接读取固化结果：作者态 Rig 的保存与读取、固化点、再生成合并与试运行均已实现（[固化 Rig · 实现进度](MATERIALIZED_RIG.md#10-实现进度)）；导入 CMO3 的模型在导入基线上从固化点重放，不单独由作者态 Rig 构建。
 
 

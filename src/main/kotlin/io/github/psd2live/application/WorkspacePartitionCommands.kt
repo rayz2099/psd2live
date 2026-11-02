@@ -15,7 +15,7 @@ internal object WorkspacePartitionEdits {
     val supported = setOf("source_split_polygon", "source_split_components")
 
     fun wouldDiscardEdits(model: RigPreviewModel, id: String): Boolean {
-        val ids = model.rig.layerIdByDrawableId.filterValues { it == id }.keys + id
+        val ids = model.rig.ownLayerIdByDrawableId.filterValues { it == id }.keys + id
         val edits = model.config.rigEdits
         fun references(value: JsonElement): Boolean = when (value) {
             is JsonObject -> value.values.any(::references)
@@ -37,7 +37,7 @@ internal object WorkspacePartitionEdits {
         val source = model.analysis.source.layers.firstOrNull { it.id.raw == id }
             ?: model.analysis.layers.firstOrNull { it.source.id.raw == id }?.source ?: return null
         if (source.clipped || source.blend != LayerBlend.Normal || source.channelMask != ChannelMask.ALL) return null
-        val drawable = model.rig.puppet.drawables.firstOrNull { it.id.raw == id || model.rig.layerIdByDrawableId[it.id.raw] == id }
+        val drawable = model.rig.puppet.drawables.firstOrNull { it.id.raw == id || model.rig.ownLayerIdByDrawableId[it.id.raw] == id }
             ?: return null
         return drawable.mesh?.let { mesh ->
             MeshComponentSplit.detectCanvas(mesh, source, Cmo3ModelImport.textureCanvas(model, drawable), checkpoint)
@@ -85,7 +85,7 @@ internal object WorkspacePartitionEdits {
         work.progress(0.75f, "Preserving partition generation context")
         if (!imported) return materialize(document, model, id, pieces, sides, names, componentPlan, request, work)
         if (!migrate) return install(document, model, id, pieces, sides)
-        val drawable = model.rig.puppet.drawables.single { model.rig.layerIdByDrawableId[it.id.raw] == id || it.id.raw == id }
+        val drawable = model.rig.puppet.drawables.single { model.rig.ownLayerIdByDrawableId[it.id.raw] == id || it.id.raw == id }
         val geometry = geometry(model, drawable, componentPlan, request, pieces.size, work)
         val frozen = WorkspaceLayerInsertionEdits.freeze(document, model)
         var next = install(frozen, model, id, pieces, sides)
@@ -93,8 +93,10 @@ internal object WorkspacePartitionEdits {
         val command = SourcePartitionJournal.encode(model.rig.puppet, drawable.id, pieces.map { it.id.raw }, ids, names, geometry,
             textureSource = if (model.config.rigEdits.importedCmo3 == null) PuppetSourceAtlas.SOURCE_ID_RAW else Cmo3ModelImport.PAINT_SOURCE_ID,
             followCutVertices = componentPlan == null)
-        val overlay = SourcePartitionJournal.migrateSimulations(
-            MeshGenerationBaseline.preserve(next.rigEdits, model.config), model.rig.puppet, drawable.id.raw, ids, geometry)
+        // The pieces take the original's place in its hit areas, as they take its simulations.
+        val overlay = RigHitAreas.replacingMeshes(SourcePartitionJournal.migrateSimulations(
+            MeshGenerationBaseline.preserve(next.rigEdits, model.config), model.rig.puppet, drawable.id.raw, ids, geometry),
+            mapOf(drawable.id.raw to ids))
         next = next.copy(rigEdits = overlay.copy(authoringJournal = overlay.authoringJournal + command,
                 importedLayerIds = if (overlay.importedCmo3 == null) overlay.importedLayerIds else
                     overlay.importedLayerIds + ids.zip(pieces.map { it.id.raw })))
@@ -122,7 +124,7 @@ internal object WorkspacePartitionEdits {
     private fun materialize(document: WorkspaceDocument, model: RigPreviewModel, id: String, pieces: List<WorkspaceSourceLayer>,
                             sides: List<Side>, names: List<String>, componentPlan: MeshComponentSplit.Plan?, request: JsonObject,
                             work: WorkspaceRasterWork): WorkspaceDocument {
-        val drawable = model.rig.puppet.drawables.single { model.rig.layerIdByDrawableId[it.id.raw] == id || it.id.raw == id }
+        val drawable = model.rig.puppet.drawables.single { model.rig.ownLayerIdByDrawableId[it.id.raw] == id || it.id.raw == id }
         val geometry = geometry(model, drawable, componentPlan, request, pieces.size, work)
         val frozen = WorkspaceLayerInsertionEdits.freeze(document, model)
         val pieceIds = WorkspaceArtPrimitives.allocate(frozen, model, pieces)
@@ -150,8 +152,8 @@ internal object WorkspacePartitionEdits {
                 classification.copy(side = sides[index].takeUnless { it == Side.NONE } ?: classification.side))
         }
         return WorkspaceArtPrimitives.materialize({ generated ->
-            val simulations = SourcePartitionJournal.migrateSimulations(MeshGenerationBaseline.preserve(frozen.rigEdits, model.config),
-                authored, drawable.id.raw, pieceIds, geometry)
+            val simulations = RigHitAreas.replacingMeshes(SourcePartitionJournal.migrateSimulations(MeshGenerationBaseline.preserve(frozen.rigEdits, model.config),
+                authored, drawable.id.raw, pieceIds, geometry), mapOf(drawable.id.raw to pieceIds))
             // Generated parts take the bones of the original; their parents are generated unless the original's was chosen.
             val overlay = if (generated) SourcePartitionJournal.migrateBones(simulations, drawable.id.raw, pieceIds) else simulations
             WorkspaceArtPrimitives.replaceLayer(frozen, model, id, pieces, sides, explicitParentOnly = generated).copy(rigEdits = overlay.copy(
@@ -169,7 +171,7 @@ internal object WorkspacePartitionEdits {
         } ?: LayerClassificationOverride()
         val ids = pieces.map { it.id.raw }
         val parent = if (id in document.parentOverrides) document.parentOverrides[id] else model.rig.puppet.drawables.firstOrNull {
-            it.id.raw == id || model.rig.layerIdByDrawableId[it.id.raw] == id
+            it.id.raw == id || model.rig.ownLayerIdByDrawableId[it.id.raw] == id
         }?.parentDeformerId?.raw
         val owner = if (document.source.layers.any { it.id.raw == id }) id else document.source.layers
             .map { it.id.raw }.filter { id.startsWith("$it:") }.maxByOrNull(String::length)
@@ -192,7 +194,7 @@ internal object WorkspacePartitionEdits {
                 (document.source.layers.map { it.id.raw }.filterNot { it in document.deletedLayerIds } + model.analysis.layers.map { it.source.id.raw }).sorted().toSet()
             }))
         // Allocate identities before rebuilding, so subsequent batch members and reopen use the same names.
-        val existing = model.rig.layerIdByDrawableId.map { (drawable, layer) -> layer to DrawableId(drawable) }.toMap() +
+        val existing = model.stableLayerIdByDrawableId.map { (drawable, layer) -> layer to DrawableId(drawable) }.toMap() +
             document.rigEdits.splitDrawableIds.mapValues { DrawableId(it.value) }
         val analysis = MouthLipLayers.prepare(RigGenerationSource.analyze(next.source, next.config()), next.config())
         val stable = RigBuilder.assignSplitDrawableIds(analysis, existing).mapValues { it.value.raw }

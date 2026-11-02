@@ -8,10 +8,8 @@ import org.lwjgl.opengl.GL14
 import org.lwjgl.opengl.GL15
 import org.lwjgl.opengl.GL20
 import org.lwjgl.opengl.GL30
-import org.lwjgl.system.MemoryUtil
 import org.umamo.render.glsl.desktopCompositeShaderSources
 import java.awt.image.BufferedImage
-import java.awt.image.DataBufferInt
 import java.util.IdentityHashMap
 
 /**
@@ -62,6 +60,8 @@ internal class P2lrtGlRenderer : AutoCloseable {
 	/** Page textures by the atlas page image they were made from, so a reload with unchanged pages uploads nothing. */
 	private val textures = IdentityHashMap<BufferedImage, Int>()
 	private var pageTextures: List<Int> = emptyList()
+	/** How the page textures sample, following the settings. */
+	private val filtering = FilteringFollower(mipmaps = true)
 	private val multiplyColor = FloatArray(3)
 	private val screenColor = FloatArray(3)
 	/** One layer per nesting depth, the destination snapshot a composite reads and the mask coverage; grow-only. */
@@ -72,6 +72,11 @@ internal class P2lrtGlRenderer : AutoCloseable {
 	private var capacityHeight = 0
 	private var frameWidth = 0
 	private var frameHeight = 0
+	/** Reused per frame: group ends and the stack that finds them, plus one color scratch per nesting depth. */
+	private var groupEndsBuffer = IntArray(0)
+	private var groupStack = IntArray(0)
+	private val groupMultiplyScratch = ArrayList<FloatArray>()
+	private val groupScreenScratch = ArrayList<FloatArray>()
 
 	init {
 		program = link(VERTEX, FRAGMENT, bindAttributes = true)
@@ -131,18 +136,19 @@ internal class P2lrtGlRenderer : AutoCloseable {
 			val (image, texture) = iterator.next()
 			if (image !in kept) { GL11.glDeleteTextures(texture); iterator.remove() }
 		}
-		pageTextures = pages.map { page -> textures.getOrPut(page) { upload(page) } }
+		pageTextures = pages.map { page -> textures.getOrPut(page) { PageTextures.upload(page, mipmaps = true, filtering.current) } }
 	}
 
 	/**
-	 * Draws [rig] as its last evaluation left it into the bound framebuffer of [width] × [height] pixels.
+	 * Draws [rig] as its last evaluation left it into [framebuffer] (bound) of [width] × [height] pixels.
 	 * Canvas pixel (x, y) lands at view pixel `x * scale + offsetX`, `y * scale + offsetY`, y down.
 	 */
-	fun draw(rig: P2lRuntime.Rig, width: Int, height: Int, scale: Float, offsetX: Float, offsetY: Float) {
+	fun draw(rig: P2lRuntime.Rig, framebuffer: Int, width: Int, height: Int, scale: Float, offsetX: Float, offsetY: Float) {
 		if (meshes.isEmpty()) return
+		filtering.follow { textures.values.asSequence() }
 		frameWidth = width
 		frameHeight = height
-		val target = Surface(GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING))
+		val target = Surface(framebuffer)
 		GL20.glUseProgram(program)
 		// The frame's top row goes to clip y = -1, the texture's first row, which Skia samples as the top.
 		val sx = 2f * scale / width
@@ -161,11 +167,29 @@ internal class P2lrtGlRenderer : AutoCloseable {
 			GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, 0L, vertices)
 		}
 		val commands = rig.renderCommands()
-		drawSpan(rig, commands, groupEnds(commands), 0, commands.size, target, 0)
+		drawSpan(rig, commands, groupEndsInto(commands), 0, commands.size, target, 0)
 		GL11.glDisable(GL11.GL_STENCIL_TEST)
 		GL11.glDisable(GL11.GL_CULL_FACE)
 		GL30.glBindVertexArray(0)
 		GL20.glUseProgram(0)
+	}
+
+	/**
+	 * [groupEnds]' result in a buffer reused between frames: the commands' group structure changes with visibility,
+	 * but its length is bounded by the command count, so allocating each frame is avoidable.
+	 */
+	private fun groupEndsInto(commands: IntArray): IntArray {
+		if (groupEndsBuffer.size < commands.size) groupEndsBuffer = IntArray(commands.size)
+		else java.util.Arrays.fill(groupEndsBuffer, 0, commands.size, 0)
+		if (groupStack.size < commands.size) groupStack = IntArray(commands.size)
+		var depth = 0
+		for (i in commands.indices) {
+			val command = commands[i]
+			if (command <= -2) groupStack[depth++] = i
+			else if (command == P2lRuntime.END_GROUP && depth > 0) groupEndsBuffer[groupStack[--depth]] = i
+		}
+		while (depth > 0) groupEndsBuffer[groupStack[--depth]] = commands.size
+		return groupEndsBuffer
 	}
 
 	/** Draws commands [from] until [to] into [surface]; layers it needs come from [depth] on. */
@@ -204,8 +228,9 @@ internal class P2lrtGlRenderer : AutoCloseable {
 
 	private fun drawGroup(rig: P2lRuntime.Rig, part: Int, commands: IntArray, ends: IntArray, from: Int, to: Int, surface: Surface, depth: Int) {
 		val info = parts.getOrNull(part) ?: return drawSpan(rig, commands, ends, from, to, surface, depth)
-		val groupMultiply = FloatArray(3)
-		val groupScreen = FloatArray(3)
+		// One pair per nesting depth: a child group composites with its own arrays after drawing.
+		val groupMultiply = groupScratch(groupMultiplyScratch, depth)
+		val groupScreen = groupScratch(groupScreenScratch, depth)
 		val groupOpacity = rig.partComposite(part, groupMultiply, groupScreen)
 		if (!(groupOpacity > 0f)) return
 		val blend = colorMode(info.blend)
@@ -219,6 +244,11 @@ internal class P2lrtGlRenderer : AutoCloseable {
 		val masked = info.masks.isNotEmpty()
 		if (masked) drawCoverage(info.masks)
 		compositeLayer(surface, layers[depth], blend, alphaBlend, groupOpacity.coerceAtMost(1f), groupMultiply, groupScreen, masked, info.invertMask)
+	}
+
+	private fun groupScratch(scratch: ArrayList<FloatArray>, depth: Int): FloatArray {
+		while (scratch.size <= depth) scratch.add(FloatArray(3))
+		return scratch[depth]
 	}
 
 	/**
@@ -415,44 +445,6 @@ internal class P2lrtGlRenderer : AutoCloseable {
 		coverage = null
 		capacityWidth = 0
 		capacityHeight = 0
-	}
-
-	/** Uploads [image] premultiplied, with mipmaps so a zoomed-out preview does not shimmer. */
-	private fun upload(image: BufferedImage): Int {
-		val width = image.width
-		val height = image.height
-		val raster = (image.raster.dataBuffer as? DataBufferInt)?.data?.takeIf { it.size == width * height }
-		val premultipliedInput = raster != null && image.type == BufferedImage.TYPE_INT_ARGB_PRE
-		val source = if (raster != null && (premultipliedInput || image.type == BufferedImage.TYPE_INT_ARGB)) raster
-			else image.getRGB(0, 0, width, height, null, 0, width)
-		val pixels = MemoryUtil.memAlloc(width * height * 4)
-		try {
-			for (i in 0 until width * height) {
-				val c = source[i]
-				val a = c ushr 24
-				if (premultipliedInput || a == 255) {
-					pixels.put((c ushr 16 and 0xff).toByte()).put((c ushr 8 and 0xff).toByte()).put((c and 0xff).toByte()).put(a.toByte())
-				} else {
-					pixels.put((((c ushr 16 and 0xff) * a + 127) / 255).toByte()).put((((c ushr 8 and 0xff) * a + 127) / 255).toByte())
-						.put((((c and 0xff) * a + 127) / 255).toByte()).put(a.toByte())
-				}
-			}
-			pixels.flip()
-			val texture = GL11.glGenTextures()
-			GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture)
-			GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4)
-			clearGlErrors()
-			GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8, width, height, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, pixels)
-			GL30.glGenerateMipmap(GL11.GL_TEXTURE_2D)
-			checkTextureUpload(texture, width, height)
-			GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR_MIPMAP_LINEAR)
-			GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR)
-			GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE)
-			GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE)
-			return texture
-		} finally {
-			MemoryUtil.memFree(pixels)
-		}
 	}
 
 	private fun releaseMeshes() {

@@ -529,8 +529,8 @@ internal fun ToolDetailsView(
                         color = colors.textMuted,
                     )
                 }
-                CanvasTool.KNIFE -> {
-                    Text(expandShortcutMarkup(tr("editor.knifeGestureHint"), editor.state.keymap), style = typography.caption, color = colors.textMuted)
+                CanvasTool.MESH_POINT -> {
+                    Text(expandShortcutMarkup(tr(editor.meshPointMode.hintKey), editor.state.keymap), style = typography.caption, color = colors.textMuted)
                 }
                 CanvasTool.SKELETON_POSE -> {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -686,7 +686,7 @@ private fun PaintToolDetailsColumn(editor: CanvasEditor, target: CanvasTarget?) 
     val layerId = editor.targetLayerId(paintT)
     val layerName = layerId?.let { lid ->
         editor.state.previewModel?.rig?.puppet?.drawables
-            ?.firstOrNull { editor.state.previewModel?.rig?.layerIdByDrawableId?.get(it.id.raw) == lid }
+            ?.firstOrNull { editor.state.previewModel?.rig?.ownLayerIdByDrawableId?.get(it.id.raw) == lid }
             ?.name ?: lid
     }
 

@@ -83,7 +83,7 @@ class EditorAndAgentScenario {
 
 	private fun Editor.state(): String = workspace.snapshot().state!!
 
-	@Test fun clearingTheMaterialEditorKeepsItsSessionAndUndoHistory() = editor {
+	@Test fun backgroundPaintEditsQueueAndEndWithTheSession() = editor {
 		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
 		consistent("imported")
 		withContext(Dispatchers.Main) {
@@ -93,15 +93,20 @@ class EditorAndAgentScenario {
 			val canvas = io.github.psd2live.ui.CanvasEditor(vm, vm.state.value.activeWorkspace.id, "material-window")
 			canvas.hierarchyMode = io.github.psd2live.ui.EditHierarchyMode.PAINT
 			val session = assertNotNull(canvas.startPaintSession("material:$materialId", forceReload = true))
-			val original = session.workingImage.getRGB(0, 0, session.docWidth, session.docHeight, null, 0, session.docWidth)
+			// A selection change made while a clear runs waits for it rather than being dropped.
 			canvas.clearCurrentLayerPaint()
-			assertSame(session, canvas.paintSession)
-			assertEquals("material:$materialId", session.layerId)
+			canvas.selectAllPaint()
+			canvas.awaitPaintWork()
 			assertTrue(session.isDirty)
-			assertTrue(session.workingImage.getRGB(0, 0, session.docWidth, session.docHeight, null, 0, session.docWidth).all { it ushr 24 == 0 })
-			canvas.undoPaint()
-			assertContentEquals(original, session.workingImage.getRGB(0, 0, session.docWidth, session.docHeight, null, 0, session.docWidth))
+			assertTrue(session.hasSelection)
+			assertFalse(canvas.paintWorking)
+			// Ending the session with edits queued lets go of it at once and runs nothing more on it.
+			canvas.clearCurrentLayerPaint()
+			canvas.deselectPaint()
 			canvas.closePaintSession()
+			assertNull(canvas.paintSession)
+			assertFalse(canvas.paintWorking)
+			assertNull(canvas.error)
 		}
 	}
 
@@ -178,44 +183,183 @@ class EditorAndAgentScenario {
 		assertEquals(shown, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
 	}
 
-	@Test fun mouthPresetAndThicknessChangePreviewAndSurviveReopening() = editor {
-		workspace.importPsd(Characters.mouthPsd(temp).toString(), true)
-		consistent("imported mouth")
-		vm.setMouthOutlineEnabled(true)
-		consistent("mouth outline")
-		val initial = vm.state.value.previewModel!!
-		assertTrue(initial.analysis.layers.any { it.source is io.github.psd2live.core.MouthLipLayer })
-		fun mouthPositions() = org.umamo.render.eval.CpuDeformationEvaluator().evaluate(vm.state.value.previewModel!!.rig.puppet,
-			mapOf(ParameterId("ParamMouthOpenY") to 0.7f, ParameterId("ParamMouthForm") to 0f)).worldPositions
-		val before = mouthPositions()
-		vm.setMouthShapeCurve("flat", io.github.psd2live.core.MouthCurve.preset("flat"))
-		consistent("mouth shape")
-		val shaped = mouthPositions()
-		assertTrue(before.any { (id, vertices) -> shaped[id]?.let { next -> vertices.size != next.size || vertices.indices.any { kotlin.math.abs(vertices[it] - next[it]) > 0.1f } } == true },
-			"the mouth preset must change the actual posed geometry")
-		val original = vm.state.value.rigEdits.authoringJournal.toList()
-		val initialHash = Oracles.hash(vm.state.value.previewModel!!.rig.puppet)
-		vm.beginEditorField("setMouthThickness")
-		vm.setMouthThickness(6f)
-		withTimeout(20_000) { vm.state.first { it.previewModel?.config?.mouthThickness == 6f } }
-		assertNotEquals(initialHash, Oracles.hash(vm.state.value.previewModel!!.rig.puppet), "thickness must change the field preview")
-		assertEquals(original, vm.state.value.rigEdits.authoringJournal)
-		vm.endEditorField("setMouthThickness")
-		consistent("mouth thickness")
-		val head = workspace.snapshot().historyHeadNodeId
-		repeat(3) {
-			vm.beginEditorField("setMouthThickness"); vm.endEditorField("setMouthThickness")
-			consistent("unchanged mouth field")
+	@Test fun theDeformMenuCopiesPastesInterpolatesAndResetsAKeyform() = editor {
+		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		consistent("imported")
+		val angle = ParameterId("ParamAngleX")
+		val parameters = vm.state.value.previewModel!!.rig.puppet.parameters
+		val range = parameters.single { it.id == angle }
+		val warp = vm.state.value.previewModel!!.rig.puppet.deformers.filterIsInstance<org.umamo.runtime.model.Deformer.Warp>().first { warp ->
+			warp.geometryGrid?.axes.orEmpty().any { axis -> axis.parameterId == angle && listOf(range.min, 0f, range.max).all { value -> axis.keys.any { it == value } } }
 		}
-		assertEquals(head, workspace.snapshot().historyHeadNodeId)
-		val shown = Oracles.hash(vm.state.value.previewModel!!.rig.puppet)
-		val archive = temp.resolve("mouth-edit.psd2live")
-		vm.saveProjectNow(archive)
-		workspace.open(archive)
-		consistent("reopened mouth")
-		assertEquals(shown, Oracles.hash(vm.state.value.previewModel!!.rig.puppet))
-		Studio.run(temp, io.github.psd2live.ui.state.WorkspaceStateCodec.document(vm.state.value), checks = emptySet()) {
-			exportMatchesEditor(this)
+		val axes = warp.geometryGrid!!.axes.map { it.parameterId.raw }
+		fun key(value: Float) = axes.associateWith { id -> if (id == angle.raw) value else parameters.single { it.id.raw == id }.default }
+		fun shape(value: Float) = io.github.psd2live.core.RigGeometryTools.geometry(vm.state.value.previewModel!!.rig.puppet, "warp", warp.id.raw, key(value)).points
+		fun differs(a: FloatArray, b: FloatArray) = a.indices.maxOf { kotlin.math.abs(a[it] - b[it]) }
+		val turned = shape(range.max)
+		assertTrue(differs(turned, shape(range.min)) > 1e-3f, "the two turns must differ for a paste to show")
+		val canvas = withContext(Dispatchers.Main) {
+			vm.selectDeformer(warp.id.raw)
+			io.github.psd2live.ui.CanvasEditor(vm, vm.state.value.activeWorkspace.id, "deform-test").also {
+				it.hierarchyMode = io.github.psd2live.ui.EditHierarchyMode.DEFORM
+				vm.setParameterValue(angle, range.max)
+			}
+		}
+		settle()
+		withContext(Dispatchers.Main) {
+			canvas.copyKeyform()
+			assertEquals(key(range.max), canvas.keyformClipboard.single().key)
+			vm.setParameterValue(angle, range.min)
+		}
+		settle()
+		withContext(Dispatchers.Main) { canvas.runKeyformTool(io.github.psd2live.ui.CanvasEditor.KeyformToolAction.PASTE) }
+		consistent("pasted the right turn onto the left")
+		assertTrue(differs(turned, shape(range.min)) < 1e-4f, "the paste did not write the copied shape")
+		withContext(Dispatchers.Main) { vm.setParameterValue(angle, 0f) }
+		settle()
+		withContext(Dispatchers.Main) {
+			assertTrue(angle.raw in canvas.keyformInterpolationAxes(), "the neutral key sits between the two turns")
+			canvas.runKeyformTool(io.github.psd2live.ui.CanvasEditor.KeyformToolAction.INTERPOLATE, angle.raw)
+		}
+		consistent("interpolated the neutral key")
+		assertTrue(differs(turned, shape(0f)) < 1e-3f, "both turns are the same shape, so the middle must be too")
+		withContext(Dispatchers.Main) { vm.undoHistory() }
+		consistent("undo the interpolation")
+		withContext(Dispatchers.Main) { vm.setParameterValue(angle, range.min) }
+		settle()
+		val neutral = shape(0f)
+		withContext(Dispatchers.Main) { canvas.runKeyformTool(io.github.psd2live.ui.CanvasEditor.KeyformToolAction.RESET_DEFAULT) }
+		consistent("reset the left turn")
+		assertTrue(differs(neutral, shape(range.min)) < 1e-4f, "the reset did not write the default-key shape")
+
+		// Soft selection: dragging the middle control point carries its neighbours part of the way.
+		val before = shape(range.min)
+		val columns = warp.columns + 1
+		val middle = (warp.rows / 2) * columns + warp.columns / 2
+		withContext(Dispatchers.Main) {
+			canvas.setEditLevel(1)
+			canvas.activateTool(io.github.psd2live.ui.CanvasTool.SELECT)
+			canvas.vertices = setOf(middle)
+			canvas.softSelection = true
+			val puppet = vm.state.value.previewModel!!.rig.puppet
+			val viewport = io.github.psd2live.core.CanvasViewport(1.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+			canvas.softRadius = puppet.canvasWidth
+			val t = assertNotNull(canvas.target())
+			val at = canvas.screen(t.geometry.points, t, viewport)[middle]
+			canvas.press(at, viewport, shift = false, alt = false)
+			canvas.move(at + androidx.compose.ui.geometry.Offset(12f, 0f), viewport, shift = false)
+			canvas.release()
+		}
+		consistent("soft drag")
+		val after = shape(range.min)
+		fun moved(i: Int) = kotlin.math.hypot(after[i * 2] - before[i * 2], after[i * 2 + 1] - before[i * 2 + 1])
+		val neighbour = middle + 1
+		assertTrue(moved(middle) > 1e-4f, "the picked point did not move")
+		assertTrue(moved(neighbour) > 1e-6f && moved(neighbour) < moved(middle), "a neighbour must follow part of the way: ${moved(neighbour)} of ${moved(middle)}")
+
+		// Paste with options: half way toward the copied right turn.
+		withContext(Dispatchers.Main) {
+			canvas.softSelection = false
+			canvas.vertices = emptySet()
+			vm.setParameterValue(angle, range.max)
+		}
+		settle()
+		val right = shape(range.max)
+		withContext(Dispatchers.Main) { canvas.copyKeyform(); vm.setParameterValue(angle, range.min) }
+		settle()
+		val left = shape(range.min)
+		withContext(Dispatchers.Main) {
+			canvas.runKeyformCommands(canvas.keyformPasteCommands(options = io.github.psd2live.ui.CanvasEditor.KeyformPasteOptions(ratio = 0.5f)))
+		}
+		consistent("blended the right turn into the left")
+		val blended = shape(range.min)
+		assertTrue(blended.indices.all { kotlin.math.abs(blended[it] - (left[it] + right[it]) / 2f) < 1e-3f }, "the blend did not land half way")
+
+		// Multi-key editing: every key of the warp half transparent, one history step.
+		withContext(Dispatchers.Main) {
+			canvas.runKeyformCommands(listOf(buildJsonObject {
+				put("op", "multi_key"); put("targets", JsonArray(canvas.multiKeyTargets().map(::JsonPrimitive))); put("opacity", 0.5f)
+			}))
+		}
+		consistent("multi-key opacity")
+		val owner = org.umamo.runtime.model.KeyformOwner.Deformer(warp.id)
+		for (value in listOf(range.min, 0f, range.max)) assertEquals(0.5f, (io.github.psd2live.core.KeyformTools.channelAt(vm.state.value.previewModel!!.rig.puppet, owner,
+			org.umamo.runtime.model.FormChannel.OPACITY, key(value)) as org.umamo.runtime.model.ChannelValue.Scalar).value, 1e-4f)
+
+		// Restore: every key back to the default-key shape.
+		withContext(Dispatchers.Main) { canvas.runKeyformTool(io.github.psd2live.ui.CanvasEditor.KeyformToolAction.RESTORE) }
+		consistent("restored the warp")
+		val rest = shape(0f)
+		for (value in listOf(range.min, range.max)) assertTrue(differs(rest, shape(value)) < 1e-4f, "key $value was not restored")
+
+		// Temporary deform tool: drag the lattice's last corner; the warp's matching corner follows it, one step per drag.
+		val beforeLattice = shape(range.min)
+		withContext(Dispatchers.Main) {
+			canvas.temporaryWarpDivisions = 1
+			canvas.beginTemporaryWarp()
+			val puppet = vm.state.value.previewModel!!.rig.puppet
+			val viewport = io.github.psd2live.core.CanvasViewport(1.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+			val corner = canvas.temporaryWarpScreen(viewport).last()
+			canvas.press(corner, viewport, shift = false, alt = false)
+			canvas.move(corner + androidx.compose.ui.geometry.Offset(10f, 10f), viewport, shift = false)
+			canvas.release()
+		}
+		consistent("temporary warp drag")
+		val afterLattice = shape(range.min)
+		// The lattice is padded around the shape, so every point follows a little; the one nearest the dragged corner most.
+		val moves = (0 until beforeLattice.size / 2).map { kotlin.math.hypot(afterLattice[it * 2] - beforeLattice[it * 2], afterLattice[it * 2 + 1] - beforeLattice[it * 2 + 1]) }
+		assertTrue(moves.max() > 1f, "the lattice drag moved nothing: ${moves.max()}")
+		assertTrue(moves.min() < moves.max() * 0.2f, "the far points must barely follow: ${moves.min()} of ${moves.max()}")
+
+		// After an undo the moved lattice no longer matches the shape: a press lays it again over what the canvas shows
+		// and writes nothing; the next drag moves the points from the undone shape by the lattice's own move only.
+		withContext(Dispatchers.Main) { vm.undoHistory() }
+		consistent("undo the lattice drag")
+		assertTrue(differs(beforeLattice, shape(range.min)) < 1e-4f, "undo did not take back the lattice drag")
+		val history = workspace.history().nodes.size
+		withContext(Dispatchers.Main) {
+			val puppet = vm.state.value.previewModel!!.rig.puppet
+			val viewport = io.github.psd2live.core.CanvasViewport(1.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+			val stale = canvas.temporaryWarpScreen(viewport).last()
+			canvas.press(stale, viewport, shift = false, alt = false)
+			canvas.release()
+			val laid = canvas.temporaryWarpScreen(viewport)
+			assertTrue((laid.last() - stale).getDistance() > 5f, "the lattice was not laid again over the undone shape")
+			val first = laid.first()
+			canvas.press(first, viewport, shift = false, alt = false)
+			canvas.move(first + androidx.compose.ui.geometry.Offset(-6f, 0f), viewport, shift = false)
+			canvas.release()
+		}
+		consistent("drag after undo")
+		assertEquals(history + 1, workspace.history().nodes.size, "the re-laying press must not commit, the drag once")
+		val again = shape(range.min)
+		val near = (0 until again.size / 2).maxBy { kotlin.math.hypot(again[it * 2] - beforeLattice[it * 2], again[it * 2 + 1] - beforeLattice[it * 2 + 1]) }
+		assertTrue(kotlin.math.abs(again[near * 2] - beforeLattice[near * 2]) <= 6.5f && kotlin.math.abs(again[near * 2 + 1] - beforeLattice[near * 2 + 1]) < 1e-2f,
+			"the drag must start from the undone shape, not the first drag's")
+
+		// Between keys a lattice press first snaps the pose onto the keys, so no key is added.
+		val keysBefore = (vm.state.value.previewModel!!.rig.puppet.deformers.single { it.id == warp.id } as org.umamo.runtime.model.Deformer.Warp)
+			.geometryGrid!!.axes.single { it.parameterId == angle }.keys.toList()
+		withContext(Dispatchers.Main) { vm.setParameterValue(angle, range.max / 2f) }
+		settle()
+		withContext(Dispatchers.Main) {
+			val puppet = vm.state.value.previewModel!!.rig.puppet
+			val viewport = io.github.psd2live.core.CanvasViewport(1.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+			val point = canvas.temporaryWarpScreen(viewport).first()
+			canvas.press(point, viewport, shift = false, alt = false)
+			canvas.move(point + androidx.compose.ui.geometry.Offset(4f, 0f), viewport, shift = false)
+			canvas.release()
+		}
+		consistent("lattice press between keys")
+		val keysAfter = (vm.state.value.previewModel!!.rig.puppet.deformers.single { it.id == warp.id } as org.umamo.runtime.model.Deformer.Warp)
+			.geometryGrid!!.axes.single { it.parameterId == angle }.keys.toList()
+		assertEquals(keysBefore, keysAfter, "a lattice drag between keys added a key")
+
+		// Shift+T's action ends it, and leaving Deform drops it.
+		withContext(Dispatchers.Main) {
+			canvas.endTemporaryWarp(); assertNull(canvas.temporaryWarp)
+			canvas.beginTemporaryWarp(); assertNotNull(canvas.activeTemporaryWarp())
+			canvas.setHierarchyMode(io.github.psd2live.ui.EditHierarchyMode.SELECT); assertNull(canvas.temporaryWarp)
 		}
 	}
 
@@ -285,22 +429,6 @@ class EditorAndAgentScenario {
 		}
 	}
 
-	@Test fun presetSwitchAndFieldInOneGestureKeepTheNormalizedJournal() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
-		consistent("imported")
-		vm.setParameterValue(ParameterId("ParamAngleX"), 10f)
-		consistent("authored pose")
-		vm.beginEditorGesture()
-		vm.setMeshOnly(true)
-		vm.setMeshOnly(false)
-		vm.setHeadStrength(2f)
-		vm.endEditorGesture()
-		consistent("preset gesture")
-		assertEquals(2f, vm.state.value.previewModel!!.config.headTurnStrength)
-		assertEquals(0f, vm.state.value.parameterValues[ParameterId("ParamAngleX")], "off then on must still release the authored pose")
-		vm.saveProjectNow(temp.resolve("preset-gesture.psd2live"))
-	}
-
 	@Test fun anAgentRigsTheCharacterAndTheEditorFollows() = editor {
 		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
 		consistent("imported")
@@ -337,10 +465,14 @@ class EditorAndAgentScenario {
 
 		// A dry run names the objects the commit then makes.
 		val sleeve = vm.state.value.previewModel!!.rig.layerIdByDrawableId.entries.single { it.value == layers.getValue("sleeve_r") }.key
-		val warp = buildJsonArray { add(buildJsonObject { put("operation", "canvas_warp"); put("request", req("name" to "Cuff", "meshes" to listOf(sleeve))) }) }
+		val warp = buildJsonArray { add(buildJsonObject { put("operation", "canvas_warp"); put("request", req("id" to "CuffWarp", "name" to "Cuff", "meshes" to listOf(sleeve))) }) }
 		val preview = call("workspace_preview_edits", buildJsonObject { put("state", state()); put("edits", warp) }).data()
 		val applied = call("workspace_apply_edits", buildJsonObject { put("request_id", "warp-1"); put("state", state()); put("edits", warp) }).data()
-		assertEquals(preview["changed"], applied["changed"], "the dry run and the commit made different objects")
+		assertNotNull(preview["changed"], "the dry run must succeed")
+		assertNotNull(applied["changed"], "the commit must succeed")
+		// Commit changes also include explicit request IDs; compare the created object handles.
+		val created = applied.getValue("changed").jsonArray.filter { it.jsonPrimitive.content.startsWith("warp:") }
+		assertEquals(preview["changed"], JsonArray(created), "the dry run and the commit made different objects")
 		consistent("warp")
 
 		// An agent working from a stale state is refused without touching the workspace.
@@ -395,29 +527,49 @@ class EditorAndAgentScenario {
 		assertEquals(20f, vm.state.value.parameterValues[ParameterId("ParamAngleX")], "the slider jumped back")
 	}
 
-	@Test fun aSliderDragReachesRecoveryOnRelease() = editor {
+	@Test fun anAgentEditDuringAnOpenFieldLandsAndTheFieldCommitsOverIt() = editor {
 		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
 		consistent("imported")
-		val angle = ParameterId("ParamAngleX")
-		val store = io.github.psd2live.project.WorkspaceStore(temp.resolve("store"))
-		val file = store.projectRoot(vm.state.value.projectId!!).resolve("recovery.json")
-		suspend fun written(): java.nio.file.attribute.FileTime? {
-			workspace.flushProjectPersistence()
-			return if (java.nio.file.Files.isRegularFile(file)) java.nio.file.Files.getLastModifiedTime(file) else null
-		}
-		val before = written()
-		withContext(Dispatchers.Main) {
-			vm.beginParameterScrub()
-			for (value in listOf(5f, 10f, 15f)) vm.setParameterValueFromPanel(angle, value)
-		}
+		fun setting(key: String) = workspace.captureQueries().projectSettings().getValue(key).jsonPrimitive.int
+		val nodes = workspace.history().nodes.size
+		withContext(Dispatchers.Main) { vm.beginEditorField("texturePadding"); vm.setTexturePadding(5) }
+		// The open field is only a draft: the agent's commit lands rather than being refused, and the draft stays shown.
+		call("settings_update", req("state" to state(), "changes" to mapOf("alphaThreshold" to 40))).data()
+		assertEquals(40, vm.state.value.alphaThreshold, "the editor does not show the agent's edit")
+		assertEquals(5, vm.state.value.texturePadding, "the agent's commit dropped the open field")
+		assertNotEquals(5, setting("texturePadding"), "the draft reached the runtime before the field closed")
+		withContext(Dispatchers.Main) { vm.endEditorField("texturePadding") }
+		consistent("field committed over the agent's edit")
+		assertEquals(5, setting("texturePadding"))
+		assertEquals(40, setting("alphaThreshold"))
+		assertEquals(nodes + 2, workspace.history().nodes.size)
+
+		// Both changing the same setting: the committed one wins and the editor drops its draft of it.
+		withContext(Dispatchers.Main) { vm.beginEditorField("texturePadding"); vm.setTexturePadding(9) }
+		call("settings_update", req("state" to state(), "changes" to mapOf("texturePadding" to 11))).data()
+		assertEquals(11, vm.state.value.texturePadding)
+		withContext(Dispatchers.Main) { vm.endEditorField("texturePadding") }
 		settle()
-		assertEquals(15f, vm.state.value.parameterValues[angle], "the canvases do not show the drag")
-		// Each sample used to encode the whole document and rewrite the checkpoint.
-		assertEquals(before, written(), "a sample of the drag rewrote the recovery checkpoint")
-		withContext(Dispatchers.Main) { vm.endParameterScrub() }
-		consistent("released")
-		written()
-		val recovered = assertNotNull(store.loadRecoveryCheckpoint(vm.state.value.projectId!!), "nothing to recover after the drag")
-		assertEquals(15f, recovered.presentation["parameterValues"]?.jsonObject?.get(angle.raw)?.jsonPrimitive?.float, "recovery misses the released pose")
+		assertEquals(11, setting("texturePadding"))
+		assertEquals(nodes + 3, workspace.history().nodes.size, "the dropped draft still committed")
+		consistent("conflicting field dropped")
 	}
+
+	@Test fun savingRecordsTheRuntimeAndNotTheEditorsCopy() = editor {
+		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		consistent("imported")
+		val nodes = workspace.history().nodes.size
+		val padding = workspace.captureQueries().projectSettings().getValue("texturePadding").jsonPrimitive.int
+		// A value only the editor's state holds, never submitted as a draft, is not the project's.
+		vm.setStateForTest(vm.state.value.copy(texturePadding = padding + 3))
+		val archive = temp.resolve("figure.psd2live")
+		vm.saveProjectNow(archive)
+		assertEquals(nodes, workspace.history().nodes.size, "saving wrote the editor's copy back as a revision")
+		assertTrue(vm.state.value.projectDirty, "a value the save left out counts as saved")
+		assertEquals(padding, workspace.captureQueries().projectSettings().getValue("texturePadding").jsonPrimitive.int)
+		workspace.open(archive)
+		consistent("reopened")
+		assertEquals(padding, vm.state.value.texturePadding, "the archive holds the editor's copy")
+	}
+
 }

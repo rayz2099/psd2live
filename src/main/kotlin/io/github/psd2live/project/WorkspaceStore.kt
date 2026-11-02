@@ -2,6 +2,7 @@ package io.github.psd2live.project
 
 import io.github.psd2live.core.LayerClassificationOverride
 import io.github.psd2live.core.LayerType
+import io.github.psd2live.core.PartRole
 import io.github.psd2live.core.RigEditOverlay
 import io.github.psd2live.core.RigKeyformChannelsEdit
 import io.github.psd2live.core.RigKeyformCopyEdit
@@ -51,6 +52,8 @@ import org.umamo.runtime.model.ParameterKind
 import java.io.ByteArrayOutputStream
 import java.nio.file.AccessDeniedException
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -264,16 +267,9 @@ internal class WorkspaceStore(
                 val target = destinationRoot.resolve(stage.source.relativize(file)).normalize()
                 check(target.startsWith(destinationRoot)) { "Asset candidate escaped its project" }
                 Files.createDirectories(target.parent)
-                if (Files.exists(target)) {
-                    // Raster names address RGBA/dimensions; keep the existing PNG encoder output.
-                    val same = target.parent == destinationRoot.resolve("blobs") ||
-                        if (target.fileName.toString().endsWith(".json")) readJson(file) == readJson(target) else Files.mismatch(file, target) == -1L
-                    require(same) { "Immutable asset content changed" }
-                } else {
-                    try { Files.move(file, target, StandardCopyOption.ATOMIC_MOVE) }
-                    catch (_: AtomicMoveNotSupportedException) { Files.move(file, target) }
-                    created.add(target)
-                }
+                // Raster names address RGBA/dimensions; keep the existing PNG encoder output.
+                val acceptExisting = target.parent == destinationRoot.resolve("blobs")
+                if (publishImmutable(file, target, acceptExisting)) created.add(target)
             } }
             checkCancelled()
             beforePublished()
@@ -286,12 +282,9 @@ internal class WorkspaceStore(
         }
     }
 
-	/**
-	 * Writes [state]'s history nodes, HEAD and the snapshot of each revision this store does not have, except the
-	 * revisions whose snapshot key ([snapshotKey]) is in [staged]: a save stages those in the archive layout already.
-	 */
+	/** Writes [state]'s history nodes, HEAD and the snapshot of each revision this store does not have. */
 	@Synchronized
-	fun persistHistory(projectId: String, state: WorkspaceHistoryState<WorkspaceDocument>, staged: Set<String> = emptySet()) {
+	fun persistHistory(projectId: String, state: WorkspaceHistoryState<WorkspaceDocument>) {
 		val project = projectRoot(projectId)
 		// The rig objects checkpoints name are part of the document: on disk before the snapshot that names them.
 		val rigObjects = project.resolve(ProjectFormatV2.WORKING_RIG_OBJECTS)
@@ -303,7 +296,7 @@ internal class WorkspaceStore(
 			if (nodePath in stored) continue
 			val snapshotPath = project.resolve("history/snapshots/${fileKey(selection.node.snapshotHash)}.json")
 			val key = fileKey(selection.node.snapshotHash)
-			if (key !in staged && !hasSnapshot(project, key)) {
+			if (!hasSnapshot(project, key)) {
 				io.github.psd2live.core.RigObjects.writeTo(rigObjects, io.github.psd2live.core.RigCheckpoint.hashes(selection.snapshot.rigEdits.authoringJournal))
 				val snapshotBytes = shareContent(encodeDocument(selection.snapshot, project), project).toString().encodeToByteArray()
 				writeAtomic(snapshotPath, snapshotBytes, replace = false, pretty = false)
@@ -320,6 +313,49 @@ internal class WorkspaceStore(
                 putJsonArray("nodeOrder") { state.selections.forEach { add(JsonPrimitive(it.node.id)) } }
 			}.toString().encodeToByteArray(),
 		)
+	}
+
+	/**
+	 * Writes [state] into the v2 archive layout under a save's staging [root], without snapshot files: the history
+	 * nodes and HEAD under `history/`, and each revision whose snapshot key ([snapshotKey]) is not in [staged] (linked
+	 * from the archive mirror already) encoded and split into document nodes ([ProjectFormatV2.split]). Rasters go to
+	 * this store's `blobs/`, which [ProjectFormatV2.pack] moves into the archive; rig objects go to its `rig/objects/`.
+	 * Returns the revisions split, by snapshot key.
+	 */
+	@Synchronized
+	fun packHistory(projectId: String, state: WorkspaceHistoryState<WorkspaceDocument>, root: Path,
+	                staged: Set<String> = emptySet()): Map<String, ProjectFormatV2.Packed> {
+		val project = projectRoot(projectId)
+		val history = root.resolve("history")
+		val rigObjects = root.resolve(ProjectFormatV2.RIG_OBJECTS)
+		// Revisions share journal entries, so each payload is written and hashed once.
+		val payloads = ProjectFormatV2.PayloadHashes()
+		val packed = LinkedHashMap<String, ProjectFormatV2.Packed>()
+		// Revisions name mostly the same rig objects: each is written once.
+		val written = HashSet<String>()
+		for (selection in state.selections) {
+			val key = fileKey(selection.node.snapshotHash)
+			if (key !in staged && key !in packed) {
+				io.github.psd2live.core.RigObjects.writeTo(rigObjects, io.github.psd2live.core.RigCheckpoint.hashes(selection.snapshot.rigEdits.authoringJournal).filter(written::add))
+				val snapshot = encodeDocument(selection.snapshot, project)
+				val index = ProjectFormatV2.split(root, snapshot, ProjectFormatV2.PAYLOAD_MIN_CHARS.takeIf { ProjectFormatV2.needsNewerSchema(snapshot) }, payloads)
+				ProjectFormatV2.writeRevision(root, key, index)
+				packed[key] = ProjectFormatV2.Packed(index, rasterFiles(snapshot))
+			}
+			writePretty(history.resolve("nodes/${fileKey(selection.node.id)}.json"), encodeNode(selection.node))
+		}
+		writePretty(history.resolve("HEAD.json"), buildJsonObject {
+			put("version", STORE_VERSION)
+			put("headNodeId", state.headNodeId)
+			putJsonArray("nodeOrder") { state.selections.forEach { add(JsonPrimitive(it.node.id)) } }
+		})
+		return packed
+	}
+
+	/** [value] at [path] in a fresh staging directory, formatted as [writeAtomic] formats JSON. */
+	private fun writePretty(path: Path, value: JsonObject) {
+		Files.createDirectories(path.parent)
+		Files.write(path, json.encodeToString(JsonElement.serializer(), json.parseToJsonElement(value.toString())).encodeToByteArray())
 	}
 
 	@Synchronized
@@ -525,6 +561,7 @@ internal class WorkspaceStore(
 					put("side", override.side.name)
 					put("parameter", override.parameter)
 					put("switchId", override.switchId)
+					override.role?.let { put("part", it.name) }
 				})
 			}
 		}
@@ -573,7 +610,11 @@ internal class WorkspaceStore(
             putJsonArray("swings") { document.rigEdits.swingEdits.forEach { add(it.toJson()) } }
             putJsonArray("motions") { document.rigEdits.motionClips.forEach { add(io.github.psd2live.core.MotionClips.toJson(it)) } }
             if (document.rigEdits.motionPresets.isNotEmpty()) put("motionPresets", io.github.psd2live.core.MotionPresets.toJson(document.rigEdits.motionPresets))
+            // Only a document that took its expressions in or has a pose writes them, so others keep their stored form.
+            document.rigEdits.expressions?.let { expressions -> putJsonArray("expressions") { expressions.forEach { add(io.github.psd2live.core.ModelExpressions.toJson(it)) } } }
+            document.rigEdits.pose?.let { put("pose", io.github.psd2live.core.ModelPoses.toJson(it)) }
             if (document.rigEdits.simEdits.isNotEmpty()) putJsonArray("simulations") { document.rigEdits.simEdits.forEach { add(encodeSimulation(it)) } }
+            if (document.rigEdits.hitAreas.isNotEmpty()) putJsonArray("hitAreas") { document.rigEdits.hitAreas.forEach { add(io.github.psd2live.core.RigHitAreas.toJson(it)) } }
 			putJsonArray("parameters") {
 				document.rigEdits.parameterEdits.forEach { edit ->
 					add(buildJsonObject {
@@ -687,6 +728,8 @@ internal class WorkspaceStore(
 				side = enumValue(override.requiredString("side")),
 				parameter = override.requiredString("parameter"),
 				switchId = override.requiredInt("switchId"),
+				// A role a later version knows and this one does not reads as left to the analysis.
+				role = override["part"]?.jsonPrimitive?.contentOrNull?.let { name -> PartRole.entries.firstOrNull { it.name == name } },
 			)
 		}
 		val rigEditObject = value.optionalObject("rigEdits")
@@ -715,7 +758,10 @@ internal class WorkspaceStore(
             swingEdits = rigEditObject.optionalArray("swings").map { io.github.psd2live.core.RigSwingEdit.fromJson(it.jsonObject) },
             motionClips = rigEditObject.optionalArray("motions").map { io.github.psd2live.core.MotionClips.fromJson(it.jsonObject) },
             motionPresets = io.github.psd2live.core.MotionPresets.fromJson(rigEditObject["motionPresets"]?.jsonObject),
+            expressions = rigEditObject["expressions"]?.jsonArray?.map { io.github.psd2live.core.ModelExpressions.fromJson(it.jsonObject) },
+            pose = rigEditObject["pose"]?.jsonObject?.let(io.github.psd2live.core.ModelPoses::fromJson),
             simEdits = rigEditObject.optionalArray("simulations").map { decodeSimulation(it.jsonObject, bakes) },
+            hitAreas = rigEditObject.optionalArray("hitAreas").map { io.github.psd2live.core.RigHitAreas.fromJson(it.jsonObject) },
 			parameterEdits = rigEditObject.optionalArray("parameters").map { element ->
 				val edit = element.jsonObject
 				RigParameterEdit(
@@ -1192,11 +1238,11 @@ internal class WorkspaceStore(
 		try {
 			val output = if (pretty && path.fileName.toString().endsWith(".json")) json.encodeToString(JsonElement.serializer(), json.parseToJsonElement(bytes.decodeToString())).encodeToByteArray() else bytes
             Files.write(temporary, output, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
-			val options = if (replace) {
-				arrayOf(StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-			} else {
-				arrayOf(StandardCopyOption.ATOMIC_MOVE)
+			if (!replace) {
+				publishNoReplace(temporary, path)
+				return
 			}
+			val options = arrayOf(StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
 			// Windows refuses to replace a file another process (a scanner or indexer) holds open for a moment.
 			var attempt = 0
 			while (true) {
@@ -1204,12 +1250,11 @@ internal class WorkspaceStore(
 					try {
 						Files.move(temporary, path, *options)
 					} catch (_: AtomicMoveNotSupportedException) {
-						if (replace) Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING)
-						else Files.move(temporary, path)
+						Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING)
 					}
 					break
 				} catch (error: AccessDeniedException) {
-					if (!replace || ++attempt >= REPLACE_ATTEMPTS) throw error
+					if (++attempt >= REPLACE_ATTEMPTS) throw error
 					Thread.sleep(10L * attempt)
 				}
 			}
@@ -1217,6 +1262,56 @@ internal class WorkspaceStore(
 			Files.deleteIfExists(temporary)
 		}
 	}
+
+	/**
+	 * Publishes [temporary] at [path] without replacing a file that is already there. [StandardCopyOption.ATOMIC_MOVE]
+	 * alone is rename(2) on POSIX and would silently replace it; a hard link fails when the target exists on every
+	 * platform that has links, with a verified move as the fallback.
+	 */
+	private fun publishNoReplace(temporary: Path, path: Path) {
+		try {
+			Files.createLink(path, temporary)
+			return
+		} catch (_: FileAlreadyExistsException) {
+		} catch (_: UnsupportedOperationException) {
+		} catch (_: FileSystemException) {
+		}
+		if (Files.exists(path)) {
+			require(sameFileContent(temporary, path)) { "Immutable file content changed: ${path.fileName}" }
+			return
+		}
+		try { Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE) }
+		catch (_: AtomicMoveNotSupportedException) { Files.move(temporary, path) }
+	}
+
+	/** [source] into [target] without replacing what is there; true when this call created [target]. */
+	private fun publishImmutable(source: Path, target: Path, acceptExisting: Boolean): Boolean {
+		if (Files.exists(target)) {
+			if (!acceptExisting) require(sameFileContent(source, target)) { "Immutable asset content changed" }
+			Files.delete(source)
+			return false
+		}
+		try {
+			Files.createLink(target, source)
+			Files.delete(source)
+			return true
+		} catch (_: FileAlreadyExistsException) {
+		} catch (_: UnsupportedOperationException) {
+		} catch (_: FileSystemException) {
+		}
+		if (Files.exists(target)) {
+			if (!acceptExisting) require(sameFileContent(source, target)) { "Immutable asset content changed" }
+			Files.delete(source)
+			return false
+		}
+		try { Files.move(source, target, StandardCopyOption.ATOMIC_MOVE) }
+		catch (_: AtomicMoveNotSupportedException) { Files.move(source, target) }
+		return true
+	}
+
+	/** Whether two immutable files hold the same content; JSON compares objects so formatting does not matter. */
+	private fun sameFileContent(a: Path, b: Path): Boolean =
+		if (b.fileName.toString().endsWith(".json")) readJson(a) == readJson(b) else Files.mismatch(a, b) == -1L
 
 	private fun fileKey(value: String): String = sha256(value.encodeToByteArray())
 
@@ -1535,9 +1630,6 @@ internal class WorkspaceStore(
 			}
 			return true
 		}
-
-		/** Working-store folders holding content shared by snapshots; [expandSnapshot] reads them. */
-		internal val sharedContentFolders = listOf("history/journal", "history/payloads", "history/bakes")
 
 		fun defaultRoot(): Path {
 			System.getProperty("psd2live.agent.store")?.takeIf(String::isNotBlank)?.let { return Path.of(it) }

@@ -611,7 +611,7 @@ private fun HierarchyTreeList(
 	val (deformerChildrenMap, drawableChildrenMap) = remember(deformers, drawables, parentOverrides, sort, meshBounds, sortDrawOrders) {
 		val (deformerChildren, drawableChildren) = buildHierarchyChildrenMaps(deformers, drawables, parentOverrides)
 		sortHierarchyChildren(deformerChildren, drawableChildren, sort, meshBounds) { drawable ->
-			val layerId = model.rig.layerIdByDrawableId[drawable.id.raw] ?: drawable.id.raw
+			val layerId = model.rig.ownLayerIdByDrawableId[drawable.id.raw] ?: drawable.id.raw
 			state.getEffectiveDrawOrder(drawable.id.raw, layerId, drawable.drawOrder)
 		}
 	}
@@ -822,7 +822,7 @@ private fun HierarchyTreeList(
 						}
 					}
 					state.selectedLayerId?.let { layerId ->
-						val drawableId = model.rig.layerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
+						val drawableId = model.rig.ownLayerIdByDrawableId.entries.firstOrNull { it.value == layerId }?.key
 						val drawable = drawableId?.let { id -> model.rig.puppet.drawables.firstOrNull { it.id.raw == id } }
 						collectAncestors(drawable?.let { state.hierarchyParentOverrides[it.id.raw] ?: it.parentDeformerId?.raw })
 					}
@@ -840,7 +840,7 @@ private fun HierarchyTreeList(
 					else {
 						val label = when {
 							state.selectedLayerId != null -> {
-								val drawableId = model.rig.layerIdByDrawableId.entries.firstOrNull { it.value == state.selectedLayerId }?.key
+								val drawableId = model.rig.ownLayerIdByDrawableId.entries.firstOrNull { it.value == state.selectedLayerId }?.key
 								model.rig.puppet.drawables.firstOrNull { it.id.raw == drawableId }?.name
 									?: state.selectedLayerId
 							}
@@ -1360,7 +1360,10 @@ private fun DeformerTreeItem(
 							}
 							.onPointerEvent(PointerEventType.Press) { event ->
 								if (event.button == PointerButton.Secondary) {
-									menuClickOffset = event.changes.firstOrNull()?.position ?: Offset.Zero
+									// The menu anchors to the chain row, so the segment-local press has to be
+									// moved into row coordinates before it can position the popup.
+									val localPress = event.changes.firstOrNull()?.position ?: Offset.Zero
+									menuClickOffset = (segmentBoundsInRow[segmentId]?.topLeft ?: Offset.Zero) + localPress
 									if (state.selectedDeformerId != segmentId) {
 										viewModel.selectDeformer(segmentId)
 									}
@@ -1656,14 +1659,18 @@ internal fun DrawableTreeItem(
 				.onPointerEvent(PointerEventType.Press) { event ->
 					meshPreviewHover?.value = null
 					if (event.button == PointerButton.Secondary) {
-						val clickPos = event.changes.firstOrNull()?.position ?: Offset.Zero
-						menuClickOffset = clickPos
-						if (layerId != null && !isLayerSelected) {
-							viewModel.selectLayer(layerId)
+						// A row without a reference or a layer has no actions here, so it must not open a
+						// menu that would only repeat its name.
+						if (reference != null || layerId != null) {
+							val clickPos = event.changes.firstOrNull()?.position ?: Offset.Zero
+							menuClickOffset = clickPos
+							if (layerId != null && !isLayerSelected) {
+								viewModel.selectLayer(layerId)
+							}
+							treeDragState.clear()
+							event.changes.firstOrNull()?.consume()
+							showMenu = true
 						}
-						treeDragState.clear()
-						event.changes.firstOrNull()?.consume()
-						showMenu = true
 					} else if (event.button == PointerButton.Primary) {
 						val parent = containerCoordinates
 						val coords = rowCoords
@@ -1739,10 +1746,13 @@ internal fun DrawableTreeItem(
 			}
 		}
 
+        val menuSelectionCount = if (layerId != null && layerId in state.selectedLayerIds)
+            state.selectedLayerIds.size else 1
         PressMenu(expanded = showMenu, onDismissRequest = { showMenu = false }, press = menuClickOffset) {
             if (reference != null) ReferenceMenu(reference, state, viewModel, close = { showMenu = false })
             else ArtMeshMenu(drawable, layerId, effectiveParent(drawable.id.raw, drawable.parentDeformerId?.raw, state.hierarchyParentOverrides),
-                state, viewModel, close = { showMenu = false }, onRequestSetOrder = onRequestSetOrder, onRequestCreate = onRequestCreate)
+                state, viewModel, close = { showMenu = false }, onRequestSetOrder = onRequestSetOrder, onRequestCreate = onRequestCreate,
+                selectionCount = menuSelectionCount)
         }
 	}
 }

@@ -47,12 +47,13 @@ internal object RigRegenerationCheckpoint {
 		checkpoint()
 		// The new generation as the entries up to the boundary see it: later splits' parts not yet in place.
 		val records = after.authoringJournal.subList(0, boundary)
-		val (previous, seen) = ArtPrimitiveReplay.withVersion1Parts(current.baseRig.resolvedPuppet().reboundTo(base.puppet.atlas, base.puppet.sources),
+		val (old, seen) = ArtPrimitiveReplay.withVersion1Parts(current.baseRig.resolvedPuppet().reboundTo(base.puppet.atlas, base.puppet.sources),
 			current.baseRig.primitiveSkins, base.resolvedPuppet(records.filter(ArtPrimitiveV2::isV2)), base.primitiveSkins, records)
+		val previous = RigMeshSeed.previous(old, after)
 		if (PuppetIr.toIr(previous) == PuppetIr.toIr(seen)) return null
 		checkpoint()
-		val record = merged(RigGenerationFrames.named(previous, records), RigGenerationFrames.named(seen, records), current.authored, base,
-			bindingKey, seen, checkpoint).record
+		val record = merged(named(previous, records), named(seen, records), current.authored, base,
+			bindingKey, seen, records, checkpoint).record
 		val journal = ArrayList<JsonObject>(after.authoringJournal).apply { add(boundary, record) }
 		return next.copy(rigEdits = after.copy(authoringJournal = journal))
 	}
@@ -93,7 +94,9 @@ internal object RigRegenerationCheckpoint {
 		val overrides = earlier.filter { GeneratedOverrides.isOverride(it) && it["target"]?.jsonPrimitive?.contentOrNull == "mesh:${original.raw}" }
 		val m = authored.rig.puppet.let { if (overrides.isEmpty()) it else GeneratedOverrides.applyAll(it, overrides).model }.reboundTo(atlas, sources)
 		val splitAuthored = requireNotNull(parts.split(m, user = true)) { "The split original is not in the authored rig: ${original.raw}" }
-		val splitGenerated = parts.split(previous, user = false) ?: previous.withDrawablesDeleted(setOf(original))
+		// [original] is named as the authored rig names it: the generated rig is split under those names ([named]), once.
+		val generatedOriginal = named(previous, earlier)
+		val splitGenerated = parts.split(generatedOriginal, user = false) ?: generatedOriginal.withDrawablesDeleted(setOf(original))
 		checkpoint()
 		val ids = partLayers.keys.map { it.raw }
 		val rig = authored.rig.copy(puppet = splitAuthored,
@@ -104,14 +107,14 @@ internal object RigRegenerationCheckpoint {
 		val targets = authored.visibilityTargets.flatMap { (id, target) ->
 			if (id != original.raw) listOf(id to target) else partLayers.entries.map { (part, partLayer) -> part.raw to partLayer }
 		}
-		val record = merged(RigGenerationFrames.named(splitGenerated, earlier), RigGenerationFrames.named(seen, earlier), AuthoredRig(rig, targets),
-			base, bindingKey, seen, checkpoint).record
+		val record = merged(splitGenerated, named(seen, earlier), AuthoredRig(rig, targets),
+			base, bindingKey, seen, earlier, checkpoint).record
 		return next.copy(rigEdits = next.rigEdits.copy(authoringJournal = journal + record))
 	}
 
 	/** [RigMergeRepair.stale] for [model], with the deformer names a generation migration gave the authored rig. */
 	fun staleMerges(model: RigPreviewModel, checkpoint: () -> Unit = {}): List<RigRegeneration.Issue> =
-		RigMergeRepair.stale(model, RigGenerationFrames::named, checkpoint)
+		RigMergeRepair.stale(model, ::named, checkpoint)
 
 	/** A regeneration with this build's generators: the new configuration and what its merge reported. */
 	class Update(val config: PipelineConfig, val issues: List<RigRegeneration.Issue>)
@@ -136,14 +139,21 @@ internal object RigRegenerationCheckpoint {
 		val (previous, now) = ArtPrimitiveReplay.withVersion1Parts(stored.authored.rig.puppet.reboundTo(atlas, sources), PrimitiveSkins.None,
 			base.resolvedPuppet(journal.subList(0, index).filter(ArtPrimitiveV2::isV2)), base.primitiveSkins, journal.subList(0, index),
 			replayOnPrevious = false)
-		val repair = RigMergeRepair.repaired(overlay, current.authored.rig.puppet, atlas, sources, RigGenerationFrames::named, checkpoint)
+		val repair = RigMergeRepair.repaired(overlay, current.authored.rig.puppet, atlas, sources, ::named, checkpoint)
 		if (repair == null && PuppetIr.toIr(previous) == PuppetIr.toIr(now)) return null
 		checkpoint()
 		val authored = repair?.let { current.authored.copy(rig = current.authored.rig.copy(puppet = it.authored)) } ?: current.authored
-		val merged = merged(RigGenerationFrames.named(previous, journal), RigGenerationFrames.named(now, journal), authored, base, bindingKey,
-			now, checkpoint)
+		val merged = merged(named(previous, journal), named(now, journal), authored, base, bindingKey,
+			now, journal, checkpoint)
 		return Update(current.config.copy(rigEdits = overlay.copy(authoringJournal = journal + merged.record)), repair?.issues.orEmpty() + merged.issues)
 	}
+
+	/**
+	 * A generated rig under the names the authored rig gives its objects: the deformers a generation migration renamed
+	 * ([RigGenerationFrames.named]), then the IDs the journal's conversions changed ([RigIdConversion.converted]).
+	 */
+	private fun named(generated: PuppetModel, journal: List<JsonObject>): PuppetModel =
+		RigIdConversion.converted(RigGenerationFrames.named(generated, journal), journal)
 
 	private class Merged(val record: JsonObject, val issues: List<RigRegeneration.Issue>)
 
@@ -152,19 +162,27 @@ internal object RigRegenerationCheckpoint {
 	 * the generation the checkpoint was made from.
 	 */
 	private fun merged(previous: PuppetModel, next: PuppetModel, authored: AuthoredRig, base: BuiltRig, bindingKey: String,
-	                   generated: PuppetModel, checkpoint: () -> Unit): Merged {
+	                   generated: PuppetModel, journal: List<JsonObject>, checkpoint: () -> Unit): Merged {
 		val result = RigRegeneration.merge(previous, next, authored.rig.puppet.reboundTo(base.puppet.atlas, base.puppet.sources), checkpoint)
 		val model = result.model
 		val ids = model.drawables.mapTo(HashSet()) { it.id.raw }
-		fun <V> joined(generatedMap: Map<String, V>, user: Map<String, V>) = (user + generatedMap).filterKeys { it in ids }
+		// The base's maps under the IDs the journal's conversions gave its meshes, as [previous] and [next] are named.
+		val renamed = RigIdConversion.renames(journal).of("mesh")
+		// A new generation can make an object under an ID a conversion gave another: both would answer to it.
+		val clashes = (RigIdCheck.conflicts(next) + base.layerIdByDrawableId.keys.filter { id -> id !in renamed && id in renamed.values }.map { "mesh $it" })
+			.distinct().map { RigRegeneration.Issue(RigRegeneration.IssueKind.CONFLICT, it.replace(' ', ':'), "converted_id") }
+		val issues = result.issues + clashes
+		fun <V> joined(generatedMap: Map<String, V>, user: Map<String, V>) =
+			(user + if (renamed.isEmpty()) generatedMap else generatedMap.mapKeys { renamed[it.key] ?: it.key }).filterKeys { it in ids }
 		val rig = base.copy(puppet = model,
 			layerIdByDrawableId = joined(base.layerIdByDrawableId, authored.rig.layerIdByDrawableId),
 			sourceBoundsByDrawableId = joined(base.sourceBoundsByDrawableId, authored.rig.sourceBoundsByDrawableId),
 			pageByDrawableId = model.drawables.filter { it.id.raw in base.pageByDrawableId || it.id.raw in authored.rig.pageByDrawableId }
 				.associate { it.id.raw to it.texturePage },
-			supersededEntryNotes = authored.rig.supersededEntryNotes, overrideIssues = emptyList())
-		val record = RigCheckpoint.encode(AuthoredRig(rig, authored.visibilityTargets.filter { it.first in ids }), bindingKey, result.issues,
+			supersededEntryNotes = authored.rig.supersededEntryNotes, overrideIssues = emptyList(),
+			copiedDrawableIds = (base.copiedDrawableIds.map { renamed[it] ?: it } + authored.rig.copiedDrawableIds).filterTo(HashSet()) { it in ids })
+		val record = RigCheckpoint.encode(AuthoredRig(rig, authored.visibilityTargets.filter { it.first in ids }), bindingKey, issues,
 			generated = AuthoredRig(base.copy(puppet = generated), emptyList()))
-		return Merged(record, result.issues)
+		return Merged(record, issues)
 	}
 }

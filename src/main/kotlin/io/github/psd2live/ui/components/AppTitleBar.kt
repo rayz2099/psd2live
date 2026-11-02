@@ -1,6 +1,20 @@
 package io.github.psd2live.ui.components
 
+import io.github.psd2live.ui.views.texture.LocalMenuGlide
+import io.github.psd2live.ui.views.texture.glideRow
+import io.github.psd2live.ui.views.texture.MenuGlide
+import io.github.psd2live.ui.views.texture.menuPanel
+import io.github.psd2live.ui.views.texture.menuAppearance
+import io.github.psd2live.ui.theme.Corners
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
@@ -37,7 +51,9 @@ import androidx.compose.material.Divider
 import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,6 +70,9 @@ import io.github.psd2live.ui.tutorial.TutorialStep
 import io.github.psd2live.ui.tutorial.TutorialTargetId
 import io.github.psd2live.ui.tutorial.tutorialTarget
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.awt.ComposeWindow
 import androidx.compose.ui.zIndex
 import androidx.compose.foundation.layout.offset
@@ -70,6 +89,7 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,13 +98,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
-import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowState
 import io.github.psd2live.i18n.AppLanguage
 import io.github.psd2live.i18n.I18n
 import io.github.psd2live.i18n.tr
 import io.github.psd2live.ui.theme.LocalToolColors
 import io.github.psd2live.ui.state.AppPage
+import io.github.psd2live.ui.state.AppSettings
+import io.github.psd2live.ui.state.WindowMode
+import io.github.psd2live.ui.utils.LocalNativeTitleBar
+import io.github.psd2live.ui.utils.MainWindowModes
+import io.github.psd2live.ui.utils.NativeTitleBar
+import androidx.compose.ui.input.pointer.PointerEventPass
 import io.github.psd2live.ui.views.PageIcon
 import io.github.psd2live.ui.state.Keymap
 import io.github.psd2live.ui.state.ShortcutAction
@@ -165,6 +190,8 @@ fun AppTitleBar(
 	onShowTextureUpscale: () -> Unit,
 	onStartScreen: () -> Unit = {},
 	onMeshSplitScan: () -> Unit = {},
+	onFindReplace: () -> Unit = {},
+	onConvertIds: () -> Unit = {},
 	/** Tools > Upgrade split records: enabled while the document holds version 1 split records. */
 	canUpdateGeneration: Boolean = false,
 	onUpdateGeneration: () -> Unit = {},
@@ -195,6 +222,8 @@ fun AppTitleBar(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 
+	val windowMode by AppSettings.windowModeFlow.collectAsState()
+
 	// Track which menu is open (null if none)
 	var activeMenu by remember { mutableStateOf<String?>(null) }
 	var activeSubmenu by remember { mutableStateOf<String?>(null) }
@@ -217,12 +246,57 @@ fun AppTitleBar(
 	var initialMouseLocation by remember { mutableStateOf<Point?>(null) }
 	var initialWindowLocation by remember { mutableStateOf<Point?>(null) }
 
+	// With the native frame, the system draws the window buttons and owns the bar's empty middle (drag, double-click,
+	// Snap); the bar tells it its height and leaves room for the buttons it reports.
+	val nativeTitleBar = LocalNativeTitleBar.current
+	val density = LocalDensity.current
+	var nativeInsets by remember(nativeTitleBar) { mutableStateOf(0.dp to 0.dp) }
+	// The runtime lays its buttons out after a height or size change, so their room is read once that has run.
+	val readNativeInsets = {
+		if (nativeTitleBar != null) java.awt.EventQueue.invokeLater {
+			val scale = window?.graphicsConfiguration?.defaultTransform?.scaleX?.toFloat() ?: 1f
+			val toDp = { inset: Float -> with(density) { (inset * scale).toDp() } }
+			nativeInsets = toDp(nativeTitleBar.leftInset) to toDp(nativeTitleBar.rightInset)
+		}
+	}
+	if (nativeTitleBar != null) {
+		LaunchedEffect(nativeTitleBar, darkTheme) { nativeTitleBar.setDarkControls(darkTheme) }
+		DisposableEffect(nativeTitleBar, window) {
+			val resized = object : java.awt.event.ComponentAdapter() {
+				override fun componentResized(e: java.awt.event.ComponentEvent) = readNativeInsets()
+			}
+			window?.addComponentListener(resized)
+			readNativeInsets()
+			onDispose { window?.removeComponentListener(resized) }
+		}
+	}
+	// Homebrew JDK cannot report the traffic-light inset. The buttons overlay this bar, so leave their width.
+	val macChrome = io.github.psd2live.ui.utils.MacShell.active && window?.isUndecorated == false && nativeTitleBar == null
+	val trafficInset = if (macChrome && windowMode != WindowMode.FULLSCREEN) 78.dp else 0.dp
+	// The title is centered on the window, not in the gap between the menus and the toolbar buttons.
+	var macBarWidth by remember { mutableStateOf(0) }
+	var macSlotStart by remember { mutableStateOf(0) }
+	var macSlotWidth by remember { mutableStateOf(0) }
+
 	Row(
 		modifier = modifier
 			.fillMaxWidth()
 			.height(32.dp)
-			.background(colors.panelElevated)
-			.border(BorderStroke(1.dp, colors.divider)),
+			// The bar is the window's backdrop, like the gaps between the panels below it.
+			.background(colors.windowBackground)
+			.then(if (!macChrome) Modifier else Modifier.drawBehind {
+				val y = size.height - 0.5f
+				drawLine(colors.divider, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
+			})
+			.onGloballyPositioned { if (macChrome) macBarWidth = it.size.width }
+			.then(if (nativeTitleBar == null) Modifier else Modifier
+				.onGloballyPositioned { bar ->
+					// The runtime takes the height in the window's units: pixels over the display scale.
+					val scale = window?.graphicsConfiguration?.defaultTransform?.scaleY?.toFloat() ?: 1f
+					nativeTitleBar.height = bar.size.height / scale
+					readNativeInsets()
+				}
+				.titleBarHitTest(nativeTitleBar, client = true)),
 		verticalAlignment = Alignment.CenterVertically,
 	) {
 		// --- LEFT: Tool Menus ---
@@ -230,7 +304,7 @@ fun AppTitleBar(
 			modifier = Modifier.fillMaxHeight(),
 			verticalAlignment = Alignment.CenterVertically,
 		) {
-			Spacer(modifier = Modifier.width(6.dp))
+			Spacer(modifier = Modifier.width(6.dp + nativeInsets.first + trafficInset))
 
 			// 1. File Menu
 			TitleBarMenuItem(
@@ -541,6 +615,16 @@ fun AppTitleBar(
 							onResetZoom()
 						},
 					)
+					AppMenuItem(
+						text = tr(if (windowMode == WindowMode.FULLSCREEN) "menu.view.exitFullscreen" else "menu.view.fullscreen"),
+						shortcut = keymap.labelFor(ShortcutAction.TOGGLE_FULLSCREEN),
+						onHover = { activeSubmenu = null },
+						onClick = {
+							activeMenu = null
+							activeSubmenu = null
+							AppSettings.toggleFullscreen()
+						},
+					)
 
 				}
 			}
@@ -628,6 +712,21 @@ fun AppTitleBar(
 					AppMenuSeparator()
 
 					AppMenuItem(
+						text = tr("objectOps.findReplace"),
+						enabled = hasInput && !isBusy,
+						onHover = { activeSubmenu = null },
+						onClick = { activeMenu = null; activeSubmenu = null; onFindReplace() },
+					)
+					AppMenuItem(
+						text = tr("objectOps.convertIds"),
+						enabled = hasInput && !isBusy,
+						onHover = { activeSubmenu = null },
+						onClick = { activeMenu = null; activeSubmenu = null; onConvertIds() },
+					)
+
+					AppMenuSeparator()
+
+					AppMenuItem(
 						text = tr("menu.tools.updateGeneration"),
 						enabled = hasInput && !isBusy && canUpdateGeneration,
 						onHover = { activeSubmenu = null },
@@ -691,18 +790,17 @@ fun AppTitleBar(
 			modifier = Modifier
 				.weight(1f)
 				.fillMaxHeight()
-				.pointerInput(window, windowState) {
-					detectTapGestures(
-						onDoubleTap = {
-							windowState.placement = if (windowState.placement == WindowPlacement.Maximized) {
-								WindowPlacement.Floating
-							} else {
-								WindowPlacement.Maximized
-							}
-						}
-					)
+				.onGloballyPositioned {
+					if (macChrome) {
+						macSlotStart = it.positionInParent().x.toInt()
+						macSlotWidth = it.size.width
+					}
 				}
-				.pointerInput(window, windowState) {
+				.then(if (nativeTitleBar != null) Modifier.titleBarHitTest(nativeTitleBar, client = false) else Modifier
+				.pointerInput(window) {
+					detectTapGestures(onDoubleTap = { AppSettings.toggleMaximized() })
+				}
+				.pointerInput(window) {
 					detectDragGestures(
 						onDragStart = {
 							initialMouseLocation = MouseInfo.getPointerInfo()?.location
@@ -712,10 +810,14 @@ fun AppTitleBar(
 							change.consume()
 							val mouse = MouseInfo.getPointerInfo()?.location
 							val initMouse = initialMouseLocation
-							val initWin = initialWindowLocation
-							if (mouse != null && initMouse != null && initWin != null && window != null) {
-								if (windowState.placement == WindowPlacement.Maximized) {
-									windowState.placement = WindowPlacement.Floating
+							var initWin = initialWindowLocation
+							// A full-screen window stays put; a maximized one comes off the edge under the pointer.
+							if (mouse != null && initMouse != null && initWin != null && window != null && windowMode != WindowMode.FULLSCREEN) {
+								if (windowMode == WindowMode.MAXIMIZED) {
+									if (mouse.distance(initMouse) < 4.0) return@detectDragGestures
+									initWin = MainWindowModes.restoreForDrag(window, mouse)
+									initialWindowLocation = initWin
+									initialMouseLocation = mouse
 								}
 								window.setLocation(
 									initWin.x + (mouse.x - initMouse.x),
@@ -732,15 +834,23 @@ fun AppTitleBar(
 							initialWindowLocation = null
 						},
 					)
-				},
+				}),
 			contentAlignment = Alignment.Center,
 		) {
+			val macTitleShift = if (macChrome && macBarWidth > 0 && macSlotWidth > 0) {
+				macBarWidth / 2 - (macSlotStart + macSlotWidth / 2)
+			} else 0
 			Text(
-				text = "PSD2Live — $projectTitle",
-				style = typography.caption.copy(fontSize = 11.5.sp),
-				color = colors.textMuted,
+				text = if (macChrome) projectTitle.substringAfterLast('/').substringAfterLast('\\') else "PSD2Live — $projectTitle",
+				style = if (macChrome) typography.body.copy(fontFamily = FontFamily.Default, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+					else typography.caption.copy(fontSize = 11.5.sp),
+				color = if (macChrome) colors.textPrimary else colors.textMuted,
 				maxLines = 1,
 				overflow = TextOverflow.Ellipsis,
+				modifier = Modifier
+					.widthIn(max = 360.dp)
+					.offset { IntOffset(macTitleShift, 0) }
+					.padding(horizontal = 8.dp),
 			)
 		}
 
@@ -799,6 +909,11 @@ fun AppTitleBar(
 
 			Spacer(modifier = Modifier.width(4.dp))
 
+			if (nativeTitleBar != null || (io.github.psd2live.ui.utils.MacShell.active && window?.isUndecorated == false)) {
+				Spacer(Modifier.width(nativeInsets.second))
+				return@Row
+			}
+
 			// Minimize
 			WindowControlButton(
 				onClick = { windowState.isMinimized = true },
@@ -806,16 +921,10 @@ fun AppTitleBar(
 				GridIcon(Modifier.size(10.dp), colors.textPrimary) { line(1f, 9f, 17f, 9f) }
 			}
 
-			// Maximize / Restore
-			val isMaximized = windowState.placement == WindowPlacement.Maximized
+			// Maximize / Restore; in full screen, restore leaves it.
+			val isMaximized = windowMode != WindowMode.WINDOWED
 			WindowControlButton(
-				onClick = {
-					windowState.placement = if (isMaximized) {
-						WindowPlacement.Floating
-					} else {
-						WindowPlacement.Maximized
-					}
-				},
+				onClick = { AppSettings.toggleMaximized() },
 			) {
 				GridIcon(Modifier.size(10.dp), colors.textPrimary) {
 					if (isMaximized) {
@@ -852,10 +961,17 @@ private fun TitleBarMenuItem(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	var isHovered by remember { mutableStateOf(false) }
+	val fill by animateColorAsState(when {
+		isOpen -> colors.controlHover
+		isHovered -> colors.controlHover.copy(alpha = 0.6f)
+		else -> Color.Transparent
+	}, tween(Motion.Instant, easing = LinearOutSlowInEasing))
 
+	// The whole height of the bar answers the pointer; the fill sits inside it, as a control's does.
 	Box(
 		modifier = modifier
 			.fillMaxHeight()
+			.pressScale()
 			.handCursor()
 			.onPointerEvent(PointerEventType.Enter) {
 				isHovered = true
@@ -864,31 +980,57 @@ private fun TitleBarMenuItem(
 			.onPointerEvent(PointerEventType.Exit) {
 				isHovered = false
 			}
-			.background(
-				when {
-					isOpen -> colors.selection
-					isHovered -> colors.controlHover
-					else -> Color.Transparent
-				},
-				RoundedCornerShape(3.dp),
-			)
-			.clickable(onClick = onToggle)
-			.padding(horizontal = 10.dp),
+			.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onToggle)
+			.padding(vertical = 4.dp),
 		contentAlignment = Alignment.Center,
 	) {
-		Text(
-			text = title,
-			style = typography.body.copy(fontSize = 11.5.sp),
-			color = if (isOpen) colors.selectionText else colors.textPrimary,
-		)
+		Box(
+			Modifier.fillMaxHeight().background(fill, RoundedCornerShape(Corners.Control)).padding(horizontal = MenuTitleInset),
+			contentAlignment = Alignment.Center,
+		) {
+			Text(
+				text = title,
+				style = typography.body.copy(fontSize = 11.5.sp),
+				color = colors.textPrimary,
+			)
+		}
 		content()
 	}
 }
 
 /**
- * Clean and seamless dropdown menu built on Compose Popup.
- * Zero gap from the title bar, zero excessive inner margins, and edge-to-edge hover highlights.
- * Tutorial steps place the menu and its spotlight in the same full-window popup.
+ * A control shrinks the moment it is pressed and settles as the pointer comes up. Ease-out, so the first frames
+ * move immediately. Dragging off the control cancels it.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun Modifier.pressScale(): Modifier {
+	var pressed by remember { mutableStateOf(false) }
+	val scale by animateFloatAsState(
+		if (pressed) 0.96f else 1f,
+		tween(120, easing = LinearOutSlowInEasing),
+		label = "press",
+	)
+	return this
+		.onPointerEvent(PointerEventType.Press) { pressed = true }
+		.onPointerEvent(PointerEventType.Release) { pressed = false }
+		.onPointerEvent(PointerEventType.Exit) { pressed = false }
+		.graphicsLayer {
+			scaleX = scale
+			scaleY = scale
+		}
+}
+
+/** How far a title bar menu's name sits in from its button's edge; its menu's labels line up with it. */
+private val MenuTitleInset = 10.dp
+
+/** How far a menu row's label sits in from the menu's edge: the panel's padding and the row's own. */
+private val MenuRowInset = 4.dp + 8.dp
+
+/**
+ * A title bar menu, on the panel every menu sits on: it grows in from its button and leaves quicker than it came, its
+ * rows glide one highlight between them, and its labels line up under the button's name. Tutorial steps place the
+ * menu and its spotlight in the same full-window popup.
  */
 @Composable
 private fun AppSeamlessDropdownMenu(
@@ -900,11 +1042,13 @@ private fun AppSeamlessDropdownMenu(
     alignEnd: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    if (!expanded) return
-    val colors = LocalToolColors.current
+    val visibility = remember { MutableTransitionState(false) }
+    visibility.targetState = expanded
+    if (!visibility.currentState && !visibility.targetState) return
     val density = LocalDensity.current
-    val titleBarHeightPx = with(density) { 32.dp.roundToPx() }
-    val positionProvider = remember(tutorialOverlay != null, titleBarHeightPx, alignEnd) {
+    val gapPx = with(density) { 2.dp.roundToPx() }
+    val shiftPx = with(density) { (MenuRowInset - MenuTitleInset).roundToPx() }
+    val positionProvider = remember(tutorialOverlay != null, gapPx, shiftPx, alignEnd) {
         object : androidx.compose.ui.window.PopupPositionProvider {
             override fun calculatePosition(
                 anchorBounds: androidx.compose.ui.unit.IntRect,
@@ -913,8 +1057,8 @@ private fun AppSeamlessDropdownMenu(
                 popupContentSize: androidx.compose.ui.unit.IntSize,
             ): IntOffset = if (tutorialOverlay != null) IntOffset.Zero
                 else IntOffset(
-                    if (alignEnd) anchorBounds.right - popupContentSize.width else anchorBounds.left,
-                    anchorBounds.top + titleBarHeightPx,
+                    if (alignEnd) anchorBounds.right - popupContentSize.width else (anchorBounds.left - shiftPx).coerceAtLeast(0),
+                    anchorBounds.bottom + gapPx,
                 )
         }
     }
@@ -924,14 +1068,15 @@ private fun AppSeamlessDropdownMenu(
         properties = PopupProperties(focusable = true),
     ) {
         Box(if (tutorialOverlay != null) Modifier.fillMaxSize() else Modifier) {
-            Surface(
-                modifier = if (tutorialOverlay != null) Modifier.offset(y = 32.dp) else Modifier,
-                color = colors.panelElevated,
-                border = BorderStroke(1.dp, colors.border),
-                shape = RoundedCornerShape(0.dp),
-                elevation = 8.dp,
+            Box(
+                (if (tutorialOverlay != null) Modifier.offset(y = 32.dp) else Modifier)
+                    .menuAppearance(visibility, TransformOrigin(if (alignEnd) 0.88f else 0.12f, 0f), rise = false)
+                    .menuPanel()
+                    .padding(4.dp),
             ) {
-                Column(modifier = modifier) { content() }
+                MenuGlide {
+                    Column(modifier.width(IntrinsicSize.Max), verticalArrangement = Arrangement.spacedBy(1.dp)) { content() }
+                }
             }
             // Draw after the menu, in the same popup. No cross-popup z-order or coordinate conversion.
             tutorialOverlay?.invoke()
@@ -939,7 +1084,93 @@ private fun AppSeamlessDropdownMenu(
     }
 }
 
-@OptIn(ExperimentalComposeUiApi::class)
+/**
+ * A menu dropping from the control it is composed beside (put both in one Box), on the panel and with the motion of
+ * every menu: under the control's left edge, or above it when there is no room below, and kept inside the window.
+ * The drop-in replacement for Material's DropdownMenu; [offset] shifts it from that spot.
+ */
+@Composable
+fun AppDropdownMenu(
+	expanded: Boolean,
+	onDismissRequest: () -> Unit,
+	modifier: Modifier = Modifier,
+	offset: androidx.compose.ui.unit.DpOffset = androidx.compose.ui.unit.DpOffset.Zero,
+	content: @Composable ColumnScope.() -> Unit,
+) {
+	val visibility = remember { MutableTransitionState(false) }
+	visibility.targetState = expanded
+	if (!visibility.currentState && !visibility.targetState) return
+	val colors = LocalToolColors.current
+	val typography = LocalToolTypography.current
+	val density = LocalDensity.current
+	val gapPx = with(density) { 2.dp.roundToPx() }
+	val shiftX = with(density) { offset.x.roundToPx() }
+	val shiftY = with(density) { offset.y.roundToPx() }
+	val positionProvider = remember(gapPx, shiftX, shiftY) {
+		object : androidx.compose.ui.window.PopupPositionProvider {
+			override fun calculatePosition(
+				anchorBounds: androidx.compose.ui.unit.IntRect,
+				windowSize: androidx.compose.ui.unit.IntSize,
+				layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+				popupContentSize: androidx.compose.ui.unit.IntSize,
+			): IntOffset {
+				val x = (anchorBounds.left + shiftX).coerceAtMost(windowSize.width - popupContentSize.width).coerceAtLeast(0)
+				val below = anchorBounds.bottom + gapPx + shiftY
+				val y = if (below + popupContentSize.height <= windowSize.height) below
+					else (anchorBounds.top - gapPx - popupContentSize.height - shiftY).coerceAtLeast(0)
+				return IntOffset(x, y)
+			}
+		}
+	}
+	Popup(
+		popupPositionProvider = positionProvider,
+		onDismissRequest = onDismissRequest,
+		properties = PopupProperties(focusable = true),
+	) {
+		androidx.compose.runtime.CompositionLocalProvider(
+			LocalDensity provides density,
+			LocalToolColors provides colors,
+			LocalToolTypography provides typography,
+		) {
+			Box(
+				Modifier
+					.menuAppearance(visibility, TransformOrigin(0.12f, 0f), rise = false)
+					.menuPanel()
+					.padding(4.dp),
+			) {
+				MenuGlide {
+					Column(modifier.width(IntrinsicSize.Max), verticalArrangement = Arrangement.spacedBy(1.dp), content = content)
+				}
+			}
+		}
+	}
+}
+
+/**
+ * The body of a menu in a popup of its own (a filter, a sort order, a column list): the panel every menu sits on,
+ * arriving as menus do, with the rows' gliding highlight. [modifier] sizes the column of rows.
+ */
+@Composable
+fun AppMenuPanel(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+	val visibility = remember { MutableTransitionState(false) }
+	visibility.targetState = true
+	Box(
+		Modifier
+			.menuAppearance(visibility, TransformOrigin(0.12f, 0f), rise = false)
+			.menuPanel()
+			.padding(4.dp),
+	) {
+		MenuGlide {
+			Column(modifier.width(IntrinsicSize.Max), verticalArrangement = Arrangement.spacedBy(1.dp), content = content)
+		}
+	}
+}
+
+/**
+ * A row of an app menu, in the menus' style: a rounded fill on hover (the gliding highlight inside a title bar menu),
+ * an optional check, icon and tree rail, the label and its shortcut. In a menu without the gliding highlight the row
+ * keeps clear of the menu's edges.
+ */
 @Composable
 fun AppMenuItem(
 	text: String,
@@ -958,39 +1189,36 @@ fun AppMenuItem(
 	isLastChild: Boolean = false,
 	modifier: Modifier = Modifier,
 	onHover: (() -> Unit)? = null,
+	/** A control of its own at the row's end, after the shortcut: a pin, say. */
+	trailing: (@Composable () -> Unit)? = null,
 	onClick: () -> Unit,
 ) {
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
-	var isHovered by remember { mutableStateOf(false) }
-
-	val contentColor = when {
-		!enabled -> colors.textDisabled
-		isHovered || highlighted -> colors.selectionText
-		else -> colors.textPrimary
-	}
+	val interaction = remember { MutableInteractionSource() }
+	val isHovered by interaction.collectIsHoveredAsState()
+	LaunchedEffect(isHovered) { if (isHovered && enabled) onHover?.invoke() }
+	val glide = LocalMenuGlide.current
+	val fill by animateColorAsState(when {
+		!enabled -> Color.Transparent
+		highlighted -> colors.controlHover.copy(alpha = 0.5f)
+		isHovered && !glide -> colors.controlHover.copy(alpha = 0.75f)
+		else -> Color.Transparent
+	}, tween(Motion.Instant))
+	val contentColor = if (enabled) colors.textPrimary else colors.textDisabled
 
 	Row(
 		modifier = modifier
+			.then(if (glide) Modifier else Modifier.padding(horizontal = 4.dp))
+			.glideRow(enabled)
 			.fillMaxWidth()
-			.height(28.dp)
-			.background(
-				when {
-					!enabled -> Color.Transparent
-					isHovered || highlighted -> colors.selection
-					else -> Color.Transparent
-				}
-			)
+			.height(26.dp)
+			.clip(RoundedCornerShape(Corners.Control))
+			.background(fill)
+			.hoverable(interaction)
 			.handCursor(enabled)
-			.onPointerEvent(PointerEventType.Enter) {
-				if (enabled) {
-					isHovered = true
-					onHover?.invoke()
-				}
-			}
-			.onPointerEvent(PointerEventType.Exit) { isHovered = false }
-			.clickable(enabled = enabled, onClick = onClick)
-			.padding(horizontal = 12.dp),
+			.clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
+			.padding(horizontal = 8.dp),
 		verticalAlignment = Alignment.CenterVertically,
 		horizontalArrangement = Arrangement.SpaceBetween,
 	) {
@@ -1037,7 +1265,7 @@ fun AppMenuItem(
 					modifier = Modifier.size(15.dp),
 					contentAlignment = Alignment.Center,
 				) {
-					icon(contentColor)
+					icon(if (enabled && !isHovered && !highlighted) colors.textMuted else contentColor)
 				}
 			}
 			Text(
@@ -1058,10 +1286,14 @@ fun AppMenuItem(
 				maxLines = 1,
 			)
 		}
+		if (trailing != null) {
+			Spacer(modifier = Modifier.width(12.dp))
+			trailing()
+		}
 	}
 }
 
-@OptIn(ExperimentalComposeUiApi::class)
+/** A row opening a second level beside it, on the same panel and with the same motion as its menu. */
 @Composable
 fun AppSubmenuItem(
 	text: String,
@@ -1074,53 +1306,60 @@ fun AppSubmenuItem(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	val density = LocalDensity.current
-	var isHovered by remember { mutableStateOf(false) }
+	val interaction = remember { MutableInteractionSource() }
+	val isHovered by interaction.collectIsHoveredAsState()
+	LaunchedEffect(isHovered) { if (isHovered) onOpen() }
 	var itemWidthPx by remember { mutableStateOf(0) }
+	val glide = LocalMenuGlide.current
+	// Open, the row keeps its fill while the pointer works the second level.
+	val fill by animateColorAsState(when {
+		isOpen -> colors.controlHover.copy(alpha = 0.75f)
+		isHovered && !glide -> colors.controlHover.copy(alpha = 0.75f)
+		else -> Color.Transparent
+	}, tween(Motion.Instant))
+	val visibility = remember { MutableTransitionState(false) }
+	visibility.targetState = isOpen
 
 	Box(
 		modifier = modifier
+			.then(if (glide) Modifier else Modifier.padding(horizontal = 4.dp))
+			.glideRow(true)
 			.fillMaxWidth()
 			.onGloballyPositioned { itemWidthPx = it.size.width }
 	) {
 		Row(
 			modifier = Modifier
 				.fillMaxWidth()
-				.height(28.dp)
-				.background(
-					when {
-						isOpen || isHovered -> colors.selection
-						else -> Color.Transparent
-					}
-				)
+				.height(26.dp)
+				.clip(RoundedCornerShape(Corners.Control))
+				.background(fill)
+				.hoverable(interaction)
 				.handCursor()
-				.onPointerEvent(PointerEventType.Enter) {
-					isHovered = true
-					onOpen()
-				}
-				.onPointerEvent(PointerEventType.Exit) { isHovered = false }
-				.clickable(onClick = onOpen)
-				.padding(horizontal = 12.dp),
+				.clickable(interactionSource = interaction, indication = null, onClick = onOpen)
+				.padding(horizontal = 8.dp),
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.SpaceBetween,
 		) {
 			Text(
 				text = text,
 				style = typography.body.copy(fontSize = 11.5.sp),
-				color = if (isOpen || isHovered) colors.selectionText else colors.textPrimary,
+				color = colors.textPrimary,
 				maxLines = 1,
 				overflow = TextOverflow.Ellipsis,
 			)
 			IconChevron(
 				expanded = false,
 				modifier = Modifier.size(9.dp),
-				tint = if (isOpen || isHovered) colors.selectionText else colors.textMuted,
+				tint = if (isOpen || isHovered) colors.textPrimary else colors.textMuted,
 			)
 		}
 
-		if (isOpen) {
+		if (visibility.currentState || visibility.targetState) {
+			// The second level's first row lines up with this one: past the panel's padding on both sides.
+			val inset = with(density) { 4.dp.roundToPx() }
 			Popup(
 				alignment = Alignment.TopStart,
-				offset = IntOffset(itemWidthPx - 1, 0),
+				offset = IntOffset(itemWidthPx + inset, -inset),
 				onDismissRequest = onDismiss,
 				properties = PopupProperties(focusable = false),
 			) {
@@ -1129,18 +1368,17 @@ fun AppSubmenuItem(
 					LocalToolColors provides colors,
 					LocalToolTypography provides typography,
 				) {
-					Surface(
-						color = colors.panelElevated,
-						border = BorderStroke(1.dp, colors.border),
-						shape = RoundedCornerShape(0.dp),
-						elevation = 6.dp,
+					Box(
+						Modifier
+							.menuAppearance(visibility, TransformOrigin(0f, 0.1f), rise = false)
+							.menuPanel()
+							.padding(4.dp),
 					) {
-						Column(
-							modifier = Modifier
-								.widthIn(min = 180.dp, max = 260.dp)
-								.padding(vertical = 0.dp),
-						) {
-							content()
+						MenuGlide {
+							Column(
+								Modifier.widthIn(min = 180.dp, max = 260.dp).width(IntrinsicSize.Max),
+								verticalArrangement = Arrangement.spacedBy(1.dp),
+							) { content() }
 						}
 					}
 				}
@@ -1152,11 +1390,7 @@ fun AppSubmenuItem(
 @Composable
 fun AppMenuSeparator() {
 	val colors = LocalToolColors.current
-	Divider(
-		color = colors.divider,
-		thickness = 1.dp,
-		modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-	)
+	Box(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 3.dp).height(1.dp).background(colors.divider))
 }
 
 @Composable
@@ -1165,11 +1399,11 @@ fun AppMenuHeader(text: String) {
 	val typography = LocalToolTypography.current
 	Text(
 		text = text,
-		style = typography.caption.copy(fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.6.sp),
-		color = colors.textMuted.copy(alpha = 0.7f),
+		style = typography.caption.copy(fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.4.sp),
+		color = colors.textMuted.copy(alpha = 0.8f),
 		modifier = Modifier
 			.fillMaxWidth()
-			.padding(horizontal = 12.dp, vertical = 3.dp),
+			.padding(start = 8.dp, end = 8.dp, top = 5.dp, bottom = 2.dp),
 	)
 }
 
@@ -1218,6 +1452,7 @@ private fun TitleBarLayoutToggle(
 			modifier = modifier
 				.width(30.dp)
 				.fillMaxHeight()
+				.pressScale()
 				.handCursor()
 				.onPointerEvent(PointerEventType.Enter) { isHovered = true }
 				.onPointerEvent(PointerEventType.Exit) { isHovered = false }
@@ -1288,6 +1523,7 @@ private fun TitleBarLanguageButton(
 			modifier = Modifier
 				.width(30.dp)
 				.fillMaxHeight()
+				.pressScale()
 				.background(if (expanded) colors.selection else Color.Transparent)
 				.handCursor()
 				.onPointerEvent(PointerEventType.Enter) { isHovered = true }
@@ -1357,6 +1593,7 @@ private fun TitleBarThemeToggle(
 			modifier = Modifier
 				.width(30.dp)
 				.fillMaxHeight()
+				.pressScale()
 				.handCursor()
 				.onPointerEvent(PointerEventType.Enter) { isHovered = true }
 				.onPointerEvent(PointerEventType.Exit) { isHovered = false }
@@ -1386,6 +1623,21 @@ private fun TitleBarThemeToggle(
 	}
 }
 
+/**
+ * Tells the native title bar, on every pointer event over this element, whether the pointer is on the app's own
+ * controls ([client]) or on the bar itself, which the system then drags, maximizes and snaps. The innermost element
+ * decides: the bar marks itself client and its empty middle marks itself not.
+ */
+private fun Modifier.titleBarHitTest(titleBar: NativeTitleBar, client: Boolean): Modifier =
+	pointerInput(titleBar, client) {
+		awaitPointerEventScope {
+			while (true) {
+				val event = awaitPointerEvent(PointerEventPass.Initial)
+				if (event.type != PointerEventType.Exit && event.type != PointerEventType.Scroll) titleBar.forceHitTest(client)
+			}
+		}
+	}
+
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 private fun WindowControlButton(
@@ -1400,6 +1652,7 @@ private fun WindowControlButton(
 		modifier = Modifier
 			.width(44.dp)
 			.fillMaxHeight()
+			.pressScale()
 			.handCursor()
 			.onPointerEvent(PointerEventType.Enter) { isHovered = true }
 			.onPointerEvent(PointerEventType.Exit) { isHovered = false }
@@ -1446,6 +1699,7 @@ private fun TitleBarSettingsButton(shown: Boolean, onClick: () -> Unit) {
 			modifier = Modifier
 				.width(30.dp)
 				.fillMaxHeight()
+				.pressScale()
 				.background(if (shown) colors.selection else Color.Transparent)
 				.handCursor()
 				.onPointerEvent(PointerEventType.Enter) { isHovered = true }

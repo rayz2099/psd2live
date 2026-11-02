@@ -135,9 +135,11 @@ data class TabViewOptions(
 	val densityHeatmap: Boolean = false,
 	/** How a preview canvas shows a running reference simulation against the baked export. */
 	val simulationView: SimulationView = SimulationView.REFERENCE,
+	/** Edit canvases' grid, guides and onion skin. */
+	val aids: io.github.psd2live.ui.CanvasAidOptions = io.github.psd2live.ui.CanvasAidOptions(),
 ) {
 	/** Point indices are only painted together with the warp overlay they annotate. */
-	fun normalized(): TabViewOptions = copy(showWarp = showWarp || warpShowIndices)
+	fun normalized(): TabViewOptions = copy(showWarp = showWarp || warpShowIndices, aids = aids.normalized())
 
 	companion object {
 		val Default = TabViewOptions()
@@ -190,8 +192,9 @@ data class CanvasModeSession(
 	fun withHierarchyView(next: EditHierarchyMode): CanvasModeSession {
 		val from = viewMode ?: return copy(viewMode = EditHierarchyMode.SELECT).withHierarchyView(next)
 		if (from == next) return this
+		// The canvas aids are the canvas's, not the mode's: the grid and the guides stay as they are across modes.
 		return copy(
-			view = modeViews[next] ?: hierarchyModeViewPreset(next, view),
+			view = (modeViews[next] ?: hierarchyModeViewPreset(next, view)).copy(aids = view.aids),
 			viewMode = next,
 			modeViews = modeViews - next + (from to view),
 		)
@@ -468,6 +471,8 @@ data class PSD2LiveState(
     val historyPanY: Float = 0f,
     val historySearch: String = "",
     val historyShowHidden: Boolean = false,
+    /** Compact history tree: consecutive linear versions share a card. The toolbar keeps the full view. */
+    val historyCompressed: Boolean = true,
     val hierarchyWidth: Float = 210f,
     val hierarchySearch: String = "",
     val drawOrderRulerWidth: Float = 24f,
@@ -477,6 +482,8 @@ data class PSD2LiveState(
     val workspaces: List<EditorWorkspace> = defaultEditorWorkspaces(),
     val activeWorkspaceId: String = DEFAULT_WORKSPACE_ID,
     val historyAnnotations: Map<String, HistoryAnnotation> = emptyMap(),
+    /** Bookmarks, shy and frozen tracks and markers of the motion editor; saved project data, not rig history. */
+    val timelineAids: io.github.psd2live.project.TimelineAids = io.github.psd2live.project.TimelineAids(),
     val inputPath: String = "",
 	/** Input identity that produced [analysis]; remains stable while the user edits the next path field. */
 	val loadedInputPath: String? = null,
@@ -503,6 +510,8 @@ data class PSD2LiveState(
 	val headStrength: Float = 1.0f,
 	val bodyStrength: Float = 1.0f,
 	val rigTuning: io.github.psd2live.core.RigTuning = io.github.psd2live.core.RigTuning(),
+	/** How the rig is built area by area ([io.github.psd2live.core.recipe.RigModules]); a project saved before modules reads as legacy. */
+	val recipe: io.github.psd2live.core.recipe.RigRecipe = io.github.psd2live.core.recipe.RigRecipe.Modern,
 	val meshOnly: Boolean = false,
 	val generateDeformers: Boolean = true,
 	val featureDisplacementEnabled: Boolean = false,
@@ -511,6 +520,9 @@ data class PSD2LiveState(
     val mouthCurve: io.github.psd2live.core.MouthCurve = io.github.psd2live.core.MouthCurve.preset("smile"),
     val mouthColor: Int? = null,
     val mouthThickness: Float = 1.5f,
+	val seeThroughBrows: Boolean = true,
+	val seeThroughEyes: Boolean = true,
+	val seeThroughOpacity: Float = io.github.psd2live.core.SeeThroughLayers.DEFAULT_OPACITY,
 	val exportMotions: Boolean = true,
 	val motionBasic: Boolean = true,
 	val motionIdle: Boolean = true,
@@ -545,9 +557,9 @@ data class PSD2LiveState(
 	val projectOutputsExpanded: Boolean = false,
 	val simulationPresetsExpanded: Boolean = true,
 	val strengthSubExpanded: Boolean = false,
-	val rigTuningExpanded: Boolean = false,
-	/** The rig values' Advanced folder is open. */
-	val rigTuningAdvancedExpanded: Boolean = false,
+	/** Whether the model presets' rig modules folder is open, and which of its area cards. */
+	val rigModulesExpanded: Boolean = false,
+	val rigAreasExpanded: Set<String> = emptySet(),
 	val advancedExpanded: Boolean = false,
 	val isAnalyzing: Boolean = false,
 	val isGenerating: Boolean = false,
@@ -598,6 +610,8 @@ data class PSD2LiveState(
 	val parameterSearchQuery: String = "",
 	/** Saved parameter snapshots, shown as the snapshot bar; project data, never history. */
 	val parameterSnapshots: List<ParameterSnapshot> = emptyList(),
+	/** The edit canvases' ruler guides; project data like the snapshots, never history. */
+	val canvasGuides: List<io.github.psd2live.project.CanvasGuide> = emptyList(),
 	val animationEnabled: Boolean = false,
 	val mouseTrackingEnabled: Boolean = true,
 	val smoothMouseTracking: Boolean = false,
@@ -751,6 +765,7 @@ data class PSD2LiveState(
 			headTurnStrength = headStrength,
 			bodyStrength = bodyStrength,
 			rigTuning = rigTuning,
+			recipe = recipe,
 			meshOnly = meshOnly,
 			generateDeformers = generateDeformers,
 			featureDisplacementEnabled = featureDisplacementEnabled,
@@ -759,6 +774,9 @@ data class PSD2LiveState(
             mouthCurve = mouthCurve,
             mouthColor = mouthColor,
             mouthThickness = mouthThickness,
+			seeThroughBrows = seeThroughBrows,
+			seeThroughEyes = seeThroughEyes,
+			seeThroughOpacity = seeThroughOpacity,
 			exportMotions = exportMotions,
 			motionBasic = motionBasic,
 			motionIdle = motionIdle,
@@ -801,7 +819,8 @@ data class PSD2LiveState(
 	}
 
 	fun getEffectiveDrawOrder(drawableId: String, layerId: String?, defaultOrder: Float): Float {
-		if (layerId != null) {
+		// A pasted copy is ordered by its own ID, never by its original's layer.
+		if (layerId != null && previewModel?.rig?.copiedDrawableIds?.contains(drawableId) != true) {
 			drawOrderOverrides[layerId]?.let { return it }
 		}
 		return drawOrderOverrides[drawableId] ?: defaultOrder
@@ -844,7 +863,7 @@ data class PSD2LiveState(
 			val layerHiddenByDeformer: (String) -> Boolean = if (hiddenDeformers.isEmpty()) {
 				{ false }
 			} else {
-				val drawableIdByLayerId = model.rig.layerIdByDrawableId.entries.associate { it.value to it.key }
+				val drawableIdByLayerId = model.rig.ownLayerIdByDrawableId.entries.associate { it.value to it.key }
 				val drawableById = model.rig.puppet.drawables.associateBy { it.id.raw }
 				val deformerById = model.rig.puppet.deformers.associateBy { it.id.raw }
 				fun isHidden(layerId: String): Boolean {
@@ -913,3 +932,10 @@ data class ExportSuccess(
 	val notesTitle: String? = null,
 	val notes: List<String> = emptyList(),
 )
+
+/** The project data saved beside the document but outside its history: snapshots, history notes and guides. */
+internal fun PSD2LiveState.savedProjectData() =
+	io.github.psd2live.project.WorkspaceAuxiliaryData(
+		parameterSnapshots = parameterSnapshots, historyAnnotations = historyAnnotations,
+		canvasGuides = canvasGuides, timelineAids = timelineAids,
+	)

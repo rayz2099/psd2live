@@ -386,7 +386,7 @@ u32 n × { sref id, sref name, f32 fadeIn, f32 fadeOut, u32 n × { ref parameter
 - Multiply：值 · (1 + (v − 1)·w)
 - Overwrite：值 · (1 − w) + v·w
 
-运行时一次播放一个表情，切换时上一个表情淡出。更新顺序为：动作片段 → 表情 → 程序化行为 → 物理。导出时，编辑器按绑定中存在的标准参数生成微笑、悲伤、生气、惊讶四个表情，淡入淡出各 0.5 秒。
+运行时一次播放一个表情，切换时上一个表情淡出。更新顺序为：动作片段 → 表情 → 程序化行为 → 物理。导出时，编辑器按绑定中存在的参数生成微笑、悲伤、生气、惊讶四个表情，模型有相应模块参数时再加害羞、困倦、阴沉，淡入淡出各 0.5 秒。
 
 ### `HITA`
 
@@ -394,7 +394,7 @@ u32 n × { sref id, sref name, f32 fadeIn, f32 fadeOut, u32 n × { ref parameter
 u32 n × { sref id, sref name, u32 n × ref mesh }
 ```
 
-点击区域覆盖其网格绘制出的范围。`p2l_hit_test(x, y)` 按文件顺序返回第一个有可见网格包含该画布点的区域。导出时生成 `HitAreaHead`（脸）与 `HitAreaBody`（上衣，否则颈或下装）。
+点击区域覆盖其网格绘制出的范围。`p2l_hit_test(x, y)` 按文件顺序返回第一个有可见网格包含该画布点的区域。导出时写入文档设置的点击区域（见[导出目标](EXPORT_TARGETS.md#点击区域)），文档没有设置时生成 `HitAreaHead`（脸）与 `HitAreaBody`（上衣，否则颈或下装）。
 
 ### `UDAT`
 

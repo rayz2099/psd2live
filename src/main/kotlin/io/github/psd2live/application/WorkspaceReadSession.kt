@@ -68,12 +68,24 @@ internal class WorkspaceReadSession(
 
     override fun structureMeshPreview(request: JsonObject, checkpoint: () -> Unit): JsonObject {
         val captured = capture()
-        if (!captured.document.layout.generation.generated) throw WorkspaceNotGenerated()
         return buildJsonObject {
             put("project_id", captured.projectId); put("state", captured.state); put("revision", captured.revision)
             WorkspaceStructureMeshEdits.preview(captured.model, captured.document.rigEdits, request, checkpoint).forEach { (k, v) -> put(k, v) }
         }
     }
+
+    override fun findObjects(request: JsonObject): JsonObject {
+        val captured = capture()
+        val offset = request["offset"]?.jsonPrimitive?.int ?: 0
+        val limit = request["limit"]?.jsonPrimitive?.int ?: 64
+        return buildJsonObject {
+            put("project_id", captured.projectId); put("state", captured.state); put("revision", captured.revision)
+            WorkspaceObjectEdits.findResult(WorkspaceObjectEdits.find(captured.model, request), offset, limit).forEach { (k, v) -> put(k, v) }
+        }
+    }
+
+    override fun planObjectEdit(operation: String, request: JsonObject): Pair<JsonObject, JsonObject> =
+        WorkspaceObjectEdits.planned(operation, capture().model, request)
 
     private fun buildSnapshot(): WorkspaceProjectSnapshot {
         val captured = read.runtime.capture
@@ -104,7 +116,7 @@ internal class WorkspaceReadSession(
             selectedLayerId = presentation.selectedLayerId, layers = active + deleted,
             parameters = currentPuppet()?.parameters.orEmpty().map { parameter ->
                 WorkspaceParameterSnapshot(parameter.id.raw, parameter.name, parameter.min, parameter.max, parameter.default,
-                    pose.values[parameter.id] ?: parameter.default, parameter.kind.name.lowercase())
+                    pose.values[parameter.id] ?: parameter.default, parameter.kind.name.lowercase(), parameter.repeat)
             }, projectFile = presentation.projectFile, projectDirty = captured?.dirty == true || presentation.projectDirty,
             projectSaving = presentation.projectSaving, projectSaveError = presentation.projectSaveError,
             persistenceStatus = presentation.persistenceStatus, persistenceError = presentation.persistenceError,
@@ -159,18 +171,24 @@ internal class WorkspaceReadSession(
     override fun currentPuppet(): PuppetModel? = read.runtime.capture?.model?.rig?.puppet
     override fun skeletonSpec(): SkeletonSpec? = read.runtime.capture?.document?.rigEdits?.skeleton
     override fun motionClips(): List<MotionClip> = read.runtime.capture?.document?.rigEdits?.motionClips.orEmpty()
+    override fun modelSidecars(): WorkspaceSidecars = capture().let { WorkspaceSidecarEdits.sidecars(it.document, it.model?.rig?.puppet) }
     override fun projectSettings(): JsonObject {
         val document = capture().document
         return WorkspaceSettingsCodec.encode(WorkspaceSettingsCodec.decode(document.settings).copy(meshOverrides = document.meshOverrides))
     }
     override fun listInteriorEffects() = capture().document.rigEdits.interiorEffects
     override fun listSwings(): List<RigSwingEdit> = capture().document.rigEdits.swingEdits
+    override fun hitAreas() = capture().document.rigEdits.hitAreas
+    override fun hitAreaModel() = read.runtime.capture?.model
     override fun layoutState(): WorkspaceLayoutState? = read.runtime.capture?.document?.let { document ->
         WorkspaceLayoutState(document.layout, document.source.layers, WorkspaceLayoutPreview.pendingIds(document), document.deletedLayerIds,
             document.source.widthPx, document.source.heightPx)
     }
+    override fun rigModules(): JsonObject = read.runtime.capture.let { RigModuleCatalog.describe(it?.document, it?.model) }
     override fun generatedOverrideIssues(): List<GeneratedOverrideIssue> = read.runtime.capture?.model?.rig?.overrideIssues.orEmpty()
     override fun supersededEntryNotes(): List<SupersededEntryNote> = read.runtime.capture?.model?.rig?.supersededEntryNotes.orEmpty()
+    override fun seeThroughNotes(): List<Pair<String, String>> =
+        read.runtime.capture?.model?.rig?.seeThroughNotes.orEmpty().map { it.original to it.reason.wire }
     override fun regenerationIssues(): List<io.github.psd2live.core.RigRegeneration.Issue> =
         read.runtime.capture?.document?.rigEdits?.authoringJournal?.lastOrNull(io.github.psd2live.core.RigCheckpoint::isRecord)
             ?.let(io.github.psd2live.core.RigCheckpoint::issues).orEmpty()
@@ -328,15 +346,18 @@ internal class WorkspaceReadSession(
             }
             RigTargetKind.ART_MESH -> {
                 val drawable = puppet.findDrawable(target.id)
-                    ?: puppet.drawables.firstOrNull { rig.layerIdByDrawableId[it.id.raw] == target.id }
+                    ?: puppet.drawables.firstOrNull { rig.ownLayerIdByDrawableId[it.id.raw] == target.id }
                     ?: throw IllegalArgumentException("Drawable not found: ${target.id}")
                 val grid = drawable.geometryGrid
                 val topo = mapOf(
                     "type" to "art_mesh",
                     "vertexCount" to (drawable.mesh?.vertexCount ?: 0).toString(),
                     "triangleCount" to (drawable.mesh?.triangleCount ?: 0).toString(),
-                    "layerId" to (rig.layerIdByDrawableId[drawable.id.raw] ?: ""),
-                )
+                    // A copy over the bangs reports its original's layer, and the original it copies; a bang with a
+                    // window for the eyes, the eye parts clipping it inverted in the finished rig alone.
+                    "layerId" to (rig.layerOf(drawable.id.raw) ?: ""),
+                ) + (rig.seeThroughCopies[drawable.id.raw]?.let { mapOf("seeThroughOf" to it) } ?: emptyMap()) +
+                    (rig.seeThroughWindows[drawable.id.raw]?.let { mapOf("seeThroughWindow" to it.joinToString(",")) } ?: emptyMap())
                 val geoSnapshot = grid?.let { g ->
                     WorkspaceObjectGeometrySnapshot(
                         axes = g.axes.map { WorkspaceObjectAxisSnapshot(it.parameterId.raw, it.keys.toList()) },
@@ -452,7 +473,7 @@ internal class WorkspaceReadSession(
 
     override fun proposeSkeleton(): SkeletonSpec {
         val preview = capture().model
-        return SkeletonAutoBuilder.build(preview.analysis, preview.rig)
+        return SkeletonAutoBuilder.build(preview)
     }
 
     override fun inspectRigGeometry(arguments: JsonObject): JsonObject {

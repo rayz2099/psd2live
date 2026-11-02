@@ -1,5 +1,7 @@
 package io.github.psd2live.ui.components
 
+import io.github.psd2live.ui.views.texture.glideRow
+import io.github.psd2live.ui.theme.Corners
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -632,20 +634,22 @@ fun CompactMenuItem(
 		!enabled -> colors.textDisabled
 		danger -> if (isHovered) colors.error else colors.error.copy(alpha = 0.9f)
 		active -> colors.accent
-		isHovered -> colors.selectionText
 		else -> colors.textPrimary
 	}
 
+	// Inside a menu with the gliding highlight the row leaves its hover fill to it, as every menu row does.
+	val glide = io.github.psd2live.ui.views.texture.LocalMenuGlide.current
 	val itemBg = when {
 		!enabled -> Color.Transparent
-		isHovered && danger -> colors.error.copy(alpha = 0.14f)
-		isHovered -> colors.selection
+		isHovered && danger && !glide -> colors.error.copy(alpha = 0.14f)
+		isHovered && !glide -> colors.controlHover.copy(alpha = 0.75f)
 		active -> colors.accent.copy(alpha = 0.12f)
 		else -> Color.Transparent
 	}
 
 	Row(
 		modifier = modifier
+			.glideRow(enabled, danger)
 			.fillMaxWidth()
 			.height(26.dp)
 			.clip(RoundedCornerShape(4.dp))
@@ -686,7 +690,7 @@ fun CompactMenuItem(
 			Text(
 				text = trailingText,
 				style = typography.monoSmall.copy(fontSize = 9.5.sp),
-				color = if (isHovered) colors.selectionText.copy(alpha = 0.85f) else colors.textMuted,
+				color = colors.textMuted,
 			)
 		}
 	}
@@ -775,8 +779,7 @@ fun TreeContextMenu(
 					.widthIn(min = minWidth, max = maxWidth)
 					.menuPanel()
 					.padding(4.dp),
-				content = content,
-			)
+			) { io.github.psd2live.ui.views.texture.MenuGlide { Column(verticalArrangement = Arrangement.spacedBy(1.dp), content = content) } }
 		}
 	}
 }
@@ -827,8 +830,8 @@ fun CompactButton(
 	Box(
 		modifier = modifier
 			.height(height)
-			.background(bgColor, RoundedCornerShape(2.dp))
-			.border(BorderStroke(1.dp, borderColor), RoundedCornerShape(2.dp))
+			.background(bgColor, RoundedCornerShape(Corners.Control))
+			.border(BorderStroke(1.dp, borderColor), RoundedCornerShape(Corners.Control))
 			.hoverable(interactionSource)
 			.clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { onClick() }
 			.handCursor(enabled)
@@ -854,6 +857,70 @@ fun CompactButton(
 				overflow = TextOverflow.Ellipsis,
 				textAlign = TextAlign.Center,
 			)
+		}
+	}
+}
+
+/**
+ * A field showing the chosen one of [options] by [label], which opens them as a menu: for choices with more values
+ * than a row of radio buttons holds (the graphics settings). Disabled [options] by [optionEnabled] show but cannot
+ * be picked.
+ */
+@Composable
+fun <T> CompactSelect(
+	options: List<T>,
+	selected: T,
+	label: (T) -> String,
+	onSelect: (T) -> Unit,
+	modifier: Modifier = Modifier,
+	enabled: Boolean = true,
+	optionEnabled: (T) -> Boolean = { true },
+	height: Dp = 24.dp,
+) {
+	val colors = LocalToolColors.current
+	val typography = LocalToolTypography.current
+	var open by remember { mutableStateOf(false) }
+	val interactionSource = remember { MutableInteractionSource() }
+	val isHovered by interactionSource.collectIsHoveredAsState()
+	Box(modifier) {
+		Row(
+			modifier = Modifier
+				.fillMaxWidth()
+				.height(height)
+				.background(when {
+					!enabled -> colors.controlBackground.copy(alpha = 0.4f)
+					open -> colors.controlActive
+					isHovered -> colors.controlHover
+					else -> colors.controlBackground
+				}, RoundedCornerShape(Corners.Control))
+				.border(BorderStroke(1.dp, when {
+					!enabled -> colors.border.copy(alpha = 0.3f)
+					open || isHovered -> colors.borderHover
+					else -> colors.border
+				}), RoundedCornerShape(Corners.Control))
+				.hoverable(interactionSource)
+				.clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { open = true }
+				.handCursor(enabled)
+				.padding(start = 8.dp, end = 4.dp),
+			verticalAlignment = Alignment.CenterVertically,
+		) {
+			Text(
+				text = label(selected),
+				style = typography.body.copy(fontSize = 11.sp),
+				color = if (enabled) colors.textPrimary else colors.textDisabled,
+				maxLines = 1,
+				overflow = TextOverflow.Ellipsis,
+				modifier = Modifier.weight(1f),
+			)
+			IconChevron(expanded = true, tint = if (enabled) colors.textMuted else colors.textDisabled)
+		}
+		AppDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+			for (option in options) {
+				AppMenuItem(text = label(option), isChecked = option == selected, enabled = optionEnabled(option), onClick = {
+					open = false
+					if (option != selected) onSelect(option)
+				})
+			}
 		}
 	}
 }
@@ -886,8 +953,8 @@ fun CompactIconButton(
 		Box(
 			modifier = (if (tooltip.isNullOrBlank()) modifier else Modifier)
 				.size(size)
-				.background(bgColor, RoundedCornerShape(2.dp))
-				.border(BorderStroke(1.dp, if (isHovered && enabled) colors.borderHover else colors.border), RoundedCornerShape(2.dp))
+				.background(bgColor, RoundedCornerShape(Corners.Control))
+				.border(BorderStroke(1.dp, if (isHovered && enabled) colors.borderHover else colors.border), RoundedCornerShape(Corners.Control))
 				.hoverable(interactionSource)
 				.clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { onClick() }
 				.handCursor(enabled),
@@ -902,7 +969,7 @@ fun CompactIconButton(
 			tooltip = {
 				Surface(
 					color = colors.panelElevated,
-					shape = RoundedCornerShape(3.dp),
+					shape = RoundedCornerShape(Corners.Control),
 					border = BorderStroke(1.dp, colors.border),
 					elevation = 4.dp,
 				) {
@@ -1004,8 +1071,8 @@ fun CompactTextField(
 					editorRegions.pressedInside = true
 				},
 			)
-			.background(colors.inputBackground, RoundedCornerShape(2.dp))
-			.border(BorderStroke(1.dp, if (isHovered && enabled) colors.borderHover else colors.border), RoundedCornerShape(2.dp))
+			.background(colors.inputBackground, RoundedCornerShape(Corners.Control))
+			.border(BorderStroke(1.dp, if (isHovered && enabled) colors.borderHover else colors.border), RoundedCornerShape(Corners.Control))
 			.padding(horizontal = 6.dp)
 			.onFocusChanged { focus ->
 				if (focus.isFocused) {
@@ -1105,8 +1172,8 @@ fun CompactNumberSpinner(
 	Row(
 		modifier = modifier
 			.height(height)
-			.background(colors.inputBackground, RoundedCornerShape(2.dp))
-			.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(2.dp)),
+			.background(colors.inputBackground, RoundedCornerShape(Corners.Control))
+			.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(Corners.Control)),
 		verticalAlignment = Alignment.CenterVertically,
 	) {
 		BasicTextField(
@@ -1381,8 +1448,8 @@ fun CompactToggleChip(
 		Box(
 			modifier = (if (tooltip.isNullOrBlank()) modifier else Modifier)
 				.height(height)
-				.background(bgColor, RoundedCornerShape(2.dp))
-				.border(BorderStroke(1.dp, borderColor), RoundedCornerShape(2.dp))
+				.background(bgColor, RoundedCornerShape(Corners.Control))
+				.border(BorderStroke(1.dp, borderColor), RoundedCornerShape(Corners.Control))
 				.hoverable(interactionSource)
 				.clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { onToggle() }
 				.handCursor(enabled)
@@ -1419,7 +1486,7 @@ fun CompactToggleChip(
 			tooltip = {
 				Surface(
 					color = colors.panelElevated,
-					shape = RoundedCornerShape(2.dp),
+					shape = RoundedCornerShape(Corners.Control),
 					border = BorderStroke(1.dp, colors.border),
 					elevation = 4.dp,
 				) {
@@ -1514,8 +1581,8 @@ fun <T> CompactDropdown(
 			modifier = Modifier
 				.height(height)
 				.fillMaxWidth()
-				.background(colors.inputBackground, RoundedCornerShape(2.dp))
-				.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(2.dp))
+				.background(colors.inputBackground, RoundedCornerShape(Corners.Control))
+				.border(BorderStroke(1.dp, colors.border), RoundedCornerShape(Corners.Control))
 				.handCursor(enabled)
 				.clickable(enabled = enabled) { expanded = true }
 				.padding(horizontal = 6.dp),
@@ -1533,41 +1600,21 @@ fun <T> CompactDropdown(
 			IconChevron(expanded = expanded, modifier = Modifier.size(10.dp), tint = colors.textMuted)
 		}
 
-		DropdownMenu(
+		AppDropdownMenu(
 			expanded = expanded,
 			onDismissRequest = { expanded = false },
-			modifier = Modifier
-				.background(colors.panelElevated)
-				.border(BorderStroke(1.dp, colors.border)),
 		) {
 			items.forEach { item ->
-				val isSelected = item == selectedItem
 				val isItemEnabled = itemEnabled(item)
-				DropdownMenuItem(
+				AppMenuItem(
+					text = itemLabel(item),
+					isChecked = item == selectedItem,
 					enabled = isItemEnabled,
 					onClick = {
-						if (isItemEnabled) {
-							onItemSelected(item)
-							expanded = false
-						}
+						onItemSelected(item)
+						expanded = false
 					},
-					modifier = Modifier
-						.height(26.dp)
-						.background(if (isSelected) colors.selection else Color.Transparent)
-						.handCursor(isItemEnabled),
-				) {
-					Text(
-						text = itemLabel(item),
-						style = typography.body.copy(
-							fontSize = 11.5.sp,
-							color = when {
-								!isItemEnabled -> colors.textDisabled
-								isSelected -> colors.selectionText
-								else -> colors.textPrimary
-							},
-						),
-					)
-				}
+				)
 			}
 		}
 	}

@@ -37,9 +37,9 @@ import java.nio.file.Path
 import java.security.MessageDigest
 
 /**
- * The desktop editor's workspace: the application [WorkspaceHost], shown through the view model's state. The editor
- * keeps its own copy of the document while the user edits it, so each commit is projected into that copy before it
- * lands ([DesktopPresentation.project]).
+ * The desktop editor's workspace: the application [WorkspaceHost], shown through the view model's state. The runtime
+ * owns the document; the editor's document fields are its projection plus field drafts the editor submits through
+ * the draft queue, carried over each commit it is shown ([DesktopPresentation.show]).
  */
 class DesktopWorkspace private constructor(
     private val viewModel: PSD2LiveViewModel,
@@ -102,15 +102,12 @@ internal class DesktopPresentation(private val viewModel: PSD2LiveViewModel) : W
         status = view.statusText, selectedLayerId = view.selectedLayerId, saveError = view.projectSaveError,
         saveIdentity = { view.saveIdentity })
 
-    override fun document(view: PSD2LiveState): WorkspaceDocument? =
-        if (view.analysis == null) null else WorkspaceStateCodec.document(view)
-
     override fun visibleLayers(capture: WorkspaceCapture<RigPreviewModel>, view: PSD2LiveState): Set<String> =
         projection(capture, view).effectiveVisibleLayerIds.toSet()
 
     /** Canvas records are read from the same v1 presentation the project archive stores. */
     override fun auxiliary(view: PSD2LiveState): JsonObject = CanvasVisibilityCodec.withRecords(JsonObject(
-        WorkspaceAuxiliaryCodec.encode(WorkspaceAuxiliaryData(view.parameterSnapshots, view.historyAnnotations)) +
+        WorkspaceAuxiliaryCodec.encode(view.savedProjectData()) +
             ("posesByWorkspace" to buildJsonObject {
                 view.workspaces.forEach { workspace ->
                     val pose = workspace.pose
@@ -131,11 +128,22 @@ internal class DesktopPresentation(private val viewModel: PSD2LiveViewModel) : W
 
     override fun basis(view: PSD2LiveState): Pair<RigPreviewModel?, Map<String, Float>> = view.previewModel to view.drawOrderOverrides
 
+    /** [ui] with [document]'s fields in place of the ones it shows. */
+    private fun withDocument(ui: PSD2LiveState, document: WorkspaceDocument): PSD2LiveState =
+        WorkspaceStateCodec.decode(document.settings, ui).copy(
+            documentLayerVisibility = document.layerVisibility, deletedLayerIds = document.deletedLayerIds,
+            layerOverrides = document.layerOverrides, parentOverrides = document.parentOverrides,
+            rigEdits = document.rigEdits, meshOverrides = document.meshOverrides,
+            generationSource = document.generationSource, meshSource = document.meshSource,
+            textureOverrides = document.textureOverrides, layout = document.layout)
+
     /** The editor's state over [capture]: the archive's presentation of the runtime's document. */
     private fun projection(capture: WorkspaceCapture<RigPreviewModel>, ui: PSD2LiveState): PSD2LiveState {
         val auxiliary = WorkspaceAuxiliaryCodec.decode(capture.auxiliary)
         val persisted = WorkspaceStateCodec.decode(capture.document.settings, ui).copy(
             parameterSnapshots = auxiliary.parameterSnapshots, historyAnnotations = auxiliary.historyAnnotations,
+            canvasGuides = auxiliary.canvasGuides,
+            timelineAids = auxiliary.timelineAids,
             projectId = capture.projectId, analysis = capture.model.analysis, previewModel = capture.model,
             documentLayerVisibility = capture.document.layerVisibility, deletedLayerIds = capture.document.deletedLayerIds,
             layerOverrides = capture.document.layerOverrides, parentOverrides = capture.document.parentOverrides,
@@ -156,40 +164,14 @@ internal class DesktopPresentation(private val viewModel: PSD2LiveViewModel) : W
         return projected.activeWorkspace.pose!!.applyTo(projected)
     }
 
-    override fun project(view: PSD2LiveState, preview: RigPreviewModel, expected: WorkspaceDocument?, next: WorkspaceDocument,
-                         status: String, restoreCheckedOutPose: Boolean): Boolean {
-        expected ?: return false
-        return viewModel.applyAgentWorkspacePreview(
-            expectedProjectId = view.projectId,
-            expectedProjectOpenGeneration = view.projectOpenGeneration,
-            preview = preview,
-            expectedSource = expected.source,
-            expectedLayerVisibility = expected.layerVisibility,
-            expectedDeletedLayerIds = expected.deletedLayerIds,
-            expectedLayerOverrides = expected.layerOverrides,
-            expectedParentOverrides = expected.parentOverrides,
-            expectedRigEdits = expected.rigEdits,
-            expectedGenerationSource = expected.generationSource,
-            expectedMeshSource = expected.meshSource,
-            expectedTextureOverrides = expected.textureOverrides,
-            expectedLayout = expected.layout,
-            expectedSettings = expected.settings,
-            expectedMeshOverrides = expected.meshOverrides,
-            layerVisibility = next.layerVisibility,
-            deletedLayerIds = next.deletedLayerIds,
-            layerOverrides = next.layerOverrides,
-            parentOverrides = next.parentOverrides,
-            rigEdits = next.rigEdits,
-            generationSource = next.generationSource,
-            meshSource = next.meshSource,
-            textureOverrides = next.textureOverrides,
-            layout = next.layout,
-            status = status,
-            settings = next.settings,
-            meshOverrides = next.meshOverrides,
-            restoreCheckedOutPose = restoreCheckedOutPose,
-        )
-    }
+    override fun show(view: PSD2LiveState, preview: RigPreviewModel, base: WorkspaceDocument?, next: WorkspaceDocument,
+                      status: String, restoreCheckedOutPose: Boolean) =
+        viewModel.showWorkspaceCommit(preview, base, next, status, view.projectId, view.projectOpenGeneration, restoreCheckedOutPose)
+
+    override fun draftYielded(view: PSD2LiveState, fields: List<String>) = viewModel.reportDraftYielded(view, fields)
+
+    override fun savedView(capture: WorkspaceCapture<RigPreviewModel>, view: PSD2LiveState): PSD2LiveState =
+        if (view.projectId != capture.projectId || view.analysis == null) view else withDocument(view, capture.document)
 
     override fun historyChanged(history: WorkspaceHistorySnapshot) = viewModel.updateHistorySnapshot(history)
     override fun shownHistoryHead(): String? = viewModel.state.value.historySnapshot?.headNodeId
@@ -213,7 +195,7 @@ internal class DesktopPresentation(private val viewModel: PSD2LiveViewModel) : W
         viewModel.installSavedProjectData(view, before, next)
     }
     override fun auxiliaryChanged() = viewModel.markProjectAuxiliaryChanged()
-    override fun discardDrafts() { viewModel.discardUncommittedTextureEdits() }
+    override fun discardDrafts() { viewModel.discardUncommittedTextureEdits(); viewModel.discardEditorSessionDrafts() }
 
     override fun sourceInstalled(view: PSD2LiveState, document: WorkspaceDocument, preview: RigPreviewModel, path: Path?, projectId: String) =
         viewModel.applySourceImport(view, document, preview, path, projectId)
@@ -234,7 +216,7 @@ internal class DesktopPresentation(private val viewModel: PSD2LiveViewModel) : W
             meshSource = document.meshSource,
             textureOverrides = document.textureOverrides,
             layout = document.layout,
-        ), expected, dirty = dirty)
+        ), expected, dirty = dirty, document = document)
     }
 
     override fun importedSource(view: PSD2LiveState): WorkspaceImportedSource? {

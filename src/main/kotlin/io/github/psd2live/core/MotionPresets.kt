@@ -32,6 +32,8 @@ data class MotionPresetSettings(
 	val values: Map<String, Float> = emptyMap(),
 	val deleted: Boolean = false,
 	val disabled: Boolean = false,
+	/** Whether the presets move the `motion/natural` way; from the rig recipe, never saved with the settings. */
+	val natural: Boolean = false,
 ) {
 	init {
 		require(values.values.all(Float::isFinite)) { "Motion preset settings must be finite" }
@@ -43,6 +45,19 @@ data class MotionPresetSettings(
 	}
 
 	val isDefault: Boolean get() = values.isEmpty() && !deleted && !disabled
+
+	/** The saved settings' text, as before [natural] existed: revision identities are made from it. */
+	override fun toString(): String = "MotionPresetSettings(values=$values, deleted=$deleted, disabled=$disabled)"
+
+	companion object {
+		/** [name]'s settings in [config], moving the way its recipe asks. */
+		fun of(config: PipelineConfig, name: String): MotionPresetSettings =
+			(config.rigEdits.motionPresets[name] ?: MotionPresetSettings()).copy(natural = natural(config))
+
+		/** Whether [config]'s recipe moves the `motion/natural` way. */
+		fun natural(config: PipelineConfig): Boolean =
+			config.recipe.base("motion") === io.github.psd2live.core.recipe.RigModules.MOTION_NATURAL
+	}
 }
 
 /**
@@ -110,7 +125,7 @@ object MotionPresets {
 		settings: MotionPresetSettings = MotionPresetSettings(),
 		exclude: Set<String> = emptySet(),
 	): List<MotionTrack> = generated.getOrPut(io.github.psd2live.format.compile.document.ContentHash.of("motion", name.lowercase(),
-		skeleton?.toJson(), settings.values.toSortedMap(), settings.deleted, settings.disabled, exclude.sorted())) {
+		skeleton?.toJson(), settings.values.toSortedMap(), settings.deleted, settings.disabled, exclude.sorted(), settings.natural)) {
 		generate(name, skeleton, settings, exclude)
 	}
 
@@ -130,9 +145,14 @@ object MotionPresets {
 				else SkeletonMotions.idleCute(skeleton, exclude, settings.of(name, TUCK))
 				if (body.isEmpty()) return emptyList()
 				val tuned = idleTuned(body, settings.of(name, AMPLITUDE), settings.of(name, BREATH), settings.of(name, HEAD))
-				if (settings.of(name, BLINK) > 0.5f) tuned + MotionGenerator.idleBlinkTracks else tuned
+				val blinks = if (settings.natural) {
+					MotionGenerator.naturalBlinkTracks + MotionGenerator.glanceTracks + MotionGenerator.idleFaceTracks
+				} else MotionGenerator.idleBlinkTracks
+				if (settings.of(name, BLINK) > 0.5f) tuned + blinks else tuned
 			}
-			"blink" -> MotionGenerator.blinkTracks(settings.of(name, CLOSURE), settings.of(name, DOUBLE) > 0.5f)
+			"talk" -> if (settings.natural) MotionGenerator.talkTracks else emptyList()
+			"blink" -> if (settings.natural) MotionGenerator.naturalBlink(settings.of(name, CLOSURE), settings.of(name, DOUBLE) > 0.5f)
+				else MotionGenerator.blinkTracks(settings.of(name, CLOSURE), settings.of(name, DOUBLE) > 0.5f)
 			"nod" -> scaledOneShot(MotionGenerator.nodTracks(settings.of(name, COUNT).roundToInt()), settings.of(name, AMPLITUDE))
 			"shake" -> scaledOneShot(MotionGenerator.shakeTracks(settings.of(name, COUNT).roundToInt()), settings.of(name, AMPLITUDE))
 			"tailswing" -> SkeletonMotions.tailSwing(skeleton, settings.of(name, AMPLITUDE), settings.of(name, COUNT).roundToInt())
@@ -151,9 +171,17 @@ object MotionPresets {
 		if (name.equals("Idle", ignoreCase = true)) SkeletonMotions.IDLE_DURATION / settings.of(name, SPEED)
 		else tracks.maxOfOrNull { it.keys.last().time } ?: 0f
 
-	/** [name] as a clip, as the editor shows a generated motion before it is edited. */
-	fun clip(id: String, name: String, skeleton: SkeletonSpec?, settings: MotionPresetSettings = MotionPresetSettings()): MotionClip {
-		val tracks = tracks(name, skeleton, settings)
+	/**
+	 * [tracks] on the parameters [renames] (an ID conversion's, by standard ID) gave other IDs: generated tracks name
+	 * the standard parameters by their standard IDs.
+	 */
+	fun renamed(tracks: List<MotionTrack>, renames: Map<String, String>): List<MotionTrack> =
+		if (renames.isEmpty()) tracks else tracks.map { track -> renames[track.parameterId]?.let { track.copy(parameterId = it) } ?: track }
+
+	/** [name] as a clip, as the editor shows a generated motion before it is edited; [renames] as [renamed] takes them. */
+	fun clip(id: String, name: String, skeleton: SkeletonSpec?, settings: MotionPresetSettings = MotionPresetSettings(),
+			 renames: Map<String, String> = emptyMap()): MotionClip {
+		val tracks = renamed(tracks(name, skeleton, settings), renames)
 		return MotionClips.fromTracks(id, name, builtin = name, loop = loops(name), tracks = tracks, duration = duration(name, tracks, settings))
 	}
 

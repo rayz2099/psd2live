@@ -32,13 +32,13 @@
     - about-viewarea different cubism=about-viewarea
     - canvas-modes exclusive
     - preview-canvas exclusive
-    - guide-function missing cubism=guide-function
+    - guide-function different cubism=guide-function
     - solo different cubism=solo
-    - grid missing cubism=grid
+    - grid different cubism=grid
     - snapshot missing cubism=snapshot
-    - onion-skin missing cubism=onion-skin
+    - onion-skin different cubism=onion-skin
     - multiview different cubism=multiview
-    - random-pose missing cubism=random-pose
+    - random-pose different cubism=random-pose
   + toolbar-folder
     - toolbar different cubism=toolbar
     - edit-level different cubism=edit-level
@@ -55,7 +55,7 @@
     - project-palette missing cubism=project-palette
     - history-palette exclusive
     - logpalatte same cubism=logpalatte
-  - convert-id missing cubism=convert-id
+  - convert-id different cubism=convert-id
   - autosave different cubism=autosave
 + material
   - divide-the-material different cubism=divide-the-material
@@ -81,8 +81,8 @@
     - edit-parts different cubism=edit-parts
     - edit-parts-sketch different cubism=edit-parts-sketch
     - variants exclusive
-    - copy-and-paste missing cubism=copy-and-paste
-    - search-and-replace missing cubism=search-and-replace
+    - copy-and-paste different cubism=copy-and-paste
+    - search-and-replace different cubism=search-and-replace
     - offscreen-drawing missing cubism=offscreen-drawing
   + draw-order
     - draworder same cubism=draworder
@@ -91,11 +91,11 @@
     - concept-of-artmesh same cubism=concept-of-artmesh
     - mesh-edit different cubism=mesh-edit
     - mesh-edit-manual different cubism=mesh-edit-manual
-    - mesh-duplication missing cubism=mesh-duplication
+    - mesh-duplication different cubism=mesh-duplication
     - clipping-mask same cubism=clipping-mask
     - reversed-mask same cubism=reversed-mask
     - sketch different cubism=sketch
-    - hittest missing cubism=hittest
+    - hittest different cubism=hittest
     - blend-mode different cubism=blend-mode
     - interior-shape exclusive
   + artpath-folder
@@ -122,7 +122,7 @@
     + extended-interpolation-folder
       - extended-interpolation missing cubism=extended-interpolation
       - extended-type missing cubism=extended-type
-    - repeat missing cubism=repeat
+    - repeat different cubism=repeat
     - recording-parameters missing cubism=recording-parameters
     - copy-and-paste-parameter-values different cubism=copy-and-paste-parameter-values
     - motion-sync missing cubism=motion-sync
@@ -131,22 +131,22 @@
     - how-to-edit different cubism=how-to-edit
     - keyform-parent-chilid-relation same cubism=keyform-parent-chilid-relation
     - keyform-xydirection same cubism=keyform-xydirection
-    - copy-and-blend-shape missing cubism=copy-and-blend-shape
-    - paste-form-special missing cubism=paste-form-special
-    - confirm-target-for-pasting-multiple-forms missing cubism=confirm-target-for-pasting-multiple-forms
+    - copy-and-blend-shape different cubism=copy-and-blend-shape
+    - paste-form-special different cubism=paste-form-special
+    - confirm-target-for-pasting-multiple-forms different cubism=confirm-target-for-pasting-multiple-forms
     - synthesize-corners missing cubism=synthesize-corners
     - face-auto-edit different cubism=face-auto-edit
     - auto-generation-of-sway-motion different cubism=auto-generation-of-sway-motion
     - edit-vertices different cubism=edit-vertices
-    - restore-deformer-shape missing cubism=restore-deformer-shape
+    - restore-deformer-shape different cubism=restore-deformer-shape
     - glue different cubism=glue
     - deformpath different cubism=deformpath
     - skinning different cubism=skinning
     - skeleton exclusive
     - generated-overrides exclusive
-    - multi-key missing cubism=multi-key
+    - multi-key different cubism=multi-key
     - motion-mirroring different cubism=motion-mirroring
-    - temporary-deform-tool missing cubism=temporary-deform-tool
+    - temporary-deform-tool different cubism=temporary-deform-tool
     - deform-brush same cubism=deform-brush
     - blend-shape different cubism=blend-shape
     - limit-settings-for-blend-shape-weights missing cubism=limit-settings-for-blend-shape-weights
@@ -170,13 +170,13 @@
   + timeline
     - timeline-basic-operation-timelinepalette different cubism=timeline-basic-operation-timelinepalette
     - timeline-basic-operation-dopesheet same cubism=timeline-basic-operation-dopesheet
-    - parameter-bookmark missing cubism=parameter-bookmark
-    - timeline-basic-operation-shy missing cubism=timeline-basic-operation-shy
-    - freeze missing cubism=freeze
-    - timeline-basic-operation-repeat missing cubism=timeline-basic-operation-repeat
+    - parameter-bookmark different cubism=parameter-bookmark
+    - timeline-basic-operation-shy different cubism=timeline-basic-operation-shy
+    - freeze different cubism=freeze
+    - timeline-basic-operation-repeat different cubism=timeline-basic-operation-repeat
     - grapheditor different cubism=grapheditor
-    - marker missing cubism=marker
-    - locus-of-tracks missing cubism=locus-of-tracks
+    - marker different cubism=marker
+    - locus-of-tracks different cubism=locus-of-tracks
     - template-making-and-management missing cubism=template-making-and-management
     - about-fade same cubism=about-fade
     - fade-setting different cubism=fade-setting
@@ -194,7 +194,7 @@
   - limited-animation missing cubism=limited-animation
   - physics-operation-bake missing cubism=physics-operation-bake
   - motion-sync-bake missing cubism=motion-sync-bake
-  - loop-editing-support missing cubism=loop-editing-support
+  - loop-editing-support different cubism=loop-editing-support
 + export
   - exporting-images different cubism=exporting-images
   - export-moc3-motion3-files different cubism=export-moc3-motion3-files
@@ -213,11 +213,11 @@
   - external-application-integration-api different cubism=external-application-integration-api
   - external-application-integration-api-list different cubism=external-application-integration-api-list
 + viewer
-  - pose-setting missing cubism=pose-setting
-  - facial-expression-system missing cubism=facial-expression-system
-  - create-facial-expressions missing cubism=create-facial-expressions
-  - setting-and-exporting-facial-expressions missing cubism=setting-and-exporting-facial-expressions
-  - userdata-event-information missing cubism=userdata-event-information
+  - pose-setting different cubism=pose-setting
+  - facial-expression-system same cubism=facial-expression-system
+  - create-facial-expressions different cubism=create-facial-expressions
+  - setting-and-exporting-facial-expressions different cubism=setting-and-exporting-facial-expressions
+  - userdata-event-information different cubism=userdata-event-information
 
 [tutorials]
 + t-beginner

@@ -23,19 +23,58 @@ object AppSettings {
 		Preferences.userRoot().node(PREFS_NODE_NAME)
 	}
 
-	/** The window's size in dp and whether it was maximized when it last closed; 1280 x 820 the first time. */
+	/** The window's windowed size in dp, the one every other mode returns to; 1280 x 820 the first time. */
 	val windowWidth: Float get() = runCatching { preferences.getFloat("window_width", 1280f) }.getOrDefault(1280f).let { if (it.isFinite()) it.coerceIn(640f, 8192f) else 1280f }
 	val windowHeight: Float get() = runCatching { preferences.getFloat("window_height", 820f) }.getOrDefault(820f).let { if (it.isFinite()) it.coerceIn(400f, 8192f) else 820f }
-	val windowMaximized: Boolean get() = runCatching { preferences.getBoolean("window_maximized", false) }.getOrDefault(false)
 
-	fun rememberWindow(width: Float, height: Float, maximized: Boolean) {
+	fun rememberWindowSize(width: Float, height: Float) {
+		if (!width.isFinite() || !height.isFinite()) return
 		runCatching {
-			preferences.putBoolean("window_maximized", maximized)
-			// A maximized window keeps the floating size it restores to.
-			if (!maximized && width.isFinite() && height.isFinite()) {
-				preferences.putFloat("window_width", width); preferences.putFloat("window_height", height)
-			}
+			preferences.putFloat("window_width", width); preferences.putFloat("window_height", height)
 			preferences.flush()
+		}
+	}
+
+	/** A stored mode by name; before modes, only whether the window was maximized was kept. */
+	internal fun windowModeOf(stored: String?, legacyMaximized: Boolean): WindowMode =
+		WindowMode.entries.firstOrNull { it.name == stored } ?: if (legacyMaximized) WindowMode.MAXIMIZED else WindowMode.WINDOWED
+
+	private fun storedWindowMode(key: String): WindowMode? =
+		runCatching { preferences.get(key, null) }.getOrNull()?.let { name -> WindowMode.entries.firstOrNull { it.name == name } }
+
+	private val legacyMaximized: Boolean get() = runCatching { preferences.getBoolean("window_maximized", false) }.getOrDefault(false)
+
+	private val windowModeState = kotlinx.coroutines.flow.MutableStateFlow(
+		windowModeOf(runCatching { preferences.get("window_mode", null) }.getOrNull(), legacyMaximized))
+
+	/** The main window's mode; the window follows it as it changes, and opens in it next time. */
+	val windowModeFlow: kotlinx.coroutines.flow.StateFlow<WindowMode> get() = windowModeState
+
+	var windowMode: WindowMode
+		get() = windowModeState.value
+		set(value) {
+			windowModeState.value = value
+			runCatching {
+				preferences.put("window_mode", value.name)
+				if (value != WindowMode.FULLSCREEN) preferences.put("window_restore_mode", value.name)
+			}
+		}
+
+	/** The windowed or maximized mode last used, which leaving full screen returns to. */
+	val restoreMode: WindowMode
+		get() = storedWindowMode("window_restore_mode")?.takeIf { it != WindowMode.FULLSCREEN } ?: windowModeOf(null, legacyMaximized)
+
+	/** Full screen, or back out of it. */
+	fun toggleFullscreen() {
+		windowMode = if (windowMode == WindowMode.FULLSCREEN) restoreMode else WindowMode.FULLSCREEN
+	}
+
+	/** The title bar's maximize button: windowed and maximized swap; from full screen, back to where it came from. */
+	fun toggleMaximized() {
+		windowMode = when (windowMode) {
+			WindowMode.WINDOWED -> WindowMode.MAXIMIZED
+			WindowMode.MAXIMIZED -> WindowMode.WINDOWED
+			else -> restoreMode
 		}
 	}
 
@@ -50,19 +89,34 @@ object AppSettings {
 			if (value.isFinite()) runCatching { preferences.putFloat("parameter_name_width", value.coerceIn(24f, 240f)) }
 		}
 
-	private val softwareCanvasState = kotlinx.coroutines.flow.MutableStateFlow(
-		runCatching { preferences.getBoolean("software_canvas", false) }.getOrDefault(false),
-	)
+	private val graphicsState = kotlinx.coroutines.flow.MutableStateFlow(runCatching {
+		io.github.psd2live.render.GraphicsOptions.stored { key -> preferences.get(key, null) }
+	}.getOrDefault(io.github.psd2live.render.GraphicsOptions()))
 
-	/** The editing canvas paints in software instead of on its GPU renderer; for troubleshooting a driver. */
+	/** How the window and canvases draw; what waits for the next start is said in [io.github.psd2live.render.GraphicsOptions]. */
+	val graphicsFlow: kotlinx.coroutines.flow.StateFlow<io.github.psd2live.render.GraphicsOptions> get() = graphicsState
+
+	var graphics: io.github.psd2live.render.GraphicsOptions
+		get() = graphicsState.value
+		set(value) {
+			val previous = graphicsState.value
+			graphicsState.value = value
+			softwareCanvasState.value = value.renderPath != io.github.psd2live.render.RenderPath.GPU
+			previewFrameRateState.value = value.frameRateLimit.fps
+			io.github.psd2live.render.GraphicsSettings.update(value)
+			runCatching { for ((key, stored) in value.toStored()) preferences.put(key, stored) }
+			// Windows keeps the card per program in its own settings; written now, read when PSD2Live next starts.
+			if (value.gpu != previous.gpu && io.github.psd2live.render.GraphicsSettings.isWindows) {
+				Thread({ io.github.psd2live.render.GraphicsDevices.applyWindowsPreference(value.gpu) }, "psd2live-gpu-preference").apply { isDaemon = true }.start()
+			}
+		}
+
+	private val softwareCanvasState = kotlinx.coroutines.flow.MutableStateFlow(graphicsState.value.renderPath != io.github.psd2live.render.RenderPath.GPU)
+
+	/** The editing canvas paints in software instead of on its GPU renderer ([graphics]' render path). */
 	val softwareCanvasFlow: kotlinx.coroutines.flow.StateFlow<Boolean> get() = softwareCanvasState
 
-	var softwareCanvas: Boolean
-		get() = softwareCanvasState.value
-		set(value) {
-			softwareCanvasState.value = value
-			runCatching { preferences.putBoolean("software_canvas", value) }
-		}
+	val softwareCanvas: Boolean get() = softwareCanvasState.value
 
 	private val previewBackendState = kotlinx.coroutines.flow.MutableStateFlow(
 		runCatching { io.github.psd2live.core.PreviewBackend.valueOf(preferences.get("preview_backend", "CUBISM")) }
@@ -91,22 +145,32 @@ object AppSettings {
 			runCatching { preferences.putBoolean("preview_advanced", value) }
 		}
 
-	/** The preview frame rates offered; 0 follows the display. */
-	val previewFrameRates = listOf(0, 30, 60, 120)
-
-	private val previewFrameRateState = kotlinx.coroutines.flow.MutableStateFlow(
-		runCatching { preferences.getInt("preview_frame_rate", 0) }.getOrDefault(0).let { if (it < 0) 0 else it },
+	private val canvasRailState = kotlinx.coroutines.flow.MutableStateFlow(
+		runCatching { preferences.get("canvas_rail", null)?.let(CanvasRailEntry::parse) }.getOrNull() ?: CanvasRailEntry.Defaults,
 	)
 
-	/** The preview's frame rate cap; 0 (the default) renders on every display refresh. */
+	/** The display toggles pinned to the canvas's display rail; the View menu carries all of them. */
+	val canvasRailFlow: kotlinx.coroutines.flow.StateFlow<Set<CanvasRailEntry>> get() = canvasRailState
+
+	var canvasRail: Set<CanvasRailEntry>
+		get() = canvasRailState.value
+		set(value) {
+			canvasRailState.value = value
+			runCatching { preferences.put("canvas_rail", CanvasRailEntry.encode(value)) }
+		}
+
+	/** The preview frame rates offered; 0 follows the display. */
+	val previewFrameRates = io.github.psd2live.render.FrameRateLimit.entries.map { it.fps }
+
+	private val previewFrameRateState = kotlinx.coroutines.flow.MutableStateFlow(graphicsState.value.frameRateLimit.fps)
+
+	/** The preview's frame rate cap; 0 (the default) renders on every display refresh. Part of [graphics]. */
 	val previewFrameRateFlow: kotlinx.coroutines.flow.StateFlow<Int> get() = previewFrameRateState
 
 	var previewFrameRate: Int
 		get() = previewFrameRateState.value
 		set(value) {
-			val rate = value.coerceAtLeast(0)
-			previewFrameRateState.value = rate
-			runCatching { preferences.putInt("preview_frame_rate", rate) }
+			graphics = graphics.copy(frameRateLimit = io.github.psd2live.render.FrameRateLimit.ofFps(value))
 		}
 
 	/** Whether edits in the simulation panel bake again as they commit; off by default, as a bake takes seconds. */
@@ -435,7 +499,7 @@ object AppSettings {
 	/** Null when [raw] is malformed — callers then fall back to the preset default for that action. */
 	private fun parseOverrideList(raw: String): List<KeyBinding>? {
 		if (raw == UNBOUND_MARKER) return emptyList()
-		val parts = raw.split(';')
+		val parts = splitKeyBindingList(raw)
 		val parsed = ArrayList<KeyBinding>(parts.size)
 		for (part in parts) parsed.add(parseKeyBinding(part) ?: return null)
 		return parsed

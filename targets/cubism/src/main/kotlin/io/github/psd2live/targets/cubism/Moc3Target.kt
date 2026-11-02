@@ -1,13 +1,19 @@
 package io.github.psd2live.targets.cubism
 
 import io.github.psd2live.format.compile.*
+import io.github.psd2live.format.model.AlphaBlend
 import io.github.psd2live.format.model.Clip
+import io.github.psd2live.format.model.CurveSegment
 import io.github.psd2live.format.model.ColorBlend
+import io.github.psd2live.format.model.GroupMode
+import io.github.psd2live.format.model.ExpressionIR
 import io.github.psd2live.format.model.Physics
 import io.github.psd2live.format.model.RigIR
 import org.umamo.format.moc3.Moc3
 import org.umamo.format.moc3.json.FileReferences
+import org.umamo.format.moc3.json.Model3Expression
 import org.umamo.format.moc3.json.Model3Group
+import org.umamo.format.moc3.json.Model3HitArea
 import org.umamo.format.moc3.json.Model3Json
 import org.umamo.format.moc3.json.Model3Motion
 import org.umamo.interop.ExportNotice
@@ -16,9 +22,10 @@ import org.umamo.interop.moc3.Moc3Sidecars
 import org.umamo.render.canvasToParentSpaceFor
 import org.umamo.render.restMeshesToCanvasSpace
 import org.umamo.runtime.model.ParameterId
+import org.umamo.runtime.model.RuntimeFeature
 
 /**
- * The Cubism runtime family: `.moc3` with its model3, physics3, motion3, cdi3 and texture files.
+ * The Cubism runtime family: `.moc3` with its model3, physics3, motion3, exp3, pose3, cdi3, userdata3 and texture files.
  *
  * Settings (all optional): `physics`, `user_data`, `display_info`, `hidden_parts`, `hidden_meshes`,
  * `guide_parts` (booleans) and `pixels_per_unit` (a positive number overriding the bake scale).
@@ -30,7 +37,7 @@ public object Moc3Target : ExportTarget {
 	override val capabilities: CapabilityProfile = CapabilityProfile(
 		warpLattice = true, parameterGrid = 3, blendShapes = true, timeline = true,
 		physics = PhysicsSupport.PARAMETER_PENDULUM, blendModes = ColorBlend.entries.toSet(),
-		masks = MaskSupport.TEXTURE_ALPHA, keyedDrawOrder = true, glue = true,
+		masks = MaskSupport.TEXTURE_ALPHA, keyedDrawOrder = true, glue = true, hitAreas = true,
 	)
 	override val settings: List<TargetSetting> = listOf(
 		TargetSetting.Flag("physics", true), TargetSetting.Flag("user_data", true), TargetSetting.Flag("display_info", true),
@@ -60,32 +67,63 @@ public object Moc3Target : ExportTarget {
 			require(page.png.size > 0) { "Texture page $index has no pixels" }
 			Moc3Sidecars.AtlasPage("$textureFolder/texture_${index.toString().padStart(2, '0')}.png", page.png.shared())
 		}
-		val texts = sidecarTexts(SidecarKey(ir.physics, ir.clips, parameterIds, baseName))
+		val texts = sidecarTexts(SidecarKey(ir.physics, ir.clips, ir.advanced.expressions, parameterIds, baseName))
 		val motions = texts.motions
+		val expressions = texts.expressions
 		val sidecars = buildList {
 			if (moc3Options.includePhysics) texts.physics?.let {
 				add(Moc3Sidecars.PassThroughSidecar(Moc3Sidecars.SidecarKind.Physics, "$baseName.physics3.json", it))
 			}
 			for ((_, file, json) in motions) add(Moc3Sidecars.PassThroughSidecar(Moc3Sidecars.SidecarKind.Motion, file, json))
+			for ((_, file, json) in expressions) add(Moc3Sidecars.PassThroughSidecar(Moc3Sidecars.SidecarKind.Expression, file, json))
+			ir.advanced.pose?.let { Cubism3Json.pose3(it, ir.parts.mapTo(HashSet()) { part -> part.id }) }?.let {
+				add(Moc3Sidecars.PassThroughSidecar(Moc3Sidecars.SidecarKind.Pose, "$baseName.pose3.json", Cubism3Json.normalize(it)))
+			}
 		}
 		val manifest = Model3Json(
 			version = 3,
 			fileReferences = FileReferences(moc = "", textures = emptyList(),
+				expressions = expressions.takeIf { it.isNotEmpty() }?.map { (name, file, _) -> Model3Expression(name = name, file = file) },
 				motions = motions.takeIf { it.isNotEmpty() }?.groupBy({ it.first }, { Model3Motion(file = it.second) })),
 			// Cubism knows these two groups; the other roles are for runtimes that drive them themselves.
 			groups = ir.parameterRoles.filter { it.role == "EyeBlink" || it.role == "LipSync" }.mapNotNull { role ->
 				role.parameters.filter(parameterIds::contains).takeIf { it.isNotEmpty() }?.let { Model3Group("Parameter", role.role, it) }
 			},
+			hitAreas = hitAreas(ir),
 		)
 		return Moc3Sidecars.bundle(exportPuppet, baseName, pages = pages, sidecars = sidecars, source = manifest,
 			canvasToParentSpace = canvasToParentSpaceFor(exportPuppet), options = moc3Options)
 	}
 
-	/** What the physics3 and motion3 texts of a bundle depend on. */
-	private data class SidecarKey(val physics: Physics, val clips: List<Clip>, val parameterIds: Set<String>, val baseName: String)
+	/** What the physics3, motion3 and exp3 texts of a bundle depend on. */
+	private data class SidecarKey(val physics: Physics, val clips: List<Clip>, val expressions: List<ExpressionIR>,
+		val parameterIds: Set<String>, val baseName: String)
 
-	/** The normalized physics3 text (checked by reading it back) and each motion's group, file and normalized text. */
-	private class SidecarTexts(physicsText: String?, val motions: List<Triple<String, String, String>>) {
+	/**
+	 * The document's hit areas as model3 names them: one ArtMesh per entry, so an area of several meshes is one entry
+	 * per mesh under the area's name, in test order. Null without any, so such a manifest stays as it was.
+	 */
+	private fun hitAreas(ir: RigIR): List<Model3HitArea>? {
+		val meshes = ir.meshes.mapTo(HashSet()) { it.id }
+		return ir.hitAreas.flatMap { area -> area.meshes.filter(meshes::contains).map { Model3HitArea(area.name, it) } }.takeIf { it.isNotEmpty() }
+	}
+
+	/** What model3 cannot say about the document's hit areas: their own IDs, and more than one mesh each. */
+	public fun hitAreaLosses(ir: RigIR): List<LossEntry> {
+		val meshes = ir.meshes.mapTo(HashSet()) { it.id }
+		return ir.hitAreas.mapNotNull { area -> area.meshes.count(meshes::contains).takeIf { it > 1 }?.let { count ->
+			LossEntry(area.id, Feature.STRUCTURE, Handling.APPROXIMATED,
+				note = "model3 hit areas name one ArtMesh each: $count entries named ${area.name}, which a host testing only the first entry by name reads as its first mesh")
+		} }
+	}
+
+	/**
+	 * The normalized physics3 text (checked by reading it back), each motion's group, file and normalized text, and
+	 * each expression's manifest name, file and normalized exp3 text in the IR's order. An exp3 file is named by the
+	 * expression's ID, which the document keeps unique and file-safe.
+	 */
+	private class SidecarTexts(physicsText: String?, val motions: List<Triple<String, String, String>>,
+		val expressions: List<Triple<String, String, String>>) {
 		/** Read back once, when a bundle first carries it. */
 		val physics: String? by lazy { physicsText?.also { Moc3.readPhysics3(it) } }
 	}
@@ -106,15 +144,66 @@ public object Moc3Target : ExportTarget {
 			val json = Cubism3Json.motion3(clip, key.parameterIds) ?: return@mapNotNull null
 			Triple(clip.group, "${key.baseName}.${clip.file}.motion3.json", Cubism3Json.normalize(json))
 		}
-		return SidecarTexts(physics, motions).also { synchronized(sidecarCache) { sidecarCache[key] = it } }
+		val expressions = key.expressions.map { expression ->
+			Triple(expression.name, "${key.baseName}.${expression.id}.exp3.json", Cubism3Json.normalize(Cubism3Json.exp3(expression, key.parameterIds)))
+		}
+		return SidecarTexts(physics, motions, expressions).also { synchronized(sidecarCache) { sidecarCache[key] = it } }
 	}
 
 	override fun plan(ir: RigIR, options: ExportOptions): LoweredExport {
 		val bundle = bundle(ir, options)
-		val losses = CapabilityScan.scan(ir, capabilities, options) + bundle.report.notices.map(::loss)
+		val losses = CapabilityScan.scan(ir, capabilities, options) + losses(ir, options, bundle.report.notices) +
+			clampedMotions(ir, bundle.report.notices) + hitAreaLosses(ir)
 		return object : LoweredExport {
 			override val losses: List<LossEntry> = losses
 			override fun write(sink: OutputSink) = bundle.files.forEach { sink.write(it.name, it.bytes) }
+		}
+	}
+
+	/**
+	 * The lowering's [notices] as loss entries. Stripped Cubism 5.3 blend modes are not dropped - the strip rewrites
+	 * each to the nearest mode the runtime has - so they become one approximated entry per mesh or isolated part of
+	 * [ir], by ID, naming the mode it becomes; [options] may hand the feature another handling, as for every scan.
+	 */
+	public fun losses(ir: RigIR, options: ExportOptions, notices: List<ExportNotice>): List<LossEntry> = notices.flatMap { notice ->
+		if (notice !is ExportNotice.FeatureStripped || notice.feature != RuntimeFeature.ExtendedBlendModes) return@flatMap listOf(loss(notice))
+		val handling = options.handling[Feature.BLEND_MODE] ?: Handling.APPROXIMATED
+		fun entry(id: String, blend: ColorBlend, alpha: AlphaBlend): LossEntry? {
+			val legacy = blend == ColorBlend.NORMAL || blend == ColorBlend.ADD_PREMULTIPLIED || blend == ColorBlend.MULTIPLY_PREMULTIPLIED
+			if (legacy && alpha == AlphaBlend.OVER) return null
+			val nearest = when (blend) {
+				ColorBlend.ADD_PREMULTIPLIED, ColorBlend.ADD, ColorBlend.ADD_GLOW, ColorBlend.SCREEN -> "add"
+				ColorBlend.MULTIPLY_PREMULTIPLIED, ColorBlend.MULTIPLY -> "multiply"
+				else -> "normal"
+			}
+			val color = if (legacy) "" else "${blend.name.lowercase()} becomes $nearest"
+			val alphaNote = if (alpha == AlphaBlend.OVER) "" else "${alpha.name.lowercase()} alpha becomes over"
+			return LossEntry(id, Feature.BLEND_MODE, handling,
+				note = "Before Cubism 5.3: " + listOf(color, alphaNote).filter { it.isNotEmpty() }.joinToString("; "))
+		}
+		ir.meshes.mapNotNull { entry(it.id, it.blend, it.alphaBlend) } +
+			ir.parts.filter { it.groupMode == GroupMode.ISOLATED }.mapNotNull { entry(it.id, it.composite.blend, it.composite.alphaBlend) }
+	}
+
+	/**
+	 * Each motion curve keyed past the range of a parameter whose repeat the target version stripped: the editor wraps
+	 * it a turn round, the runtime clamps it at the end of the range.
+	 */
+	public fun clampedMotions(ir: RigIR, notices: List<ExportNotice>): List<LossEntry> {
+		val stripped = notices.filterIsInstance<ExportNotice.FeatureStripped>()
+			.filter { it.feature == RuntimeFeature.ParameterRepeat }.flatMapTo(HashSet()) { it.subjects }
+		if (stripped.isEmpty()) return emptyList()
+		val parameters = ir.parameters.filter { it.id in stripped }.associateBy { it.id }
+		return ir.clips.flatMap { clip ->
+			clip.curves.mapNotNull { curve ->
+				val parameter = parameters[curve.parameter] ?: return@mapNotNull null
+				val values = sequenceOf(curve.startValue) + curve.segments.asSequence().flatMap { segment ->
+					if (segment is CurveSegment.Bezier) sequenceOf(segment.c1Value, segment.c2Value, segment.value) else sequenceOf(segment.value)
+				}
+				if (values.all { it in parameter.min..parameter.max }) null
+				else LossEntry("${clip.id}/${parameter.id}", Feature.TIMELINE, Handling.APPROXIMATED,
+					note = "Motion ${clip.name} keys ${parameter.id} past its range; without parameter repeat the runtime clamps it where the editor preview wraps it")
+			}
 		}
 	}
 
@@ -130,6 +219,8 @@ public object Moc3Target : ExportTarget {
 			note = "${notice.pageCount} texture pages rebuilt without source art")
 		is ExportNotice.SharedAtlasSlotKept -> LossEntry(notice.drawableNames.joinToString(","), Feature.TEXTURE_SIZE, Handling.APPROXIMATED,
 			note = "Meshes keep a shared atlas slot")
+		is ExportNotice.HitAreaDropped -> LossEntry(notice.drawableId, Feature.STRUCTURE, Handling.DROPPED,
+			note = "Hit area ${notice.name} names mesh ${notice.drawableId}, which the moc does not contain")
 		is ExportNotice.DrawOrdersRenumbered -> LossEntry(notice.subjects.joinToString(","), Feature.STRUCTURE, Handling.APPROXIMATED,
 			note = "Fractional draw orders renumbered to whole numbers; the stacking is unchanged")
 	}

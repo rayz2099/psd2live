@@ -45,6 +45,22 @@ data class MotionCurve(val parameterId: String, val keys: List<MotionKey>) {
 }
 
 /**
+ * A point a runtime reports to its host as the motion passes it (Cubism's motion user data, the animation view's
+ * Event): the host receives [value] at [time] seconds.
+ */
+data class MotionEvent(val time: Float, val value: String) {
+	init {
+		require(time.isFinite() && time >= 0f) { "Event time must be finite and not negative" }
+		require(value.length <= MAX_VALUE_LENGTH) { "An event value is at most $MAX_VALUE_LENGTH characters" }
+	}
+
+	companion object {
+		const val MAX_VALUE_LENGTH = 1024
+		const val MAX_PER_CLIP = 256
+	}
+}
+
+/**
  * An authored motion. A [builtin] clip overrides the generated motion of that name (see
  * [MotionClips.BUILTIN_NAMES]); without it the clip is the user's own and exports under [name].
  */
@@ -59,6 +75,8 @@ data class MotionClip(
 	val fadeOut: Float = 1f,
 	val enabled: Boolean = true,
 	val curves: List<MotionCurve> = emptyList(),
+	/** Events in time order, one per time. */
+	val events: List<MotionEvent> = emptyList(),
 ) {
 	init {
 		require(id.isNotBlank() && name.isNotBlank() && name.none(Char::isISOControl)) { "Motion needs an id and a name" }
@@ -66,27 +84,37 @@ data class MotionClip(
 		require(fps.isFinite() && fps in 1f..120f) { "Motion FPS must be within 1..120" }
 		require(fadeIn.isFinite() && fadeIn >= 0f && fadeOut.isFinite() && fadeOut >= 0f) { "Motion fades must not be negative" }
 		require(curves.map { it.parameterId }.distinct().size == curves.size) { "A motion drives each parameter once" }
+		require(events.size <= MotionEvent.MAX_PER_CLIP) { "A motion has at most ${MotionEvent.MAX_PER_CLIP} events" }
+		require(events.zipWithNext().all { (a, b) -> a.time < b.time }) { "Motion events must be in time order, one per time" }
 	}
 
 	fun curve(parameterId: String): MotionCurve? = curves.firstOrNull { it.parameterId == parameterId }
 }
 
 object MotionClips {
-	/** Parameter deletion removes tracks; range changes constrain keys and Bezier control values. */
+	/**
+	 * Parameter deletion removes tracks; range changes constrain keys and Bezier control values. A repeating parameter's
+	 * keys may run turns past its range ([MotionLoops.keyLimits]): the runtime wraps them.
+	 */
 	fun reconcileParameters(clips: List<MotionClip>, parameters: List<org.umamo.runtime.model.Parameter>): List<MotionClip> {
 		val definitions = parameters.associateBy { it.id.raw }
 		return clips.map { clip -> clip.copy(curves = clip.curves.mapNotNull { curve ->
 			val parameter = definitions[curve.parameterId] ?: return@mapNotNull null
-			clamped(curve, parameter.min, parameter.max)
+			val limits = MotionLoops.keyLimits(parameter)
+			clamped(curve, limits.start, limits.endInclusive)
 		}) }
 	}
 
 	/**
-	 * [clips] once parameter [parameterId] spans [min]..[max]: its keys and their handles are held inside the range,
-	 * as the export plays them, so the clips stay valid to edit.
+	 * [clips] once parameter [parameterId] spans [min]..[max]: its keys and their handles are held inside the range
+	 * (or the turns a [repeat] parameter allows), as the export plays them, so the clips stay valid to edit.
 	 */
-	fun withParameterRange(clips: List<MotionClip>, parameterId: String, min: Float, max: Float): List<MotionClip> =
-		clips.map { clip -> clip.copy(curves = clip.curves.map { if (it.parameterId == parameterId) clamped(it, min, max) else it }) }
+	fun withParameterRange(clips: List<MotionClip>, parameterId: String, min: Float, max: Float, repeat: Boolean = false): List<MotionClip> {
+		val limits = MotionLoops.keyLimits(min, max, repeat)
+		return clips.map { clip -> clip.copy(curves = clip.curves.map {
+			if (it.parameterId == parameterId) clamped(it, limits.start, limits.endInclusive) else it
+		}) }
+	}
 
 	/** [clips] without the curves of parameter [parameterId], once it is deleted. */
 	fun withoutParameter(clips: List<MotionClip>, parameterId: String): List<MotionClip> =
@@ -103,7 +131,7 @@ object MotionClips {
 	})
 
 	/** The basic generated motions, which every rig can play; the model presets switch them as one group. */
-	val BASIC_NAMES: List<String> = listOf("Idle", "Blink", "Nod", "Shake")
+	val BASIC_NAMES: List<String> = listOf("Idle", "Blink", "Nod", "Shake", "Talk")
 
 	/** The generated motions, in the order the panel lists them. */
 	val BUILTIN_NAMES: List<String> = BASIC_NAMES + SkeletonMotions.presets.map { it.name }
@@ -215,9 +243,13 @@ object MotionClips {
 	}
 
 	/** A clip id unused by [clips]. */
-	fun newId(clips: List<MotionClip>): String {
+	/**
+	 * An unused motion ID. [reserved] are IDs to skip as well - a deleted motion's, which its timeline aids still
+	 * hold for an undo to find, so a new motion does not inherit them.
+	 */
+	fun newId(clips: List<MotionClip>, reserved: Set<String> = emptySet()): String {
 		var index = clips.size + 1
-		while (clips.any { it.id == "motion_$index" }) index++
+		while (clips.any { it.id == "motion_$index" } || "motion_$index" in reserved) index++
 		return "motion_$index"
 	}
 
@@ -277,6 +309,20 @@ object MotionClips {
 				}
 			})
 		}
+		// Only a clip with events writes the key, so clips without them keep their stored form.
+		if (clip.events.isNotEmpty()) putJsonArray("events") {
+			for (event in clip.events) add(buildJsonObject { put("time", event.time); put("value", event.value) })
+		}
+	}
+
+	/** [events] by time, a later event replacing an earlier one at the same time. */
+	fun normalizedEvents(events: List<MotionEvent>): List<MotionEvent> {
+		val result = ArrayList<MotionEvent>(events.size)
+		for (event in events.withIndex().sortedWith(compareBy({ it.value.time }, { it.index })).map { it.value }) {
+			if (result.isNotEmpty() && abs(result.last().time - event.time) < TIME_EPSILON) result[result.lastIndex] = event
+			else result += event
+		}
+		return result
 	}
 
 	fun fromJson(o: JsonObject): MotionClip = MotionClip(
@@ -310,5 +356,9 @@ object MotionClips {
 				}),
 			)
 		},
+		events = normalizedEvents(o["events"]?.jsonArray.orEmpty().map { element ->
+			val event = element.jsonObject
+			MotionEvent(event.getValue("time").jsonPrimitive.float, event.getValue("value").jsonPrimitive.content)
+		}),
 	)
 }

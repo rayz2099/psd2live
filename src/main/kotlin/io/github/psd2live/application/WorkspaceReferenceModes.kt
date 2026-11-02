@@ -62,13 +62,12 @@ internal object WorkspaceReferenceModes {
             putJsonObject("rect") { put("left", space.left); put("top", space.top); put("width", space.width); put("height", space.height) }
             put("under", mode == Mode.BACKGROUND)
             put("visible", document.layerVisibility[id] ?: layer.visible)
-            put("opacity", model.rig.puppet.drawables.firstOrNull { model.rig.layerIdByDrawableId[it.id.raw] == id }?.opacity ?: layer.opacity)
+            put("opacity", model.rig.puppet.drawables.firstOrNull { model.rig.ownLayerIdByDrawableId[it.id.raw] == id }?.opacity ?: layer.opacity)
             if (pin.isNotEmpty()) put("points", JsonArray(pin.map { point -> JsonObject(point.mapValues { JsonPrimitive(it.value) }) }))
         })
         // A reference in the model goes with its mesh; one not in it yet leaves no trace.
-        val removed = if (id in WorkspaceReferenceMeshes.createdLayerIds(document))
-            WorkspaceLayerEdits.apply(added, model, WorkspaceDocumentOperation(WorkspaceLayerEdits.DELETE, buildJsonObject { put("layer_id", id) }))
-        else WorkspaceGenerationEdits.delete(added, id)
+        val removed = WorkspaceLayerEdits.apply(added, model,
+            WorkspaceDocumentOperation(WorkspaceLayerEdits.DELETE, buildJsonObject { put("layer_id", id) }))
         return removed.copy(layout = removed.layout.copy(referencePins = removed.layout.referencePins - id))
     }
 }

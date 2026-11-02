@@ -10,7 +10,9 @@ import io.github.psd2live.project.WorkspaceMutationResult
 import io.github.psd2live.core.LayerType
 import io.github.psd2live.core.SemanticTag
 import io.github.psd2live.core.Side
+import io.github.psd2live.core.PartRole
 import io.github.psd2live.core.MotionClips
+import io.github.psd2live.core.MotionEvent
 import io.github.psd2live.core.sim.SimMaterialPreset
 import kotlinx.serialization.json.*
 import java.util.UUID
@@ -86,13 +88,13 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         }
     }
 
-    register(WorkspaceImageLayerCommands.OP, "Import 1..128 PNG, lossless WebP, TIFF or BMP files as editable layers. Trims transparent borders, centres and scales down to fit the canvas without resampling the pixels. Each image gets its own mesh in the authored rig, which the generators never regenerate; parent_deformer_id attaches it to that existing deformer (default the model root); anchor_layer_id draws the batch just in front of that layer (in_front=false: just behind it), the first image in front of the rest; at [x, y] centres each image there in canvas units instead of the canvas centre. Move, scale or rotate it afterwards with layer_transform; undo removes it. Preserves existing object identities and commits the complete batch as one history edit. Each file is limited to 64 MiB and 16 megapixels; the complete batch is limited to 32 megapixels.",
+    register(WorkspaceImageLayerCommands.OP, "Import 1..128 PNG, lossless WebP, TIFF or BMP files as editable layers. Trims transparent borders, centres and scales down to fit the canvas without resampling the pixels. Each image gets its own mesh in the authored rig, which the generators never regenerate; parent_deformer_id attaches it to that existing deformer (default the model root); anchor_layer_id draws the batch just in front of that layer (in_front=false: just behind it), the first image in front of the rest; at [x, y] centres each image there in canvas units instead of the canvas centre; as_reference=true imports them as reference layers in the layer stack (no mesh, never exported), as dropping onto the layer list as a reference does. Move, scale or rotate it afterwards with layer_transform; undo removes it. Preserves existing object identities and commits the complete batch as one history edit. Each file is limited to 64 MiB and 16 megapixels; the complete batch is limited to 32 megapixels.",
         objectSchema(buildJsonObject { put("state", string()); put("paths", arraySchema(string(), 1, 128)); put("parent_deformer_id", string())
-            put("anchor_layer_id", string()); put("in_front", boolean()); put("at", arraySchema(number(), 2, 2)) },
+            put("anchor_layer_id", string()); put("in_front", boolean()); put("at", arraySchema(number(), 2, 2)); put("as_reference", boolean()) },
             listOf("state", "paths")), WorkspaceOperationKind.DOCUMENT) { request ->
         val at = request["at"]?.jsonArray?.map { it.jsonPrimitive.float }
         val insertion = ImageLayerInsertion(request["parent_deformer_id"]?.jsonPrimitive?.content, request["anchor_layer_id"]?.jsonPrimitive?.content,
-            request["in_front"]?.jsonPrimitive?.boolean ?: true, at?.let { it[0] to it[1] })
+            request["in_front"]?.jsonPrimitive?.boolean ?: true, at?.let { it[0] to it[1] }, reference = request["as_reference"]?.jsonPrimitive?.boolean == true)
         WorkspaceOperationOutput(workspace.importImages(request.text("state"), request.getValue("paths").jsonArray.map {
             java.nio.file.Path.of(it.jsonPrimitive.content)
         }, insertion).layerResult())
@@ -135,7 +137,10 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
     register(WorkspaceStructureMeshEdits.OP, "Rebuild the inside of one mesh along the structure drawn into its texture: creases, shading boundaries and pattern lines become rows of vertices with edges along them, and by default no vertex lies anywhere else: triangles span from line to line and to the edge rows, as hand-made meshes do. settings.fill adds vertices between the lines; settings.bands straddles drawn creases with a row on each side and rungs across. The outline row and edge band stay exactly as they are; keyforms, blend shapes, paths, weights and glue migrate as for layer_mesh_rebuild. On a mesh with an interior effect the effect's detected TOPOLOGY guides are replaced (drawn guides and guides marked FOLD stay and lead the mesh) and the effect is baked again in the same history edit (interior_rebaked). Fails without changing anything when the region cannot be meshed or max_vertices would be exceeded. Check first with layer_mesh_structure_preview.",
         objectSchema(JsonObject(structureSchema + ("state" to string())), listOf("state", "target")), WorkspaceOperationKind.DOCUMENT) { request ->
         val target = request.text("target").removePrefix("mesh:")
-        val rebake = workspace.captureQueries().listInteriorEffects().any { it.target == target }
+        // Read on the version the state names: the commit fails on any other.
+        val captured = workspace.captureQueries()
+        if (captured.snapshot().state != request.text("state")) throw WorkspaceConflict(request.text("state"), captured.snapshot().state)
+        val rebake = captured.listInteriorEffects().any { it.target == target }
         val edits = listOf(WorkspaceDocumentOperation(WorkspaceStructureMeshEdits.OP, JsonObject(request - "state")))
         val result = workspace.applyDocumentEdits(request.text("state"), "Remeshed $target along its texture", edits, MutationAuthor.AGENT)
         WorkspaceOperationOutput(buildJsonObject {
@@ -146,7 +151,11 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
     }
     register(WorkspaceStructureMeshEdits.PREVIEW, "What layer_mesh_structure would build on one mesh, from one captured version, without changing anything: the lines found (kind FOLD, SHADE or PATTERN; followed tells whether the mesh follows it, banded whether it straddles it), in source pixels and canvas units, and the new mesh's canvas points and triangles.",
         objectSchema(structureSchema, listOf("target")), WorkspaceOperationKind.QUERY) { request ->
-        WorkspaceOperationOutput(workspace.captureQueries().structureMeshPreview(request))
+        // Off the caller's thread and stopped where the mesher checks in when the call is cancelled.
+        val queries = workspace.captureQueries()
+        WorkspaceOperationOutput(kotlinx.coroutines.runInterruptible(kotlinx.coroutines.Dispatchers.Default) {
+            queries.structureMeshPreview(request, WorkspaceQueries::interrupted)
+        })
     }
 
     register(WorkspaceGenerationUpdate.OP, "Regenerate the rig with this build's generators. A project whose journal has a regeneration checkpoint keeps what the generators made when it was written, even after an update; this merges what they make now onto the user's edits: what the user left follows the new output, the user's changes stay, and what does not carry over cleanly is reported in issues (also in workspace_inspect quality.regeneration). Earlier regeneration merges this build makes differently are merged again first and their correction carried onto the current rig (issue kind remerged, target journal:<index>). Commits one undoable history node, or none when the generators make the same rig and every merge comes out alike (updated: false). Imported CMO3 models have no generated rig and are refused.",
@@ -164,15 +173,16 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         WorkspaceOperationOutput(workspace.captureQueries().sourceMeshComponents(request.text("layer_id")))
     }
 
-    registerJsonOperation("layer", "Classify an existing source layer using the same fields as the UI Layers table. Omitted fields retain their current values. A generated layer keeps the rig it has until rig_generate: the classification waits (pending: true); put rig_generate after it in one workspace_apply_edits batch to see it at once. A layer not generated yet takes it at once. Commits a recoverable history edit.",
+    registerJsonOperation("layer", "Classify an existing source layer using the same fields as the UI Layers table. Omitted fields retain their current values. part says what the layer is within its role (highlight, lower lash, shadow...; none for nothing, auto to let the analysis guess) - the rig modules read it. A generated layer keeps the rig it has until rig_generate: the classification waits (pending: true); put rig_generate after it in one workspace_apply_edits batch to see it at once. A layer not generated yet takes it at once. Commits a recoverable history edit.",
         buildJsonObject {
             put("state", string()); put("layer_id", string())
             put("type", choices(*LayerType.entries.map { it.name.lowercase() }.toTypedArray()))
             put("role", choices(*SemanticTag.entries.map { it.name.lowercase() }.toTypedArray()))
             put("side", choices(*Side.entries.map { it.name.lowercase() }.toTypedArray()))
             put("parameter", string()); put("switch_id", integer(0))
+            put("part", choices(*(PartRole.worded.map { it.word } + listOf("none", "auto")).toTypedArray()))
         }, listOf("state", "layer_id"), true) { a ->
-        require(listOf("type", "role", "side", "parameter", "switch_id").any { it in a }) { "Provide at least one classification field" }
+        require(listOf("type", "role", "side", "parameter", "switch_id", "part").any { it in a }) { "Provide at least one classification field" }
         val id = a.text("layer_id")
         val result = workspace.classifyLayer(id, JsonObject(a - setOf("state", "layer_id")), a.text("state"))
         buildJsonObject {
@@ -207,9 +217,10 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         listOf("atlasSize", "meshSpacing", "texturePadding", "alphaThreshold").forEach { put(it, integer(0)) }
         listOf("meshOuterMargin", "meshEdgeWidth", "meshMaxEdgeDistance", "meshInteriorDensity",
             "headStrength", "bodyStrength", "mouthThickness").forEach { put(it, number()) }
+        put("seeThroughOpacity", buildJsonObject { put("type", "number"); put("minimum", 0); put("maximum", 1) })
         put("exportPixelsPerUnit", oneOf(listOf(number(), buildJsonObject { put("type", "null") })))
         listOf("meshSuppressBoundaryDiagonals", "meshOnly", "generateDeformers", "featureDisplacementEnabled", "mouthOutlineEnabled",
-            "generatePhysics", "physicsFrontHair", "physicsBackHair", "physicsEyeJelly",
+            "seeThroughBrows", "seeThroughEyes", "generatePhysics", "physicsFrontHair", "physicsBackHair", "physicsEyeJelly",
             "exportMotions", "motionBasic", "motionIdle", "motionBlink", "motionNod", "motionShake", "motionSkeleton",
             "exportCmo3", "exportMoc3", "exportJson", "exportCan3", "exportHiddenParts", "exportHiddenDrawables",
             "exportGuideImageParts", "exportIncludePhysics", "exportIncludeUserData", "exportIncludeDisplayInfo").forEach { put(it, boolean()) }
@@ -241,8 +252,9 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         put("runtimeTarget", string()); put("textureUpscale", upscaleSettings)
         put("meshFillParameters", fillParameterFields)
         put("rigTuning", rigTuningFields)
+        put("rig", RigModuleSchemas.change)
     })
-    registerJsonOperation("settings", "Update the project generation/export configuration used by the UI. Inspect scope=settings first. Rebuilds the model and commits history; textureUpscale, meshFillParameters and rigTuning fields are merged with the existing configuration; rigTuning sets how far the rig moves each part at the parameters' full values (head turn and face, eyes, brows, mouth, nose and ears, hair, body turn, open, lean, proportion, breath, depth).",
+    registerJsonOperation("settings", "Update the project generation/export configuration used by the UI. Inspect scope=settings first. Rebuilds the model and commits history; textureUpscale, meshFillParameters, rigTuning and rig fields are merged with the existing configuration; rigTuning sets how far the rig moves each part at the parameters' full values (head turn and face, eyes, brows, mouth, nose and ears, hair, body turn, open, lean, proportion, breath, depth); rig sets how the rig is built area by area (module_catalog lists areas, bases and modules): bases {area: {base, values}} and modules {id: {on, values}}, null entries returning to the default, and moves {feature: {handle: [dx, dy]}} shifts a fitted feature's handle by canvas pixels (eye.L/eye.R inner, outer, upper, lower; brow.L/brow.R inner, outer, arch; mouth left, right, upper, lower), null returning it to the fit; rig {} upgrades a project saved before modules, rig null returns it to the legacy rig.",
         buildJsonObject { put("state", string()); put("changes", projectSettingFields) }, listOf("state", "changes"), true) { a ->
         workspace.updateProjectSettings(a.text("state"), a.getValue("changes").jsonObject).compact()
     }
@@ -264,11 +276,26 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
     }
     val previewValues = buildJsonObject { put("type", "object"); put("additionalProperties", number()) }
     val previewLocks = buildJsonObject { put("type", "object"); put("additionalProperties", boolean()) }
-    registerJsonOperation("preview", "Set authored preview parameter values and locks, or reset them, against the captured committed pose. Values are checked against parameter ranges; unspecified values survive independently of animation frames. This persists auxiliary session state without authoring model keyforms or history.",
+    registerJsonOperation("preview", "Set authored preview parameter values and locks, or reset them, against the captured committed pose. Values are checked against parameter ranges; unspecified values survive independently of animation frames. expression shows that expression at full weight over the pose (the committed one with values applied first), as the animation panel's preview does and a host plays it over a motion. This persists auxiliary session state without authoring model keyforms or history.",
         buildJsonObject { put("request", oneOf(listOf(
-            variant("mode", "set", buildJsonObject { put("state", string()); put("values", previewValues); put("locks", previewLocks) }, listOf("state")),
+            variant("mode", "set", buildJsonObject { put("state", string()); put("values", previewValues); put("locks", previewLocks); put("expression", string()) }, listOf("state")),
             variant("mode", "reset", buildJsonObject { put("state", string()) }, listOf("state"))
-        ))) }, listOf("request"), true) { a -> workspace.setPreviewSession(a.getValue("request").jsonObject) }
+        ))) }, listOf("request"), true) { a ->
+        val request = a.getValue("request").jsonObject
+        val expressionId = request["expression"]?.jsonPrimitive?.content
+        if (expressionId == null) workspace.setPreviewSession(request) else {
+            // The expression's values over the pose this call makes, read on the version the state names.
+            val queries = workspace.captureQueries()
+            if (queries.snapshot().state != request.text("state")) throw WorkspaceConflict(request.text("state"), queries.snapshot().state)
+            val expression = queries.modelSidecars().expressions.firstOrNull { it.id == expressionId }
+                ?: throw io.github.psd2live.core.RigRefusal(io.github.psd2live.core.RigRefusal.Code.NOT_FOUND, "Expression not found: $expressionId", "expression:$expressionId")
+            val base = queries.previewSession().getValue("values").jsonObject.mapValues { it.value.jsonPrimitive.float } +
+                request["values"]?.jsonObject.orEmpty().mapValues { it.value.jsonPrimitive.float }
+            val applied = io.github.psd2live.core.ModelExpressions.applied(expression, base, queries.currentPuppet()?.parameters.orEmpty())
+            val values = request["values"]?.jsonObject.orEmpty() + applied.mapValues { JsonPrimitive(it.value) }
+            workspace.setPreviewSession(JsonObject(request - "expression" + ("values" to JsonObject(values))))
+        }
+    }
     register("preview_pose", "Author parameter values or an FK/IK bone target and optionally record automatic timeline keys atomically. Merge against the committed authored pose. auto_key preserves existing handles and records the previous authored value at zero for a new curve. This command is separate from preview_set/reset and returns the committed pose and keys.",
         objectSchema(buildJsonObject {
             put("state", string()); put("values", previewValues); put("locks", previewLocks)
@@ -330,6 +357,9 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
     val key = buildJsonObject { put("type", "object"); put("minProperties", 1); put("additionalProperties", number()) }
     val selection = objectSchema(buildJsonObject {
         put("rect", vector(4)); put("center", vector(2)); put("line", vector(4)); put("radius", number()); put("feather", number()); put("hardness", number())
+        // The editor's picked points and soft selection: indices move fully, soft_radius carries the points around them.
+        put("indices", arraySchema(integer(0), 1, 4096)); put("soft_radius", number())
+        put("falloff", choices(*io.github.psd2live.core.BrushFalloff.entries.map { it.name.lowercase() }.toTypedArray()))
     })
     fun operation(type: String, properties: JsonObject, required: List<String>) = variant("type", type, JsonObject(properties + ("selection" to selection)), required)
     val operations = arraySchema(oneOf(listOf(
@@ -340,7 +370,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         operation("curve", buildJsonObject { put("axis", choices("x", "y")); put("controls", vector(4)) }, listOf("controls")),
         operation("landmarks", buildJsonObject { put("from", arraySchema(vector(2), 1, 16)); put("to", arraySchema(vector(2), 1, 16)) }, listOf("from", "to"))
     )), 1, 16)
-    registerJsonOperation("deform", "Edit whole ArtMesh/Warp surfaces at exact keys, atomically across changes. All points participate including empty cage regions. Units: fixed input bounds, normalized x-right/y-down; rotations in degrees. arc bends cross-sections along root→tip; root_pin is a fixed length fraction. Optional brush hardness gives a broad plateau. Unspecified directly bound axes are an error. This edits local shapes; parent motion is inherited.",
+    registerJsonOperation("deform", "Edit whole ArtMesh/Warp surfaces at exact keys, atomically across changes. All points participate including empty cage regions. Units: fixed input bounds, normalized x-right/y-down; rotations in degrees. arc bends cross-sections along root→tip; root_pin is a fixed length fraction. Optional brush hardness gives a broad plateau. selection.indices picks points by index (mesh_get_topology lists a mesh's); with soft_radius and falloff the points around them follow, as the editor's soft selection carries them, and landmarks moves picked points the way the temporary lattice does. Unspecified directly bound axes are an error. This edits local shapes; parent motion is inherited.",
         buildJsonObject {
             put("state", string()); put("changes", arraySchema(objectSchema(buildJsonObject {
                 put("target", string()); put("key", key); put("operations", operations); put("selection", selection)
@@ -358,8 +388,12 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
     })
     val formBase = buildJsonObject { put("target", string()); put("key", key) }
     fun described(schema: JsonObject, text: String) = JsonObject(schema + ("description" to JsonPrimitive(text)))
+    val pointIndices = described(buildJsonObject { put("type", "array"); put("minItems", 1); put("uniqueItems", true); put("items", integer(0, 1_000_000)) },
+        "Only these points (mesh vertex or warp control point indices) change; the rest keep the shape at the key. Not for rotations.")
     registerJsonOperation("form", "Author key collections atomically. seed captures interpolated geometry without changing other keys. copy transfers selected channels (omit for all) from an explicit source key. set writes scalar/color channels or a rotation form, never mesh point arrays. " +
         "mirror reflects a keyform across a vertical canvas line onto the opposite key of the same object (from {ParamAngleX:30} writes ParamAngleX -30), onto the opposite-side object (destination, or \"auto\" to pair by L/R id or name), or in place; it writes ordinary keyforms. " +
+        "reset, interpolate and paste write a whole geometry keyform (or only the given vertices) as an ordinary set: reset takes the key back to its default-key shape (to rest: a mesh's undeformed points), interpolate remakes it from the keys on either side along one parameter, paste writes the move another key makes (a mesh's from its rest, a warp's or rotation's from its default key) onto the same object or a like one under the same parent, optionally blended by ratio, flipped or with its opacity, draw order and colors; reset all_keys restores every key. " +
+        "multi_key sets the opacity, draw order or colors of many keyforms of many objects at once (overwrite, add, multiply or screen). " +
         "Keys name only the destination object's axes, not the viewing pose. A keyed drawOrder channel: " + WorkspaceDrawOrderSchemas.GUIDE,
         buildJsonObject { put("state", string()); put("changes", arraySchema(oneOf(listOf(
             variant("op", "seed", formBase, listOf("target", "key")),
@@ -379,7 +413,36 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
                 put("reflect", described(arraySchema(string(), 0, 64), "Parameters whose value flips about the default; default the symmetric-range ones that are a 2D pad's horizontal axis or end in X or Z."))
                 put("channels", described(arraySchema(choices("geometry", "opacity", "drawOrder", "multiplyColor", "screenColor", "glueIntensity", "flipX", "flipY"), 1, 8),
                     "What to carry over: the reflected geometry and channel values as they are at from; default geometry only."))
-            }, listOf("target"))
+            }, listOf("target")),
+            variant("op", "reset", JsonObject(formBase + buildJsonObject {
+                put("to", described(choices("default", "rest"), "default (the default): the shape with the along parameters at their defaults; rest: a mesh's undeformed points."))
+                put("along", described(arraySchema(string(), 1, 64), "With to default: the key's parameters taken to their default; default all of them."))
+                put("all_keys", described(boolean(), "In place of key: every keyform of the target back to its default-key shape, restoring a deformer to the shape it had when first keyed."))
+                put("vertices", pointIndices)
+            }), listOf("target")),
+            variant("op", "interpolate", JsonObject(formBase + buildJsonObject {
+                put("parameter", described(string(), "The axis to interpolate along; default the one the key sits between two keys of."))
+                put("vertices", pointIndices)
+            }), listOf("target", "key")),
+            variant("op", "paste", JsonObject(formBase + buildJsonObject {
+                put("from", described(key, "Source key; the source's missing axes at their defaults."))
+                put("destination", described(string(), "Destination; default the target. For geometry another object must be of the target's kind with the same triangles (mesh) or rows and columns (warp) under the same parent."))
+                put("vertices", pointIndices)
+                put("ratio", described(JsonObject(number() + mapOf("minimum" to JsonPrimitive(0), "maximum" to JsonPrimitive(1))), "How far the key moves toward the pasted values: 1 (default) pastes, less blends."))
+                put("flip", described(choices("horizontal", "vertical"), "Flip the pasted moves: a warp's columns (horizontal) or rows reversed, a mesh's vertices paired by their mirrored rest places (refused unless the rest is symmetric), each move turned around; a rotation's angle change reversed."))
+                put("channels", described(arraySchema(choices("geometry", "opacity", "drawOrder", "multiplyColor", "screenColor"), 1, 5), "What to paste; default geometry."))
+            }), listOf("target", "from", "key")),
+            variant("op", "multi_key", buildJsonObject {
+                put("targets", described(arraySchema(string(), 1, 128), "Meshes, deformers or parts."))
+                put("keys", described(arraySchema(key, 1, 256), "Partial keys a keyform must match one of (a parameter's value, or a whole key); default every keyform of each target."))
+                put("ranges", described(buildJsonObject { put("type", "object"); put("additionalProperties", arraySchema(number(), 1, 64)) },
+                    "Per parameter, the key values a keyform on it may have; a keyform not on that parameter passes."))
+                put("opacity", described(JsonObject(number() + mapOf("minimum" to JsonPrimitive(0), "maximum" to JsonPrimitive(1))), "Opacity 0..1."))
+                put("drawOrder", described(number(), "Draw order 0..1000; not for deformers."))
+                put("multiplyColor", described(vector(3), "Multiply color [r, g, b] 0..1."))
+                put("screenColor", described(vector(3), "Screen color [r, g, b] 0..1."))
+                put("method", described(choices("overwrite", "add", "multiply", "screen"), "How a value combines with each keyform's own; default overwrite. Draw order takes overwrite or add. Each channel is written at its own track's keys, or the object's geometry keys while it has none."))
+            }, listOf("targets"))
         )), 1, 128)) }, listOf("state", "changes"), true) { a -> workspace.authorRig(a.text("state"), a.getValue("changes").jsonArray, MutationAuthor.AGENT).compact() }
 
     registerJsonOperation("rig", "Create a fitted independent Warp for meshes sharing a parent. Existing keyforms and UVs migrate; the parent lattice constrains fit precision. Use deform directly when no independent motion layer is needed. Returned target is the new Warp.",
@@ -582,7 +645,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         put("part_id", buildJsonObject {}); put("space", choices("local"))
         put("opacity", number()); put("draw_order", integer(0, 1000))
         put("multiply_color", vector(3)); put("screen_color", vector(3))
-        put("blend_mode", string()); put("masked_by", arraySchema(string(), 0, 64))
+        put("blend_mode", choices(*org.umamo.runtime.model.BlendMode.entries.map { it.name }.toTypedArray())); put("masked_by", arraySchema(string(), 0, 64))
         put("invert_mask", boolean()); put("culling", boolean())
         put("selectable", boolean()); put("quad", boolean()); put("user_data", string())
         put("partner_id", string()); put("linked", boolean()); put("open", boolean())
@@ -627,26 +690,42 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         }, listOf("state", "mesh_a", "mesh_b")),
         variant("mode", "topology", buildJsonObject {
             put("state", string()); put("id", string())
-            put("action", choices("merge", "duplicate", "connect", "delete", "subdivide", "split", "knife"))
+            put("action", choices(*io.github.psd2live.core.CanvasTopology.ACTIONS.toTypedArray()))
             put("vertices", arraySchema(integer(0), 0, 65536))
-            put("anchors", arraySchema(objectSchema(buildJsonObject {
+            // An anchor is an existing vertex or a free point, never both or neither.
+            put("anchors", arraySchema(JsonObject(objectSchema(buildJsonObject {
                 put("vertex", integer(0)); put("x", number()); put("y", number())
-            }), 0, 4096))
+            }) + ("oneOf" to buildJsonArray {
+                add(buildJsonObject { put("type", "object"); put("required", buildJsonArray { add("vertex") }) })
+                add(buildJsonObject { put("type", "object"); put("required", buildJsonArray { add("x"); add("y") }) })
+            })), 0, 4096))
             put("edges", arraySchema(arraySchema(integer(0), 2, 2), 0, 65536))
-        }, listOf("state", "id", "action", "vertices")),
+        }, listOf("state", "id", "action")),
     )
-    registerJsonOperation("canvas", "Use the canvas editor's persisted algorithms to create a Warp or Rotation, pair Glue vertices where both meshes rest (the default pose, as Cubism's glue), or edit mesh topology. Glue requires two different art-mesh ids (mesh_a and mesh_b) and fails when a mesh is missing, the ids match, or no vertices fall inside distance. Set replace to update an existing glue on that pair. Topology indices are from the current mesh and require fresh state. Creation accepts an optional stable ID; otherwise one is generated.",
+    registerJsonOperation("canvas", "Use the canvas editor's persisted algorithms to create a Warp or Rotation, pair Glue vertices where both meshes rest (the default pose, as Cubism's glue), or edit mesh topology. Glue requires two different art-mesh ids (mesh_a and mesh_b) and fails when a mesh is missing, the ids match, or no vertices fall inside distance. Set replace to update an existing glue on that pair. Topology indices are from the current mesh (mesh_get_topology reads them) and require fresh state; vertices defaults to none. Topology actions: merge/duplicate/connect (two vertices)/delete (vertices, the hole is refilled)/subdivide/split act on vertices or edges; knife cuts through anchors; add_points adds a vertex at each anchor {x,y} given in the mesh's own rest space (a {vertex} anchor is refused) (inside: splits the face or edge, outside: grows the outline); delete_edges deletes exactly the edges given in edges, which it requires (an interior edge flips across its quad, an outline edge removes its triangle; refuses what would break the triangulation); retriangulate flips edges around the given vertices (all when empty) toward Delaunay without moving the picture; a mesh already there is no change (applied=false). Creation accepts an optional stable ID; otherwise one is generated.",
         buildJsonObject { put("request", oneOf(canvasBranches)) }, listOf("request"), true) { a ->
         val input = a.getValue("request").jsonObject
         validateOperationSchema(input, oneOf(canvasBranches))
         val mode = input.text("mode")
-        val command = WorkspaceCanvasCommands.create(workspace.currentPuppet() ?: error("No model is loaded"), mode, input)
+        val puppet = workspace.currentPuppet() ?: error("No model is loaded")
+        val command = WorkspaceCanvasCommands.create(puppet, mode, input)
         val writtenId = command.getValue("id").jsonPrimitive.content
+        val made = if (mode == "topology") WorkspaceMeshTopology.newVertices(puppet, command) else emptyList()
+        if (mode == "topology" && command.getValue("action").jsonPrimitive.content == "retriangulate" && !WorkspaceMeshTopology.changes(puppet, command)) {
+            // Already as Delaunay as it gets: no change on the state the caller holds, as the batch member answers.
+            val snapshot = workspace.captureQueries().snapshot()
+            if (snapshot.state != input.text("state")) throw WorkspaceConflict(input.text("state"), snapshot.state)
+            return@registerJsonOperation buildJsonObject {
+                put("state", snapshot.state); snapshot.historyHeadNodeId?.let { put("history_node_id", it) }
+                put("project_id", requireNotNull(snapshot.projectId)); put("id", writtenId); put("applied", false)
+            }
+        }
         val result = workspace.authorRig(input.text("state"), buildJsonArray { add(command) }, MutationAuthor.AGENT)
         buildJsonObject {
             put("state", requireNotNull(result.state)); put("history_node_id", result.historyNodeId); put("project_id", requireNotNull(result.projectId)); put("id", writtenId)
             if (!result.applied) put("applied", false)
             result.geometryDiagnostics?.let { put("geometry_diagnostics", it) }
+            if (mode == "topology" && result.applied) putJsonArray("new_vertices") { made.forEach { add(it) } }
             if (mode == "glue") {
                 put("mesh_a", command.getValue("mesh_a").jsonPrimitive.content)
                 put("mesh_b", command.getValue("mesh_b").jsonPrimitive.content)
@@ -822,6 +901,9 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         put("curves", arraySchema(objectSchema(buildJsonObject {
             put("parameter", string()); put("keys", arraySchema(motionKey, 1, 4096))
         }, listOf("parameter", "keys")), 0, 256))
+        put("events", arraySchema(objectSchema(buildJsonObject {
+            put("time", number()); put("value", buildJsonObject { put("type", "string"); put("maxLength", MotionEvent.MAX_VALUE_LENGTH) })
+        }, listOf("time", "value")), 0, MotionEvent.MAX_PER_CLIP))
     }, listOf("id", "name"))
     val motionSelection = arraySchema(objectSchema(buildJsonObject { put("parameter", string()); put("time", number()) }, listOf("parameter", "time")), 1, 4096)
     val copiedKeys = arraySchema(objectSchema(buildJsonObject { put("parameter", string()); put("key", motionKey) }, listOf("parameter", "key")), 1, 4096)
@@ -838,15 +920,18 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         variant("mode", "seed_builtin", buildJsonObject { put("state", string()); put("builtin", choices(*MotionClips.BUILTIN_NAMES.toTypedArray())); put("id", string()) }, listOf("state", "builtin")),
         variant("mode", "set_key", buildJsonObject { put("state", string()); put("id", string()); put("parameter", string()); put("key", motionKey) }, listOf("state", "id", "parameter", "key")),
         variant("mode", "delete_key", buildJsonObject { put("state", string()); put("id", string()); put("parameter", string()); put("time", number()) }, listOf("state", "id", "parameter", "time")),
+        variant("mode", "set_event", buildJsonObject { put("state", string()); put("id", string()); put("time", number()); put("value", buildJsonObject { put("type", "string"); put("minLength", 1); put("maxLength", MotionEvent.MAX_VALUE_LENGTH) }); put("from_time", number()) }, listOf("state", "id", "time", "value")),
+        variant("mode", "delete_event", buildJsonObject { put("state", string()); put("id", string()); put("time", number()) }, listOf("state", "id", "time")),
         variant("mode", "remove_curve", buildJsonObject { put("state", string()); put("id", string()); put("parameter", string()) }, listOf("state", "id", "parameter")),
         variant("mode", "pose", buildJsonObject { put("state", string()); put("id", string()); put("time", number()); put("values", previewValues) }, listOf("state", "id", "time", "values")),
         variant("mode", "move_keys", buildJsonObject { put("state", string()); put("id", string()); put("selection", motionSelection); put("dt", number()); put("dv", number()); put("normalized", boolean()) }, listOf("state", "id", "selection", "dt")),
         variant("mode", "delete_keys", buildJsonObject { put("state", string()); put("id", string()); put("selection", motionSelection) }, listOf("state", "id", "selection")),
         variant("mode", "paste_keys", buildJsonObject { put("state", string()); put("id", string()); put("time", number()); put("keys", copiedKeys) }, listOf("state", "id", "time", "keys")),
         variant("mode", "replace_keys", buildJsonObject { put("state", string()); put("id", string()); put("keys", arraySchema(objectSchema(buildJsonObject { put("parameter", string()); put("from_time", number()); put("key", motionKey) }, listOf("parameter", "from_time", "key")), 1, 4096)) }, listOf("state", "id", "keys")),
+        variant("mode", "close_loop", buildJsonObject { put("state", string()); put("id", string()); put("parameters", arraySchema(string(), 1, 256)) }, listOf("state", "id")),
         variant("mode", "preset", buildJsonObject { put("state", string()); put("builtin", choices(*MotionClips.BUILTIN_NAMES.toTypedArray())); put("action", choices("update", "reset", "delete", "restore")); put("values", previewValues); put("disabled", boolean()) }, listOf("state", "builtin", "action")),
     )
-    registerJsonOperation("motion", "Read and edit persistent motion clips and parameter timelines. create makes a named blank clip or copies a generated motion with its current knobs; duplicate copies a clip under a unique name; rename resolves name collisions; properties updates playback/export fields, dropping keys after a shortened duration. sample returns exact interpolated values without authoring a pose. pose keys a parameter map; move_keys/delete_keys/paste_keys/replace_keys preserve timeline interpolation and handles. preset edits generated-motion knobs and lifecycle. preview_pose applies FK/IK and records optional auto keys atomically. Export writes authored clips to motion3.json.",
+    registerJsonOperation("motion", "Read and edit persistent motion clips and parameter timelines. create makes a named blank clip or copies a generated motion with its current knobs; duplicate copies a clip under a unique name; rename resolves name collisions; properties updates playback/export fields, dropping keys after a shortened duration; close_loop makes the listed curves (default all) end where they start - a key at 0 and at the end with the start's value, a repeating parameter's whole turns on, the end easing in at the start's slope - so a loop has no seam. A repeating parameter's keys may run up to 64 turns past its range; the runtime wraps them. sample returns exact interpolated values without authoring a pose. pose keys a parameter map; move_keys/delete_keys/paste_keys/replace_keys preserve timeline interpolation and handles. preset edits generated-motion knobs and lifecycle. set_event puts an event (motion3 UserData: the text a host receives as playback passes the time; from_time moves one) and delete_event removes one; motion_events lists them all with the meshes' user data. preview_pose applies FK/IK and records optional auto keys atomically. Export writes authored clips to motion3.json.",
         buildJsonObject { put("request", oneOf(motionBranches)) }, listOf("request"), true) { a ->
         val input = a.getValue("request").jsonObject
         validateOperationSchema(input, oneOf(motionBranches))
@@ -857,6 +942,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
                 putJsonArray("clips") { requireNotNull(queries).motionClips().forEach { add(buildJsonObject {
                     put("id", it.id); put("name", it.name); it.builtin?.let { builtin -> put("builtin", builtin) }
                     put("duration", it.duration); put("enabled", it.enabled); put("curves", it.curves.size)
+                    if (it.events.isNotEmpty()) put("events", it.events.size)
                 }) } }
                 putJsonArray("builtins") { MotionClips.BUILTIN_NAMES.forEach { add(JsonPrimitive(it)) } }
             }
@@ -877,7 +963,9 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
                         .forEach { (parameter, value) -> put(parameter.raw, value) }
                 }
             }
-            else -> workspace.editMotion(input.text("state"), input).compact()
+            else -> workspace.editMotion(input.text("state"), WorkspaceMotionIds.chosen(
+                WorkspaceDocumentOperation("motion_${input.text("mode")}", input), workspace.captureQueries().motionClips(),
+                workspace.savedProjectData().data.timelineAids).request).compact()
         }
     }
 

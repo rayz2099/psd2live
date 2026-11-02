@@ -13,7 +13,7 @@ ZIP 条目的压缩方式：PNG（`assets/`、`images/`、观察图）与 CMO3 �
 | 变化 | 是否要求保存 |
 | --- | --- |
 | 源图、模型编辑、生成 / 导出设置、输出目录、历史切换 | 是 |
-| 参数姿态与锁定、快照、历史注释、画布图层 / 变形器可见性、素材与任务记录 | 是 |
+| 参数姿态与锁定、快照、历史注释、时间轴辅助（参数书签与各动作的掩盖、冻结轨道和标记）、画布图层 / 变形器可见性、素材与任务记录 | 是 |
 | 创建、删除、重命名或重排工作区，创建或关闭画布 | 是 |
 | 选择与悬停、搜索、镜头、工作区 / 画布焦点、编辑 / 预览模式、布局、面板展开和显示选项 | 否；手动保存时仍记录可恢复的界面状态 |
 | 播放、跟踪开关及实时预览帧、观察日志 | 否 |
@@ -33,17 +33,17 @@ GUI 放弃并打开会先等待此前正在执行的编辑与字段提交完成�
 | `history/HEAD.json` | 当前节点与节点顺序 |
 | `history/nodes/` | 不可变父链节点和元数据（与 v1 相同） |
 | `history/revisions/<key>.json` | 每个修订的索引：`{schema, nodes:{类型:哈希}, overrides?, clips?, payloads?}` |
-| `document/nodes/<类型>/<sha256>.json` | 文档节点 `{schema, kind, value}`；类型为 `source`（源图层与组）、`generation-source` / `mesh-source`（旧版写入的 `placement-source` 读取时忽略）、`layers`（可见性、软删除、分类、父级、网格与纹理覆盖）、`settings`、`rig`（参数、骨架、摆动、模拟、物理等 Rig 定义）、`journal`（作者编辑日志，不含覆盖）、`layout`（用户标签、素材关联、生成状态）、`materials`（素材库：文件夹与条目，像素引用 `assets/` 中的栅格，SVG 原文内嵌；读自 PSD / CMO3 的文件夹带 `origin` 文件名，其条目的 `placementCanvas` 为默认摆放所在的画布尺寸）、`document`（其余字段）。`layout` 与 `materials` 只在文档带有 [Layout 状态](MATERIAL_LAYOUT_WORKSPACE.md)时写入，不认识它们的旧版本拒绝打开 |
+| `document/nodes/<类型>/<sha256>.json` | 文档节点 `{schema, kind, value}`；类型为 `source`（源图层与组）、`generation-source` / `mesh-source`（旧版写入的 `placement-source` 读取时忽略）、`layers`（可见性、软删除、分类、父级、网格与纹理覆盖）、`settings`、`rig`（参数、骨架、摆动、模拟、物理、点击区域等 Rig 定义）、`journal`（作者编辑日志，不含覆盖）、`layout`（用户标签、素材关联、生成状态）、`materials`（素材库：文件夹与条目，像素引用 `assets/` 中的栅格，SVG 原文内嵌；读自 PSD / CMO3 的文件夹带 `origin` 文件名，其条目的 `placementCanvas` 为默认摆放所在的画布尺寸）、`document`（其余字段）。`layout` 与 `materials` 只在文档带有 [Layout 状态](MATERIAL_LAYOUT_WORKSPACE.md)时写入，不认识它们的旧版本拒绝打开 |
 | `document/nodes/payload/<sha256>.json` | 大型日志条目的内容寻址载荷节点，由 schema 2 修订在 `payloads` 中列出 |
 | `document/overrides/<sha256>.json` | 生成结果覆盖 `generated_override`，连同其在编辑日志中的位置 |
-| `document/clips/<sha256>.json` | 动作片段与生成动作设置 |
+| `document/clips/<sha256>.json` | 动作片段（`motions`，含各片段的 `events`）、生成动作设置（`motionPresets`）、表情（`expressions`）与姿势（`pose`）；后两者只在工程编辑过表情或设置了姿势组时写入 |
 | `document/bakes/<sha256>.bin` | 模拟烘焙结果（打包 JSON，见下文“烘焙文件”），由 schema 4 修订在 `bakes` 中列出 |
 | `assets/` | 去重 RGBA 栅格，以 PNG 保存 |
 | `auxiliary/assets/` | 暂存素材元数据 |
 | `auxiliary/views/`、`auxiliary/view-images/` | 观察图的空间映射；较早保存的工程还带有每张渲染图，现在保存时不再写入 |
 | `auxiliary/workflow/` | 素材参考包、注册 / 放置等辅助记录 |
 | `auxiliary/tasks.json` | Agent 任务和事件记录 |
-| `workspace.json` | 布局、镜头、选择、参数预览、历史注释和日志等持久 UI 状态 |
+| `workspace.json` | 布局、镜头、选择、参数预览、历史注释、时间轴辅助（`timelineAids`）和日志等持久 UI 状态 |
 | `images/<hash>.png` | 日志图片 |
 | `rig/objects/` | Rig 对象：固化点记录引用的对象（含固化点的修订必需），以及各修订作者态 Rig 的对象 |
 | `rig/revisions/` | 可选，各修订的作者态 Rig 索引（见下文“作者态 Rig”） |
@@ -67,7 +67,7 @@ GUI 放弃并打开会先等待此前正在执行的编辑与字段提交完成�
 | `rig/objects/<sha256>.bin` | 一个 Rig 对象（`RigIrObjects`）：框架（变形器与网格以外的全部内容）、单个变形器或单个网格，按字节 SHA-256 命名，在修订与固化点之间共享 |
 | `rig/revisions/<revision>.json` | `{header, frame, deformers:[...], meshes:[...]}`：头部与按 Rig 顺序列出的对象哈希 |
 
-- 对象编码为中立 IR 的二进制形式（`RigIrBinary`，浮点按原始位保存），自带魔数、编码版本与对象类型；读取接受 `RigIrObjects.MIN_VERSION` 起的每个版本，IR 新增字段只在其加入的版本起读取。编码版本 5 起浮点数组按字节平面写出（全部值的第一个字节，然后第二个……），数值不变而 DEFLATE 压缩率明显提高；已有对象以其哈希被固化点引用，保持原编码。
+- 对象编码为中立 IR 的二进制形式（`RigIrBinary`，浮点按原始位保存），自带魔数、编码版本与对象类型；读取接受 `RigIrObjects.MIN_VERSION` 起的每个版本，IR 新增字段只在其加入的版本起读取。编码版本 5 起浮点数组按字节平面写出（全部值的第一个字节，然后第二个……），数值不变而 DEFLATE 压缩率明显提高；版本 6 加入 IR 的点击区域（旧版本对象照常读取；之后保存新写出的对象都是版本 6 编码，内容未变的对象也会得到新的哈希，因此升级后第一次写入固化点时归档会一次性增大，之后照常共享）；已有对象以其哈希被固化点引用，保持原编码。
 - 头部 `{format:"psd2live-authored-rig", version:1, build, binding_key, pages, layers, bounds, face, warnings, skipped, visibility}`：网格到纹理页、源图层与中性边界的映射，面部中心、半径与初始倾角，生成警告，重放跳过的条目，需应用图层显隐的网格，以及纹理集绑定键。浮点按原始位写成整数。
 - 文件名中的修订键为文档的修订 ID（`WorkspaceRevisions.of`），即构建按其查找的键。
 - 绑定键是生成基础 Rig 时纹理集的放置、页尺寸与纹理图层矩形的摘要。打开时按当前程序为该修订打包纹理集；键相同时直接使用保存的纹理坐标，不同时（本程序打包得不同）按画布纹理坐标把它们移到新的图块上。条目无法读取或校验失败时照常构建。
@@ -97,12 +97,15 @@ GUI 放弃并打开会先等待此前正在执行的编辑与字段提交完成�
 | 节点 1 | 不含下列字段的节点 | — |
 | 节点 2 | `source` 及三种附加源图节点中有图层带 `rect`；`layers` 含 `textureOverrides`；`settings` 含 `atlas` 或 `atlasArrangement` | 见下文纹理字段 |
 | 节点 3 | `source` 或附加源图节点中有图层带 `transform` | 图层整体变换 `[a, b, c, d, e, f]`（`x' = a·x + c·y + e`，`y' = b·x + d·y + f`，画布单位、y 向下），作用于图层的帧（整数边界与 `rect`）；纹理坐标锚定在帧上，生成只读帧。单位变换不写 |
+| 节点 4 | `layout` / `materials` 节点含 Layout 节点引入后新增的字段 | 参考图、参考图层与钉点、绘图、素材的画布与参考标记 |
+| 节点 5 | `clips` 节点含 `expressions`、`pose`，或有动作片段带 `events` | 表情 `{id, name, fade_in, fade_out, entries:[{parameter, blend, value}]}`（`blend` 为 `ADD` / `MULTIPLY` / `OVERWRITE`）；姿势 `{fade_in, groups:[[{part, links?}]]}`；事件 `[{time, value}]` |
+| 节点 5 | `rig` 节点含 `hitAreas` | 点击区域 `{id, name, meshes}`，按判定顺序，见[导出目标](EXPORT_TARGETS.md#点击区域) |
 | 修订 1 | 日志不引用载荷节点 | — |
 | 修订 2 | 日志引用载荷节点，索引列出 `payloads` | `{"$payload": "<sha256>"}` 日志条目 |
 | 修订 3 | 日志含固化点记录 `rig_checkpoint` | 索引的 `rig` 列出记录引用的 Rig 对象，归档在 `rig/objects/` 中保存它们；可同时列出 `payloads` |
 | 修订 4 | 有模拟带烘焙结果 | `rig` 节点中每个烘焙写成 `{"$bake": "<sha256>"}`，索引的 `bakes` 列出它们，内容在 `document/bakes/`；可同时列出 `payloads` 与 `rig` |
 
-只读取 schema 1 的程序遇到 schema 2 的节点或修订会拒绝打开，不会丢弃新字段；当前程序读取节点 schema 1–3、修订 schema 1–4，更高 schema 仍拒绝。修订 schema 4 的 `rig` 节点只能引用索引列出的烘焙，打开时按哈希核对每个烘焙文件；此前的程序遇到修订 schema 4 拒绝打开，因此带烘焙的工程保存后不能再用它们打开。修订 schema 3 的索引必须列出 `rig`，打开时逐个核对 `rig/objects/` 中有这些对象，缺少任何一个都拒绝打开；不支持 schema 3 的程序无法从这类修订构建模型，因此拒绝打开。修订 schema 2 必须列出至少一个载荷，日志只能引用自己列出的载荷。保存时，已含 schema 2 节点的修订把 512 字符以上的作者日志条目外置为载荷节点（日志节点中的引用不到 80 字符），每个载荷只写一次，修订索引为 schema 2；只读 schema 1 的程序本就打不开这类修订。不含新字段的文档仍全部写 schema 1，节点与索引逐字节不变。这样长历史的每个修订不再各存一份完整日志，归档体积与保存耗时不再随修订数平方增长。
+只读取 schema 1 的程序遇到 schema 2 的节点或修订会拒绝打开，不会丢弃新字段；当前程序读取节点 schema 1–4（`clips` 与 `rig` 节点 1–5）、修订 schema 1–4，更高 schema 仍拒绝；不认识 schema 5 的程序遇到带表情、姿势或动作事件的 `clips` 节点拒绝打开，而不是丢掉它们。修订 schema 4 的 `rig` 节点只能引用索引列出的烘焙，打开时按哈希核对每个烘焙文件；此前的程序遇到修订 schema 4 拒绝打开，因此带烘焙的工程保存后不能再用它们打开。修订 schema 3 的索引必须列出 `rig`，打开时逐个核对 `rig/objects/` 中有这些对象，缺少任何一个都拒绝打开；不支持 schema 3 的程序无法从这类修订构建模型，因此拒绝打开。修订 schema 2 必须列出至少一个载荷，日志只能引用自己列出的载荷。保存时，已含 schema 2 节点的修订把 512 字符以上的作者日志条目外置为载荷节点（日志节点中的引用不到 80 字符），每个载荷只写一次，修订索引为 schema 2；只读 schema 1 的程序本就打不开这类修订。不含新字段的文档仍全部写 schema 1，节点与索引逐字节不变。这样长历史的每个修订不再各存一份完整日志，归档体积与保存耗时不再随修订数平方增长。
 
 ### 烘焙文件
 
@@ -130,7 +133,7 @@ v1 归档仍可打开。v1 把每个修订保存为一个完整快照：
 | `workspace/<projectId>/blobs/` | 去重 RGBA 栅格（PNG） |
 | `workspace/<projectId>/assets/`、`views/`、`view-images/`、`workflow/`、`tasks.json` | 辅助数据 |
 
-其余条目（`manifest.json`、`source/`、`workspace.json`、`images/`）与 v2 相同。打开 v1 时直接读入这些快照，内存中的文档与 v2 一致；下一次保存写出 v2，并在替换目标文件前把原 v1 文件另存为同目录的 `<名称>.v1.psd2live`（已有同名备份时不覆盖）。迁移只改变存储布局，所有修订、分支、注释、素材、观察图与任务记录原样保留。工作目录内部仍使用快照布局，归档的打包与解包在保存、打开时完成。
+其余条目（`manifest.json`、`source/`、`workspace.json`、`images/`）与 v2 相同。打开 v1 时直接读入这些快照，内存中的文档与 v2 一致；下一次保存写出 v2，并在替换目标文件前把原 v1 文件另存为同目录的 `<名称>.v1.psd2live`（已有同名备份时不覆盖）。迁移只改变存储布局，所有修订、分支、注释、素材、观察图与任务记录原样保留。工作目录内部仍使用快照布局：打开时把归档解包为快照；保存不经过快照，直接把内存中的历史编码、拆分为 v2 节点写入暂存目录。
 
 工作目录的快照与 v1 不同处只有共享内容：新写入的快照把非空 `rigEdits.authoringJournal` 写成 `{count, chunks:[键...]}`，条目按内容分块保存在 `history/journal/<键>.json`（块在摘要选中的条目后结束，平均约 4 条、不超过 16 条或约 64K 字符；键为块内各条目 SHA-256 的 SHA-256）；64K 字符以上的 `rigEdits.importedCmo3` 写成 `{payload: sha256}`，内容在 `history/payloads/<sha256>.txt`；模拟烘焙写成 `{"$bake": sha256}`，内容为 `history/bakes/<sha256>.bin`（与归档相同的打包 JSON，同一烘焙在各修订间只读一次、解码为同一对象）。追加条目只新增末尾的块，之前关闭的块在修订间共享。读取时按键核对后还原为原快照，键顺序不变；打包成 v2 前同样先还原，因此归档节点不受影响。快照改为紧凑 JSON。不支持分块的旧程序读到对象形式会报错，而不会丢掉日志。v2 解包也按这种共享形式写出快照，读取时同一条目在各修订间只解析一次、共用同一对象（不只限于共享的块：日志末块在日志结尾截断，相邻修订的末尾条目由按内容去重合并）；旧版写出的完整快照照常读取，两种快照可以混存。
 

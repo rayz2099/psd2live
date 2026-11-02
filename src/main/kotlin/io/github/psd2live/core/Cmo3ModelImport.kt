@@ -35,6 +35,7 @@ internal object Cmo3ModelImport {
         if (config.rigEdits.importedCmo3 == null) return config
         val defaults = PipelineConfig()
         return config.copy(mouthOutlineEnabled = defaults.mouthOutlineEnabled, generateDeformers = defaults.generateDeformers,
+            seeThroughBrows = defaults.seeThroughBrows, seeThroughEyes = defaults.seeThroughEyes,
             physicsFrontHair = defaults.physicsFrontHair, physicsBackHair = defaults.physicsBackHair, physicsEyeJelly = defaults.physicsEyeJelly,
             generatePhysics = defaults.generatePhysics, motionBasic = defaults.motionBasic, motionIdle = defaults.motionIdle,
             motionBlink = defaults.motionBlink, motionNod = defaults.motionNod, motionShake = defaults.motionShake,
@@ -173,14 +174,22 @@ internal object Cmo3ModelImport {
                 else if (replace) config.rigEdits.physicsFps else RigEditOverlay.DEFAULT_PHYSICS_FPS,
             motionClips = if (replace) config.rigEdits.motionClips else emptyList(),
             motionPresets = if (replace) config.rigEdits.motionPresets else emptyMap(),
+            // Expressions and the pose name parameters and parts by ID, as the replacement keeps them. An imported model
+            // has no standard expressions, so a generated rig's are kept as the document's own.
+            expressions = if (!replace) null else config.rigEdits.expressions
+                ?: if (config.rigEdits.importedCmo3 != null) null else ModelExpressions.standardFor(current!!.rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }),
+            pose = if (replace) config.rigEdits.pose else null,
             swingEdits = if (replace) config.rigEdits.swingEdits else emptyList(),
             simEdits = if (replace) config.rigEdits.simEdits else emptyList(),
+            // A replacement keeps the mesh IDs, and with them the hit areas set up on them.
+            hitAreas = if (replace) config.rigEdits.hitAreas else emptyList(),
             authoringJournal = if (replace) current!!.rig.puppet.vertexGroups.filter { g ->
                 incoming.puppet.drawables.none { it.id == g.drawableId }
             }.map(VertexGroupJournal::encode) else emptyList(),
         )
         return source to config.copy(rigEdits = overlay, runtimeTarget = decoded.puppet.runtimeTarget,
             mouthOutlineEnabled = false, generateDeformers = false, meshOnly = false,
+            seeThroughBrows = false, seeThroughEyes = false,
             physicsFrontHair = false, physicsBackHair = false, physicsEyeJelly = false,
             generatePhysics = if (replace) config.generatePhysics else true,
             motionBasic = if (replace) config.motionBasic else false,

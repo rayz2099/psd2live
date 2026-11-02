@@ -46,7 +46,6 @@ internal object WorkspaceLayerEdits {
 
     private fun delete(document: WorkspaceDocument, model: RigPreviewModel, id: String): WorkspaceDocument {
         val remaining = document.source.layers.filterNot { it.id.raw == id }
-        require(remaining.isNotEmpty()) { "The last layer cannot be deleted" }
         // Its meshes, and the ones generated from it under derived IDs (mouth lip ribbons, legacy halves).
         val meshes = model.rig.layerIdByDrawableId.filter { (_, layer) -> layer == id || layer.startsWith("$id:") }.keys
         fun without(source: org.umamo.format.art.SourceArt?) = source?.let { art ->
@@ -59,10 +58,11 @@ internal object WorkspaceLayerEdits {
             layerVisibility = document.layerVisibility - id, layerOverrides = document.layerOverrides - id,
             parentOverrides = document.parentOverrides - id, meshOverrides = document.meshOverrides - id,
             textureOverrides = document.textureOverrides - id, deletedLayerIds = document.deletedLayerIds - id,
-            // Pending layers are temporarily absent while this edits the generated base.
-            layout = document.layout.retaining(remaining.mapTo(HashSet()) { it.id.raw } + document.layout.generation.pendingLayerIds - id),
-            rigEdits = document.rigEdits.copy(splitDrawableIds = document.rigEdits.splitDrawableIds - id,
-                assetLayers = document.rigEdits.assetLayers - id, calibrationLayerIds = document.rigEdits.calibrationLayerIds - id))
+            layout = document.layout.retaining(remaining.mapTo(HashSet()) { it.id.raw }),
+            // Its meshes leave the hit areas, so a later mesh given a freed ID does not join them.
+            rigEdits = RigHitAreas.replacingMeshes(document.rigEdits.copy(splitDrawableIds = document.rigEdits.splitDrawableIds - id,
+                assetLayers = document.rigEdits.assetLayers - id, calibrationLayerIds = document.rigEdits.calibrationLayerIds - id),
+                meshes.associateWith { emptyList() }))
         if (meshes.isEmpty()) return candidate
         return candidate.copy(rigEdits = candidate.rigEdits.copy(authoringJournal = candidate.rigEdits.authoringJournal +
             LayerDeletionJournal.encode(id, meshes)))

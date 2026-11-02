@@ -93,11 +93,13 @@ enum class ShortcutAction(
     ZOOM_IN(ShortcutCategory.VIEW, "menu.view.zoomIn"),
     ZOOM_OUT(ShortcutCategory.VIEW, "menu.view.zoomOut"),
     ZOOM_RESET(ShortcutCategory.VIEW, "menu.view.zoomReset"),
+    TOGGLE_FULLSCREEN(ShortcutCategory.VIEW, "menu.view.fullscreen"),
     OPEN_SETTINGS(ShortcutCategory.VIEW, "help.shortcuts.settings"),
     OPEN_HELP(ShortcutCategory.VIEW, "help.shortcuts.help"),
 
     TEMPORARY_SELECT(ShortcutCategory.CANVAS_TOOLS, "shortcut.temporarySelect", ShortcutKind.HOLD),
     QUICK_PREVIEW(ShortcutCategory.CANVAS_TOOLS, "shortcut.quickPreview"),
+    TOGGLE_OBJECT_MODE(ShortcutCategory.CANVAS_TOOLS, "shortcut.toggleObjectMode"),
 
     MODE_SELECT(ShortcutCategory.CANVAS_TOOLS, "editor.mode.select"),
     MODE_DEFORM(ShortcutCategory.CANVAS_TOOLS, "editor.mode.deform"),
@@ -122,7 +124,9 @@ enum class ShortcutAction(
     TOOL_CREATE_DEFORM_PATH(ShortcutCategory.CANVAS_TOOLS, "editor.tool.create_deform_path"),
     TOOL_GLUE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.glue"),
     TOOL_SUBDIVIDE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.subdivide"),
-    TOOL_KNIFE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.knife"),
+    // The point tool's two faces. TOOL_KNIFE keeps its name so saved keymaps still bind the line face.
+    TOOL_KNIFE(ShortcutCategory.CANVAS_TOOLS, "shortcut.meshPointLine"),
+    TOOL_MESH_POINT(ShortcutCategory.CANVAS_TOOLS, "shortcut.meshPointPoint"),
     TOOL_WEIGHT_PAINT(ShortcutCategory.CANVAS_TOOLS, "editor.tool.weight_paint"),
     TOOL_WEIGHT_GRADIENT(ShortcutCategory.CANVAS_TOOLS, "editor.tool.weight_gradient"),
     TOOL_PAINT_BRUSH(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_brush"),
@@ -133,6 +137,12 @@ enum class ShortcutAction(
     TOOL_PAINT_LINE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_line"),
     TOOL_PAINT_RECT(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_rect"),
     TOOL_PAINT_ELLIPSE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_ellipse"),
+    TOOL_INTERIOR(ShortcutCategory.CANVAS_TOOLS, "editor.tool.interior"),
+    TOOL_FEATURE(ShortcutCategory.CANVAS_TOOLS, "editor.tool.feature"),
+    TOOL_PAINT_SELECT(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_select"),
+    TOOL_PAINT_GRADIENT(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_gradient"),
+    TOOL_PAINT_BLUR(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_blur"),
+    TOOL_PAINT_TRANSFORM(ShortcutCategory.CANVAS_TOOLS, "editor.tool.paint_transform"),
     // The numbered choices of the mode or tool in hand: Deform's levels, otherwise the variants the toolbar
     // lists under the tool (brush tips, glue and skeleton sub-tools, the vertex group kinds, paint shapes).
     PICK_OPTION_1(ShortcutCategory.CANVAS_TOOLS, "shortcut.pickOption"),
@@ -148,9 +158,19 @@ enum class ShortcutAction(
     SELECTION_STYLE_LASSO(ShortcutCategory.CANVAS_EDIT, "shortcut.selectionLasso"),
     SELECT_LINKED(ShortcutCategory.CANVAS_EDIT, "shortcut.selectLinked"),
     MIRROR_KEYFORM(ShortcutCategory.CANVAS_EDIT, "shortcut.mirrorKeyform"),
+    // Deform's keyform tools.
+    KEYFORM_COPY(ShortcutCategory.CANVAS_EDIT, "shortcut.keyformCopy"),
+    KEYFORM_PASTE(ShortcutCategory.CANVAS_EDIT, "shortcut.keyformPaste"),
+    KEYFORM_RESET(ShortcutCategory.CANVAS_EDIT, "shortcut.keyformReset"),
+    KEYFORM_INTERPOLATE(ShortcutCategory.CANVAS_EDIT, "shortcut.keyformInterpolate"),
+    SOFT_SELECTION_TOGGLE(ShortcutCategory.CANVAS_EDIT, "shortcut.softSelection"),
+    TEMPORARY_DEFORM(ShortcutCategory.CANVAS_EDIT, "shortcut.temporaryDeform"),
     CANCEL(ShortcutCategory.CANVAS_EDIT, "shortcut.cancel"),
     FINISH_PATH(ShortcutCategory.CANVAS_EDIT, "shortcut.finishPath"),
     DELETE_SELECTION(ShortcutCategory.CANVAS_EDIT, "editor.delete"),
+    // One copy and one paste for the canvas; each mode decides what they carry (objects in Select mode).
+    COPY(ShortcutCategory.CANVAS_EDIT, "shortcut.copy"),
+    PASTE(ShortcutCategory.CANVAS_EDIT, "shortcut.paste"),
     LAYER_TO_FRONT(ShortcutCategory.CANVAS_EDIT, "layers.reorder.front"),
     LAYER_FORWARD(ShortcutCategory.CANVAS_EDIT, "layers.reorder.forward"),
     LAYER_BACKWARD(ShortcutCategory.CANVAS_EDIT, "layers.reorder.backward"),
@@ -167,10 +187,22 @@ enum class ShortcutAction(
     PAINT_SHAPE_CYCLE(ShortcutCategory.CANVAS_EDIT, "shortcut.paintShapeCycle"),
     PAINT_OPACITY_DOWN(ShortcutCategory.CANVAS_EDIT, "shortcut.paintOpacityDown"),
     PAINT_OPACITY_UP(ShortcutCategory.CANVAS_EDIT, "shortcut.paintOpacityUp"),
+    PAINT_DESELECT(ShortcutCategory.CANVAS_EDIT, "shortcut.paintDeselect"),
+    PAINT_FILL_SELECTION(ShortcutCategory.CANVAS_EDIT, "shortcut.paintFillSelection"),
+    PAINT_RESET_COLORS(ShortcutCategory.CANVAS_EDIT, "shortcut.paintResetColors"),
+    PAINT_LOCK_ALPHA(ShortcutCategory.CANVAS_EDIT, "shortcut.paintLockAlpha"),
     AXIS_CONSTRAIN_X(ShortcutCategory.CANVAS_EDIT, "shortcut.axisX"),
     AXIS_CONSTRAIN_Y(ShortcutCategory.CANVAS_EDIT, "shortcut.axisY"),
     FRAME_VIEW(ShortcutCategory.CANVAS_EDIT, "shortcut.frameView"),
     RESET_CAMERA(ShortcutCategory.CANVAS_EDIT, "shortcut.resetCamera"),
+    // Canvas aids: grid, guides, onion skin and random pose.
+    TOGGLE_GRID(ShortcutCategory.CANVAS_EDIT, "shortcut.toggleGrid"),
+    TOGGLE_GUIDES(ShortcutCategory.CANVAS_EDIT, "shortcut.toggleGuides"),
+    LOCK_GUIDES(ShortcutCategory.CANVAS_EDIT, "shortcut.lockGuides"),
+    TOGGLE_SNAP(ShortcutCategory.CANVAS_EDIT, "shortcut.toggleSnap"),
+    TOGGLE_ONION_SKIN(ShortcutCategory.CANVAS_EDIT, "shortcut.toggleOnionSkin"),
+    RANDOM_POSE(ShortcutCategory.CANVAS_EDIT, "shortcut.randomPose"),
+    RESTORE_RANDOM_POSE(ShortcutCategory.CANVAS_EDIT, "shortcut.restoreRandomPose"),
 
     // Canvas mouse gestures: a button starts them, the pointer's motion drives them.
     PAN_VIEW(ShortcutCategory.CANVAS_MOUSE, "shortcut.panView", ShortcutKind.DRAG),
@@ -191,6 +223,14 @@ enum class ShortcutAction(
     MOTION_GO_END(ShortcutCategory.TIMELINE, "shortcut.motion.goEnd"),
     MOTION_PREV_FRAME(ShortcutCategory.TIMELINE, "shortcut.motion.prevFrame"),
     MOTION_NEXT_FRAME(ShortcutCategory.TIMELINE, "shortcut.motion.nextFrame"),
+    MOTION_ADD_MARKER(ShortcutCategory.TIMELINE, "shortcut.motion.addMarker"),
+    MOTION_PREV_MARKER(ShortcutCategory.TIMELINE, "shortcut.motion.prevMarker"),
+    MOTION_NEXT_MARKER(ShortcutCategory.TIMELINE, "shortcut.motion.nextMarker"),
+    MOTION_TOGGLE_BOOKMARK(ShortcutCategory.TIMELINE, "shortcut.motion.bookmark"),
+    MOTION_TOGGLE_SHY(ShortcutCategory.TIMELINE, "shortcut.motion.shy"),
+    MOTION_HIDE_SHY(ShortcutCategory.TIMELINE, "shortcut.motion.hideShy"),
+    MOTION_TOGGLE_FREEZE(ShortcutCategory.TIMELINE, "shortcut.motion.freeze"),
+    MOTION_CLOSE_LOOP(ShortcutCategory.TIMELINE, "shortcut.motion.closeLoop"),
     ;
 
     val scope: ShortcutScope get() = category.scope
@@ -275,9 +315,11 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.ZOOM_RESET to keys("Ctrl+0", "Ctrl+NumPad0"),
     ShortcutAction.OPEN_SETTINGS to keys("Ctrl+,"),
     ShortcutAction.OPEN_HELP to keys("F1"),
+    ShortcutAction.TOGGLE_FULLSCREEN to keys("F11"),
 
     ShortcutAction.TEMPORARY_SELECT to keys("Z"),
     ShortcutAction.QUICK_PREVIEW to keys("`"),
+    ShortcutAction.TOGGLE_OBJECT_MODE to keys("Tab"),
 
     ShortcutAction.MODE_SELECT to keys("Alt+1", "Alt+NumPad1"),
     ShortcutAction.MODE_DEFORM to keys("Alt+2", "Alt+NumPad2"),
@@ -305,6 +347,8 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     // losing its conventional key.
     ShortcutAction.TOOL_SUBDIVIDE to keys("M"),
     ShortcutAction.TOOL_KNIFE to keys("K"),
+    // Beside the subdivide brush's M: both add points to a mesh.
+    ShortcutAction.TOOL_MESH_POINT to keys("Alt+M"),
     ShortcutAction.TOOL_WEIGHT_PAINT to keys("Shift+V"),
     ShortcutAction.TOOL_WEIGHT_GRADIENT to keys("Alt+V"),
     ShortcutAction.TOOL_PAINT_BRUSH to keys("Shift+P", "J"),
@@ -315,6 +359,16 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.TOOL_PAINT_LINE to keys("U"),
     ShortcutAction.TOOL_PAINT_RECT to keys("Shift+R"),
     ShortcutAction.TOOL_PAINT_ELLIPSE to keys("Shift+O"),
+    ShortcutAction.TOOL_INTERIOR to keys("Shift+I"),
+    ShortcutAction.TOOL_FEATURE to keys("Shift+Y"),
+    // Photoshop's M, G and R belong to tools of the other modes here, so the paint tools take Alt chords instead -
+    // the selection Alt+L, after the lasso it starts as.
+    ShortcutAction.TOOL_PAINT_SELECT to keys("Alt+L"),
+    ShortcutAction.TOOL_PAINT_GRADIENT to keys("Alt+G"),
+    ShortcutAction.TOOL_PAINT_BLUR to keys("Alt+J"),
+    // Photoshop's Ctrl+T opens a workspace tab here, so Free Transform takes the transform tool's T with Alt;
+    // in Paint mode the T of the object transform tool picks it too.
+    ShortcutAction.TOOL_PAINT_TRANSFORM to keys("Alt+T"),
     ShortcutAction.PICK_OPTION_1 to keys("1", "NumPad1"),
     ShortcutAction.PICK_OPTION_2 to keys("2", "NumPad2"),
     ShortcutAction.PICK_OPTION_3 to keys("3", "NumPad3"),
@@ -322,14 +376,24 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.PICK_OPTION_5 to keys("5", "NumPad5"),
 
     ShortcutAction.SELECT_ALL to keys("Ctrl+A"),
-    ShortcutAction.INVERT_SELECTION to keys("Ctrl+I"),
+    ShortcutAction.INVERT_SELECTION to keys("Ctrl+I", "Ctrl+Shift+I"),
     ShortcutAction.SELECTION_STYLE_BOX to keys("Q"),
     ShortcutAction.SELECTION_STYLE_LASSO to keys("Shift+Q"),
     ShortcutAction.SELECT_LINKED to keys("Shift+L"),
     ShortcutAction.MIRROR_KEYFORM to keys("Shift+M"),
+    // Deform's keyform tools, on Ctrl+Alt beside the clipboard keys that copy objects.
+    ShortcutAction.KEYFORM_COPY to keys("Ctrl+Alt+C"),
+    ShortcutAction.KEYFORM_PASTE to keys("Ctrl+Alt+V"),
+    ShortcutAction.KEYFORM_RESET to keys("Ctrl+Alt+X"),
+    ShortcutAction.KEYFORM_INTERPOLATE to keys("Ctrl+Alt+I"),
+    // Blender's proportional editing key.
+    ShortcutAction.SOFT_SELECTION_TOGGLE to keys("O"),
+    ShortcutAction.TEMPORARY_DEFORM to keys("Shift+T"),
     ShortcutAction.CANCEL to keys("Esc"),
     ShortcutAction.FINISH_PATH to keys("Enter", "NumPadEnter"),
     ShortcutAction.DELETE_SELECTION to keys("Del", "Backspace"),
+    ShortcutAction.COPY to keys("Ctrl+C"),
+    ShortcutAction.PASTE to keys("Ctrl+V"),
     // Photoshop's arrange keys: one step with Ctrl, all the way with Ctrl+Shift.
     ShortcutAction.LAYER_TO_FRONT to keys("Ctrl+Shift+]"),
     ShortcutAction.LAYER_FORWARD to keys("Ctrl+]"),
@@ -350,10 +414,23 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     // The paint tip's third parameter, on the same Shift pairing the Alt + drag gesture uses.
     ShortcutAction.PAINT_OPACITY_DOWN to keys("Alt+Shift+["),
     ShortcutAction.PAINT_OPACITY_UP to keys("Alt+Shift+]"),
+    // Photoshop's selection and fill keys; D is the deform path's, so the default colours take Alt+D.
+    ShortcutAction.PAINT_DESELECT to keys("Ctrl+D"),
+    ShortcutAction.PAINT_FILL_SELECTION to keys("Alt+Backspace", "Alt+Del"),
+    ShortcutAction.PAINT_RESET_COLORS to keys("Alt+D"),
+    ShortcutAction.PAINT_LOCK_ALPHA to keys("/"),
     ShortcutAction.AXIS_CONSTRAIN_X to keys("X"),
     ShortcutAction.AXIS_CONSTRAIN_Y to keys("Y"),
     ShortcutAction.FRAME_VIEW to keys("F"),
     ShortcutAction.RESET_CAMERA to keys("Home", "0"),
+    // Photoshop's grid and guide keys.
+    ShortcutAction.TOGGLE_GRID to keys("Ctrl+'"),
+    ShortcutAction.TOGGLE_GUIDES to keys("Ctrl+;"),
+    ShortcutAction.LOCK_GUIDES to keys("Ctrl+Alt+;"),
+    ShortcutAction.TOGGLE_SNAP to keys("Ctrl+Shift+;"),
+    ShortcutAction.TOGGLE_ONION_SKIN to keys("Alt+O"),
+    ShortcutAction.RANDOM_POSE to keys("Alt+P"),
+    ShortcutAction.RESTORE_RANDOM_POSE to keys("Alt+Shift+P"),
 
     // Space + left drag also pans, but Space is a latch rather than a modifier and is not rebindable.
     ShortcutAction.PAN_VIEW to keys("MouseMiddle", "Shift+MouseMiddle"),
@@ -374,6 +451,14 @@ private val PS_DEFAULTS: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.MOTION_GO_END to keys("End"),
     ShortcutAction.MOTION_PREV_FRAME to keys("Left"),
     ShortcutAction.MOTION_NEXT_FRAME to keys("Right"),
+    ShortcutAction.MOTION_ADD_MARKER to keys("M"),
+    ShortcutAction.MOTION_PREV_MARKER to keys("Ctrl+Left"),
+    ShortcutAction.MOTION_NEXT_MARKER to keys("Ctrl+Right"),
+    ShortcutAction.MOTION_TOGGLE_BOOKMARK to keys("B"),
+    ShortcutAction.MOTION_TOGGLE_SHY to keys("Shift+H"),
+    ShortcutAction.MOTION_HIDE_SHY to keys("H"),
+    ShortcutAction.MOTION_TOGGLE_FREEZE to keys("Shift+F"),
+    ShortcutAction.MOTION_CLOSE_LOOP to keys("Shift+L"),
 )
 
 /**
@@ -391,6 +476,12 @@ private val BLENDER_OVERRIDES: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.TOOL_CREATE_WARP to keys("Shift+W"),
     ShortcutAction.TOOL_GLUE to keys("Shift+G"),
     ShortcutAction.TOOL_PAINT_ERASER to keys("Shift+E"),
+    // Blender hands Alt + letter to clearing transforms and the like in every mode, and these chords would switch
+    // into Paint from anywhere: the newer paint tools are left to the toolbar there.
+    ShortcutAction.TOOL_PAINT_SELECT to emptyList(),
+    ShortcutAction.TOOL_PAINT_GRADIENT to emptyList(),
+    ShortcutAction.TOOL_PAINT_BLUR to emptyList(),
+    ShortcutAction.TOOL_PAINT_TRANSFORM to emptyList(),
     // Numpad-dot = view selected.
     ShortcutAction.FRAME_VIEW to keys("NumPadDot"),
     // Workspace cycling.
@@ -398,6 +489,10 @@ private val BLENDER_OVERRIDES: Map<ShortcutAction, List<KeyBinding>> = mapOf(
     ShortcutAction.PREV_TAB to keys("Ctrl+PageUp"),
     // Insert keyframe.
     ShortcutAction.MOTION_KEY_POSE to keys("I", "K"),
+    // Alt+letter is Blender's "clear" family (Alt+G, Alt+R, Alt+S...): the canvas aids stay unbound there.
+    ShortcutAction.TOGGLE_ONION_SKIN to emptyList(),
+    ShortcutAction.RANDOM_POSE to emptyList(),
+    ShortcutAction.RESTORE_RANDOM_POSE to emptyList(),
 )
 
 /**

@@ -13,6 +13,7 @@ import io.github.psd2live.ui.components.*
 import io.github.psd2live.ui.state.PSD2LiveState
 import io.github.psd2live.ui.state.referenceConversion
 import io.github.psd2live.ui.state.PSD2LiveViewModel
+import io.github.psd2live.ui.state.ShortcutAction
 import io.github.psd2live.ui.utils.NativeFilePicker
 import io.github.psd2live.ui.views.texture.FloatingMenuRow
 import io.github.psd2live.ui.views.texture.FloatingMenuSection
@@ -31,12 +32,15 @@ internal fun ArtMeshMenu(
     close: () -> Unit,
     onRequestSetOrder: ((String, String, Float, Float, Boolean) -> Unit)? = null,
     onRequestCreate: ((CreatePlacementKind, CreateRelation, Boolean, String) -> Unit)? = null,
+    /** How many layers the hierarchy has selected; the rows below still act on this row's layer only. */
+    selectionCount: Int = 1,
 ) {
     val editable = !state.isBusy && !state.workspaceEditBusy && !state.editorDraftBusy
     val rows = mutableListOf<Triple<Boolean, Boolean, @Composable () -> Unit>>()
     fun add(highlight: Boolean = true, danger: Boolean = false, content: @Composable () -> Unit) { rows += Triple(highlight, danger, content) }
     fun section(key: String) = add(false) { FloatingMenuSection(tr(key)) }
     add(false) { FloatingMenuSection(drawable.name) }
+    if (selectionCount > 1) add(false) { FloatingMenuSection(tr("canvas.hierarchy.menuScopeSingle", selectionCount)) }
     if (layerId != null) {
         add(highlight = state.referenceConversion(layerId).enabled) { ReferenceConversionMenuRow(layerId, state, viewModel, close) }
         section("canvas.hierarchy.menuView")
@@ -68,26 +72,55 @@ internal fun ArtMeshMenu(
             val picked = NativeFilePicker.chooseTransparentImages()
             if (picked.isNotEmpty()) viewModel.importLayersFromFiles(picked, ImageLayerInsertion(parentId, drawable.id.raw))
         }, enabled = editable, icon = { IconSelectionBounds(it, Modifier.size(12.dp)) }) }
+        if (drawable.mesh != null) {
+            section("hitArea.menuSection")
+            hitAreaMenuRows(drawable, state, viewModel, editable, close) { highlight, content -> add(highlight, content = content) }
+        }
         section("canvas.hierarchy.menuSettings")
         add(highlight = editable && drawable.mesh != null) { FloatingMenuRow(if (viewModel.depthSplitMiddleIds(drawable.id.raw).isNotEmpty())
             tr("editor.depthSplit.quick", drawable.name) else tr("editor.depthSplit.menu"),
             { close(); viewModel.requestDepthSplit(drawable.id.raw) }, enabled = editable && drawable.mesh != null,
             icon = { IconDrawOrder(Modifier.size(12.dp), it) }) }
         val order = state.getEffectiveDrawOrder(drawable.id.raw, layerId, drawable.drawOrder)
-        val overridden = layerId in state.drawOrderOverrides || drawable.id.raw in state.drawOrderOverrides
+        val ownLayer = layerId?.takeUnless { state.previewModel?.rig?.copiedDrawableIds?.contains(drawable.id.raw) == true }
+        val overridden = ownLayer in state.drawOrderOverrides || drawable.id.raw in state.drawOrderOverrides
         add(highlight = editable) { FloatingMenuRow(tr("canvas.hierarchy.setDrawOrder"),
-            { close(); onRequestSetOrder?.invoke(layerId, drawable.name, order, drawable.drawOrder, overridden) },
+            { close(); onRequestSetOrder?.invoke(ownLayer ?: drawable.id.raw, drawable.name, order, drawable.drawOrder, overridden) },
             selected = overridden, enabled = editable, trailing = order.roundToInt().toString(),
             icon = { IconDrawOrder(Modifier.size(12.dp), it) }) }
         if (overridden) add(highlight = editable) { FloatingMenuRow(tr("canvas.drawOrder.reset"),
-            { close(); viewModel.resetLayerDrawOrder(layerId) }, enabled = editable,
+            { close(); viewModel.resetLayerDrawOrder(ownLayer ?: drawable.id.raw) }, enabled = editable,
             icon = { IconReset(Modifier.size(12.dp), it) }) }
         add(highlight = editable && drawable.mesh != null) { FloatingMenuRow(tr("canvas.hierarchy.splitMeshComponents"),
             { close(); viewModel.requestMeshSplit(layerId) }, enabled = editable && drawable.mesh != null,
             icon = { IconMeshWireframe(it, Modifier.size(12.dp)) }) }
+        objectRows(drawable, state, viewModel, editable, close, ::add)
         add(highlight = editable, danger = true) { FloatingMenuRow(tr("canvas.hierarchy.deleteLayer"),
             { close(); viewModel.deleteLayer(layerId) }, enabled = editable,
             danger = true, icon = { IconTrash(Modifier.size(12.dp), it) }) }
     }
     GlidingColumn(Modifier.width(236.dp), rows.size, { rows[it].first }, dangers = { rows[it].second }) { rows[it].third() }
 }
+
+/**
+ * Copy, paste and mesh duplication for the mesh a menu is about: copy takes the hierarchy's selection when this mesh is
+ * in it, paste places the copies beside their originals, and duplication copies this mesh's topology onto the other
+ * selected meshes.
+ */
+internal fun objectRows(drawable: Drawable, state: PSD2LiveState, viewModel: PSD2LiveViewModel, editable: Boolean, close: () -> Unit,
+                        add: (Boolean, Boolean, @Composable () -> Unit) -> Unit) {
+    val self = "mesh:${drawable.id.raw}"
+    val selection = viewModel.selectedObjectTargets()
+    val targets = viewModel.meshDuplicationTargets(drawable.id.raw)
+    add(false, false) { FloatingMenuSection(tr("objectOps.section")) }
+    add(true, false) { FloatingMenuRow(tr("objectOps.copy"), { close(); viewModel.copyObjects(if (self in selection) selection else listOf(self)) },
+        trailing = state.keymap.labelFor(ShortcutAction.COPY), icon = { GridIcon(Modifier.size(12.dp), it) { copySheets() } }) }
+    val canPaste = editable && viewModel.objectClipboard.isNotEmpty()
+    add(canPaste, false) { FloatingMenuRow(tr("objectOps.paste"), { close(); viewModel.pasteObjects() }, enabled = canPaste,
+        trailing = state.keymap.labelFor(ShortcutAction.PASTE), icon = { GridIcon(Modifier.size(12.dp), it) { pasteBoard() } }) }
+    if (drawable.mesh != null && targets.isNotEmpty() && self in selection) add(editable, false) {
+        FloatingMenuRow(tr("objectOps.duplicateMesh", targets.size), { close(); viewModel.duplicateMesh(drawable.id.raw, targets) },
+            enabled = editable, icon = { IconMeshWireframe(it, Modifier.size(12.dp)) })
+    }
+}
+

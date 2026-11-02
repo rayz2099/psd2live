@@ -19,6 +19,8 @@ import io.github.psd2live.ui.BrushShape
 import io.github.psd2live.ui.CanvasTool
 import io.github.psd2live.ui.EditHierarchyMode
 import io.github.psd2live.ui.GlueSubTool
+import io.github.psd2live.ui.PaintSelectShape
+import io.github.psd2live.ui.MeshPointMode
 import io.github.psd2live.ui.PaintShape
 import io.github.psd2live.ui.SkeletonEditSubTool
 import io.github.psd2live.ui.SkeletonPoseSubTool
@@ -51,8 +53,10 @@ internal fun ToolIcon(
     brushShape: BrushShape? = null,
     paintShape: PaintShape? = null,
     skeletonEditSubTool: SkeletonEditSubTool? = null,
+    paintSelectShape: PaintSelectShape? = null,
+    meshPointMode: MeshPointMode? = null,
 ) {
-    Canvas(Modifier.size(18.dp)) { drawToolIcon(tool, color, brushShape, paintShape, skeletonEditSubTool) }
+    Canvas(Modifier.size(18.dp)) { drawToolIcon(tool, color, brushShape, paintShape, skeletonEditSubTool, paintSelectShape, meshPointMode) }
 }
 
 /** The hierarchy mode bar's icons, one per mode, on the same grid as the tools. */
@@ -69,6 +73,16 @@ internal fun BrushShapeIcon(shape: BrushShape, color: Color, size: Dp = 14.dp) {
 @Composable
 internal fun PaintShapeIcon(shape: PaintShape, color: Color, size: Dp = 14.dp) {
     Canvas(Modifier.size(size)) { drawPaintShapeIcon(shape, color) }
+}
+
+@Composable
+internal fun MeshPointModeIcon(mode: MeshPointMode, color: Color, size: Dp = 14.dp) {
+    Canvas(Modifier.size(size)) { IconPen(this, color).meshPoint(mode) }
+}
+
+@Composable
+internal fun PaintSelectShapeIcon(shape: PaintSelectShape, color: Color, size: Dp = 14.dp) {
+    Canvas(Modifier.size(size)) { IconPen(this, color).paintSelect(shape) }
 }
 
 @Composable
@@ -97,6 +111,8 @@ internal fun DrawScope.drawToolIcon(
     brushShape: BrushShape? = null,
     paintShape: PaintShape? = null,
     skeletonEditSubTool: SkeletonEditSubTool? = null,
+    paintSelectShape: PaintSelectShape? = null,
+    meshPointMode: MeshPointMode? = null,
 ) {
     val pen = IconPen(this, color)
     when (tool) {
@@ -118,7 +134,7 @@ internal fun DrawScope.drawToolIcon(
         CanvasTool.CREATE_DEFORM_PATH -> pen.deformPath()
         CanvasTool.GLUE -> pen.glue()
         CanvasTool.SUBDIVIDE -> pen.subdivide()
-        CanvasTool.KNIFE -> pen.knife()
+        CanvasTool.MESH_POINT -> pen.meshPoint(meshPointMode ?: MeshPointMode.POINT)
         CanvasTool.WEIGHT_PAINT -> pen.weightPaint()
         CanvasTool.WEIGHT_GRADIENT -> pen.weightGradient()
         CanvasTool.PAINT_BRUSH -> pen.paintBrush()
@@ -128,6 +144,17 @@ internal fun DrawScope.drawToolIcon(
         CanvasTool.PAINT_EYEDROPPER -> pen.eyedropper()
         // The row carries the face in hand, the way the deform brush's row carries its footprint.
         CanvasTool.PAINT_SHAPE -> pen.paintShape(paintShape ?: PaintShape.LINE)
+        CanvasTool.INTERIOR -> pen.interiorHandles()
+        CanvasTool.FEATURE -> pen.featureHandles()
+        CanvasTool.PAINT_SELECT -> pen.paintSelect(paintSelectShape ?: PaintSelectShape.RECTANGLE)
+        CanvasTool.PAINT_GRADIENT -> pen.paintGradient()
+        CanvasTool.PAINT_BLUR -> pen.blurDrop()
+        // A dashed box with its corner handles, a stroke inside it: the pixels in a free transform.
+        CanvasTool.PAINT_TRANSFORM -> {
+            pen.box(3f, 3f, 12f, 12f, r = 0f, dash = floatArrayOf(1.6f, 1.6f))
+            for (x in listOf(3f, 15f)) for (y in listOf(3f, 15f)) pen.fillBox(x - 1.5f, y - 1.5f, 3f, 3f, r = 0f)
+            pen.line(6.4f, 11.6f, 11.6f, 6.4f, width = 1.6f)
+        }
     }
 }
 
@@ -397,15 +424,22 @@ private fun IconPen.skeletonEdit() {
 
 // --- mesh editing ----------------------------------------------------------------------------------------
 
-private fun IconPen.knife() = turned(-45f) {
-    val blade = path {
-        m(11f, 7f); l(4.4f, 7f)
-        c(2.4f, 7f, 1.1f, 8.6f, 0.8f, 10.8f)
-        l(11f, 10.8f); z()
-    }
-    fill(blade, soft)
-    outline(blade)
-    fillBox(12f, 7.2f, 5.6f, 3.4f, 1.4f)
+/** The point tool's face in hand: a lone point, or a line of points joined by edges. */
+private fun IconPen.meshPoint(mode: MeshPointMode) = if (mode == MeshPointMode.LINE) meshLine() else meshPoints()
+
+/** Mesh points: a mesh triangle on its corners, and the new point being joined to it. */
+private fun IconPen.meshPoints() {
+    shape(path { m(2.4f, 13f); l(7.6f, 2.8f); l(12.2f, 10.4f); z() }, width = ICON_FINE)
+    outline(path { m(12.2f, 10.4f); l(15f, 15f); l(2.4f, 13f) }, width = ICON_FINE, dash = floatArrayOf(1.4f, 1.1f))
+    for ((x, y) in listOf(2.4f to 13f, 7.6f to 2.8f, 12.2f to 10.4f)) dot(x, y, 1.4f)
+    ring(15f, 15f, 2.2f)
+}
+
+/** A mesh line: a triangle crossed by a solid polyline whose three points it is now split along. */
+private fun IconPen.meshLine() {
+    shape(path { m(2.4f, 15.4f); l(9f, 2.4f); l(15.6f, 15.4f); z() }, width = ICON_FINE)
+    outline(path { m(1.4f, 11.6f); l(9f, 8.4f); l(16.6f, 11.6f) })
+    for ((x, y) in listOf(1.4f to 11.6f, 9f to 8.4f, 16.6f to 11.6f)) dot(x, y, 1.6f)
 }
 
 /** Weight paint: the paint brush pressed into the patch of falloff it lays its weight over. */
@@ -439,6 +473,22 @@ private fun IconPen.weightGradient() {
         line(9f, y0, 9f, y0 + 8f / steps, tint = color.copy(alpha = color.alpha * (1f - 0.75f * (i + 0.5f) / steps)))
     }
     box(3.6f, 13f, 10.8f, 2.6f, 1.1f)
+}
+
+/** Interior handles: the virtual arch over its rest line, held by the handle at its crown. */
+/** An eye's outline with its four handles: the corners and the middles of both lids. */
+private fun IconPen.featureHandles() {
+    outline(path { m(2.6f, 9.4f); c(5.4f, 4.2f, 12.6f, 4.2f, 15.4f, 9.4f); c(12.6f, 13.2f, 5.4f, 13.2f, 2.6f, 9.4f) }, width = ICON_FINE)
+    for ((x, y) in listOf(2.6f to 9.4f, 15.4f to 9.4f, 9f to 5.5f, 9f to 12.3f)) fillBox(x - 1.5f, y - 1.5f, 3f, 3f, r = 1.5f)
+}
+
+private fun IconPen.interiorHandles() {
+    outline(path { m(2.4f, 14.2f); l(15.6f, 14.2f) }, width = ICON_FINE, dash = floatArrayOf(1.4f, 1.1f))
+    val arch = path { m(2.4f, 14.2f); c(4.2f, 5.6f, 13.8f, 5.6f, 15.6f, 14.2f) }
+    outline(arch)
+    line(9f, 14.2f, 9f, 8.4f, width = ICON_FINE)
+    dot(9f, 7.8f, 2.2f, soft)
+    ring(9f, 7.8f, 2.2f)
 }
 
 // --- painting --------------------------------------------------------------------------------------------
@@ -517,6 +567,51 @@ private fun IconPen.paintShape(shape: PaintShape) {
             scope.drawOval(color, p(2.2f, 4f), Size(13.6f * s, 10f * s), style = stroke())
     }
 }
+
+/** The selection tool's faces: marching-ant outlines, and the wand with its sparkle. */
+private fun IconPen.paintSelect(shape: PaintSelectShape) {
+    val ants = floatArrayOf(1.6f, 1.6f)
+    when (shape) {
+        PaintSelectShape.RECTANGLE -> box(2.6f, 3.6f, 12.8f, 10.8f, 0.4f, dash = ants)
+        PaintSelectShape.ELLIPSE -> ring(9f, 9f, 6.4f, dash = ants)
+        PaintSelectShape.LASSO -> lasso()
+        PaintSelectShape.POLYGON -> {
+            outline(path { m(3f, 13.8f); l(5.2f, 3.4f); l(14.6f, 5.6f); l(12.4f, 14.4f); z() }, dash = ants)
+            for ((x, y) in listOf(3f to 13.8f, 5.2f to 3.4f, 14.6f to 5.6f, 12.4f to 14.4f)) fillBox(x - 1.2f, y - 1.2f, 2.4f, 2.4f, 0.4f)
+        }
+        PaintSelectShape.WAND -> {
+            line(3f, 15f, 11f, 7f, width = 1.8f)
+            line(13f, 1.6f, 13f, 6.4f, width = 1.1f)
+            line(10.6f, 4f, 15.4f, 4f, width = 1.1f)
+            dot(16f, 9.6f, 0.9f)
+            dot(7.6f, 2.6f, 0.9f)
+        }
+        // A brush tip whose outline is marching ants, with the handle trailing off it.
+        PaintSelectShape.QUICK -> {
+            ring(7.4f, 7.4f, 5.2f, dash = ants)
+            line(11.2f, 11.2f, 15.6f, 15.6f, width = 2f)
+        }
+    }
+}
+
+/** Gradient: a box whose fill fades from full to nothing across it. */
+private fun IconPen.paintGradient() {
+    val steps = 6
+    for (i in 0 until steps) {
+        fillBox(3f + i * 12f / steps, 4f, 12f / steps + 0.05f, 10f, 0f, tint = color.copy(alpha = color.alpha * (1f - (i + 0.5f) / steps)))
+    }
+    box(3f, 4f, 12f, 10f, 1f)
+}
+
+/** Blur: a drop of water. */
+private fun IconPen.blurDrop() = shape(path {
+    m(9f, 2f)
+    c(11.6f, 5.6f, 14.4f, 8.6f, 14.4f, 11.2f)
+    c(14.4f, 14.2f, 12f, 16.2f, 9f, 16.2f)
+    c(6f, 16.2f, 3.6f, 14.2f, 3.6f, 11.2f)
+    c(3.6f, 8.6f, 6.4f, 5.6f, 9f, 2f)
+    z()
+})
 
 /** What each kind of vertex group does to a simulated mesh, drawn on the tool grid. */
 @Composable

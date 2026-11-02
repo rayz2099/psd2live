@@ -139,17 +139,25 @@ internal fun BarDivider() {
 @Composable
 internal fun BarTooltip(text: String?, content: @Composable () -> Unit) {
 	if (text.isNullOrBlank()) { content(); return }
-	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	TooltipArea(
 		tooltip = {
-			Surface(color = colors.panelElevated, shape = RoundedCornerShape(4.dp), border = BorderStroke(0.5.dp, colors.border), elevation = 4.dp) {
-				Text(text, style = typography.caption.copy(fontSize = 10.5.sp), color = colors.textPrimary,
+			BarTooltipPanel {
+				Text(text, style = typography.captionSmall, color = LocalToolColors.current.textPrimary,
 					modifier = Modifier.widthIn(max = 280.dp).padding(horizontal = 7.dp, vertical = 4.dp))
 			}
 		},
 		delayMillis = Motion.TooltipDelay,
 	) { content() }
+}
+
+/** Shared tooltip chrome for text tips and richer thumbnail previews. */
+@Composable
+internal fun BarTooltipPanel(content: @Composable () -> Unit) {
+	val colors = LocalToolColors.current
+	Surface(color = colors.panelElevated, shape = RoundedCornerShape(4.dp), border = BorderStroke(0.5.dp, colors.border), elevation = 4.dp) {
+		content()
+	}
 }
 
 /**
@@ -634,8 +642,7 @@ internal fun FloatingMenuSlider(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	Row(Modifier.fillMaxWidth().height(24.dp).padding(start = 9.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-		Text(label, color = if (enabled) colors.textMuted else colors.textMuted.copy(alpha = 0.5f), fontSize = 10.5.sp, maxLines = 1,
-			overflow = TextOverflow.Ellipsis, modifier = Modifier.width(54.dp))
+		FloatingMenuValueLabel(label, enabled)
 		val clamped = value.coerceIn(valueRange.start, valueRange.endInclusive)
 		val slider = Modifier.weight(1f).padding(horizontal = 4.dp)
 		if (logarithmic && valueRange.start > 0f) {
@@ -650,6 +657,51 @@ internal fun FloatingMenuSlider(
 		}
 		Text(display, color = if (enabled) colors.textPrimary else colors.textMuted, style = typography.monoSmall.copy(fontSize = 9.5.sp),
 			maxLines = 1, textAlign = androidx.compose.ui.text.style.TextAlign.End, modifier = Modifier.width(40.dp))
+	}
+}
+
+/** The label column of a [FloatingMenu]'s one-line value rows, so sliders and swatches line up. */
+@Composable
+private fun FloatingMenuValueLabel(label: String, enabled: Boolean) {
+	val colors = LocalToolColors.current
+	val typography = LocalToolTypography.current
+	Text(label, color = if (enabled) colors.textMuted else colors.textMuted.copy(alpha = 0.5f),
+		style = typography.captionSmall, maxLines = 1,
+		overflow = TextOverflow.Ellipsis, modifier = Modifier.width(54.dp))
+}
+
+/**
+ * A value row of a [FloatingMenu] choosing one of a few colours: the label, then a swatch per choice, each named
+ * in its tooltip, the chosen one ringed.
+ */
+@Composable
+internal fun FloatingMenuSwatches(label: String, swatches: List<Pair<String, Color>>, selected: Int, onSelect: (Int) -> Unit) {
+	val colors = LocalToolColors.current
+	Row(Modifier.fillMaxWidth().height(24.dp).padding(start = 9.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+		FloatingMenuValueLabel(label, enabled = true)
+		Row(Modifier.weight(1f).padding(start = 4.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+			swatches.forEachIndexed { index, (name, color) ->
+				BarTooltip(name) {
+					Box(
+						Modifier
+							.size(20.dp)
+							.glideItem(enabled = true)
+							.clip(CircleShape)
+							.clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onSelect(index) }
+							.semantics { contentDescription = name },
+						contentAlignment = Alignment.Center,
+					) {
+						Box(
+							Modifier
+								.size(12.dp)
+								.clip(CircleShape)
+								.background(color)
+								.then(if (index == selected) Modifier.border(1.5.dp, colors.textPrimary, CircleShape) else Modifier),
+						)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -911,7 +963,7 @@ internal fun NoticeBanner(messages: List<Pair<String, Color>>, onClose: (() -> U
 		}
 		Column(Modifier.weight(1f, fill = false).padding(start = 6.dp, end = 4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
 			for ((message, color) in messages) {
-				Text(message, style = typography.caption.copy(fontSize = 10.5.sp), color = if (color == colors.error) color else colors.textPrimary,
+				Text(message, style = typography.captionSmall, color = if (color == colors.error) color else colors.textPrimary,
 					maxLines = 3, overflow = TextOverflow.Ellipsis)
 			}
 			if (actions.isNotEmpty()) Row(Modifier.padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {

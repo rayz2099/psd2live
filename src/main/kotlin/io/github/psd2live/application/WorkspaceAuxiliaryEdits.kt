@@ -20,9 +20,15 @@ sealed interface WorkspaceAuxiliaryEdit {
     data class DeleteSnapshot(val id: String) : WorkspaceAuxiliaryEdit
     data class PutAnnotation(val nodeId: String, val annotation: HistoryAnnotation) : WorkspaceAuxiliaryEdit
     data class DeleteAnnotation(val nodeId: String) : WorkspaceAuxiliaryEdit
+    /** Replaces the edit canvases' ruler guides: one drag, added guide or cleared set is one edit. */
+    data class SetCanvasGuides(val guides: List<CanvasGuide>) : WorkspaceAuxiliaryEdit
+    /** Bookmarks, shy and frozen tracks and markers of the motion editor ([TimelineAidsEdits]). */
+    data class EditTimeline(val edit: TimelineAidsEdit) : WorkspaceAuxiliaryEdit
 }
 
 object WorkspaceAuxiliaryEdits {
+    const val MAX_CANVAS_GUIDES = 256
+
     fun apply(current: WorkspaceAuxiliaryData, edit: WorkspaceAuxiliaryEdit,
               parameters: List<Parameter>, historyNodeIds: Set<String>): WorkspaceAuxiliaryData {
         fun validate(values: Map<ParameterId, Float>) {
@@ -60,6 +66,14 @@ object WorkspaceAuxiliaryEdits {
                 requireNode(edit.nodeId)
                 current.copy(historyAnnotations = current.historyAnnotations - edit.nodeId)
             }
+            is WorkspaceAuxiliaryEdit.SetCanvasGuides -> {
+                require(edit.guides.size <= MAX_CANVAS_GUIDES) { "At most $MAX_CANVAS_GUIDES guides" }
+                require(edit.guides.all { it.id.isNotBlank() && it.position.isFinite() }) { "Guides need an ID and a finite position" }
+                require(edit.guides.distinctBy { it.id }.size == edit.guides.size) { "Guide IDs must be unique" }
+                current.copy(canvasGuides = edit.guides.toList())
+            }
+            is WorkspaceAuxiliaryEdit.EditTimeline ->
+                current.copy(timelineAids = TimelineAidsEdits.apply(current.timelineAids, edit.edit, parameters))
         }
     }
 }

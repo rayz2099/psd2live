@@ -12,6 +12,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 data class WorkspacePaintStroke(val id: String, val name: String)
 
+/** What [WorkspacePaintSession.lift] took off the raster for a transform in hand: [region] in raster pixels, its straight ARGB [pixels]. */
+class WorkspacePaintLift(val region: Rectangle, val pixels: IntArray)
+
 /**
  * One private raster and stroke history, shared by UI and public session controls.
  *
@@ -41,6 +44,8 @@ class WorkspacePaintSession internal constructor(
     private val buffer = PaintRasterSession(layerId, layerName, image, copy(image))
     private var version = 0L
     private var active = false
+    /** Whether the live edit in hand is a [lift], which a `transform` gesture puts back before it lands. */
+    private var lifted = false
     private var committing = false
     private var closed = false
     private var completion: WorkspaceMutationResult? = null
@@ -103,32 +108,169 @@ class WorkspacePaintSession internal constructor(
         writable(); active = true; buffer.beginStroke(); changed()
     }
     internal fun segment(x0: Float, y0: Float, x1: Float, y1: Float, tip: RasterPaintEngine.Tip,
-        color: Int, opacity: Float, erase: Boolean) = synchronized(lock) {
+        color: Int, opacity: Float, erase: Boolean, lockAlpha: Boolean = false) = synchronized(lock) {
         writable(allowActive = true); check(active) { "No live paint stroke" }
         val rasterTip = if (space.isCanvas) tip else RasterPaintEngine.Tip(space.imageLength(tip.radius), tip.hardness, tip.antialias)
         buffer.stroke().addSegment(space.canvasToImageX(x0), space.canvasToImageY(y0),
             space.canvasToImageX(x1), space.canvasToImageY(y1), rasterTip)?.let {
-            buffer.landSegment(it, color, opacity, erase); changed()
+            buffer.landSegment(it, color, opacity, erase, selection, lockAlpha); changed()
         }
+    }
+
+    /** One segment of a live blur stroke: [strength] 0..1 of the way towards the blurred pixels under the tip. */
+    internal fun blurSegment(x0: Float, y0: Float, x1: Float, y1: Float, tip: RasterPaintEngine.Tip, strength: Float) = synchronized(lock) {
+        writable(allowActive = true); check(active) { "No live paint stroke" }
+        val rasterTip = if (space.isCanvas) tip else RasterPaintEngine.Tip(space.imageLength(tip.radius), tip.hardness, tip.antialias)
+        buffer.stroke().addSegment(space.canvasToImageX(x0), space.canvasToImageY(y0),
+            space.canvasToImageX(x1), space.canvasToImageY(y1), rasterTip)?.let {
+            buffer.landBlurSegment(it, strength, blurKernel(rasterTip.radius), selection); changed()
+        }
+    }
+
+    /**
+     * The selection every edit of the session lands through, in raster pixels; null with nothing selected, when
+     * edits reach the whole raster. It is the session's, not the stroke history's: undo leaves it alone.
+     */
+    internal var selection: PaintSelection? = null
+        private set
+
+    /** Bumped by every [select], so a view of the selection's edge knows when to trace it again. */
+    var selectionRevision = 0
+        private set
+
+    /** Raster pixels of the selection's bounds, or null without one. */
+    val selectionBounds: Rectangle? get() = synchronized(lock) { selection?.bounds }
+
+    /** The selection's edge for the marching ants, as [PaintSelection.outline] segments in raster pixels. */
+    fun selectionOutline(): FloatArray = synchronized(lock) { selection?.outline() ?: FloatArray(0) }
+
+    /**
+     * Changes the selection: [request] is one [WorkspacePaintSessionSchemas.selection] - a shape in canvas units
+     * (`rectangle`, `ellipse`, `lasso`, `wand`, `quick`) or the layer's alpha (`opaque`) met with the current selection
+     * through `op`, or `all`, `none`, `invert`, `feather`, `expand` and `contract`. A selection that ends up empty is no
+     * selection.
+     */
+    fun select(request: JsonObject, expected: String? = null) = synchronized(lock) {
+        writable(expected)
+        validateOperationSchema(request, WorkspacePaintSessionSchemas.selection)
+        val w = imageWidth; val h = imageHeight
+        fun point(value: JsonElement): Pair<Float, Float> {
+            val n = value.jsonArray.map { it.jsonPrimitive.float }
+            require(n.size == 2 && n.all(Float::isFinite)) { "point must be [x,y]" }
+            return space.canvasToImageX(n[0]) to space.canvasToImageY(n[1])
+        }
+        val antialias = request["antialias"]?.jsonPrimitive?.boolean ?: true
+        val mode = request.getValue("mode").jsonPrimitive.content
+        val shape: PaintSelection? = when (mode) {
+            "all" -> PaintSelection.all(w, h)
+            "none" -> null
+            // Nothing selected has nothing to turn inside out; Select All is the way to everything.
+            "invert" -> selection?.inverted()
+            "feather" -> selection?.feathered(space.imageLength(request.getValue("radius").jsonPrimitive.float))
+            "expand" -> selection?.grown(space.imageLength(request.getValue("radius").jsonPrimitive.float))
+            "contract" -> selection?.grown(-space.imageLength(request.getValue("radius").jsonPrimitive.float))
+            "opaque" -> PaintSelection.opaque(buffer.workingImage)
+            "quick" -> PaintSelection.quick(buffer.workingImage, request.getValue("points").jsonArray
+                .flatMap { point(it).toList() }.toFloatArray(), space.imageLength(request.getValue("radius").jsonPrimitive.float),
+                request["tolerance"]?.jsonPrimitive?.int ?: 32)
+            "rectangle", "ellipse" -> {
+                val (x0, y0) = point(request.getValue("from")); val (x1, y1) = point(request.getValue("to"))
+                if (mode == "rectangle") PaintSelection.rectangle(w, h, x0, y0, x1, y1, antialias)
+                else PaintSelection.ellipse(w, h, x0, y0, x1, y1, antialias)
+            }
+            "lasso" -> PaintSelection.polygon(w, h, request.getValue("points").jsonArray
+                .flatMap { point(it).toList() }.toFloatArray(), antialias)
+            "wand" -> {
+                val (x, y) = point(request.getValue("point"))
+                PaintSelection.wand(buffer.workingImage, kotlin.math.floor(x).toInt(), kotlin.math.floor(y).toInt(),
+                    request["tolerance"]?.jsonPrimitive?.int ?: 32, request["contiguous"]?.jsonPrimitive?.boolean ?: true)
+            }
+            else -> throw IllegalArgumentException("Unknown selection mode: $mode")
+        }
+        val op = PaintSelectionOp.valueOf((request["op"]?.jsonPrimitive?.content ?: "replace").uppercase())
+        val current = selection
+        val next = when {
+            // These act on the selection as a whole; the op is for a shape meeting it.
+            mode in WHOLE_SELECTION_MODES -> shape
+            // Nothing selected yet: a shape added is the selection, one taken away or intersected leaves none.
+            current == null -> shape.takeIf { op == PaintSelectionOp.REPLACE || op == PaintSelectionOp.ADD }
+            else -> current.combine(requireNotNull(shape), op)
+        }
+        selection = next?.takeUnless { it.isEmpty }
+        selectionRevision++
+        changed()
     }
     fun recordStroke(name: String) = synchronized(lock) {
         writable(allowActive = true); buffer.recordStroke(name); active = false; changed()
     }
     fun abandonStroke(expected: String? = null) = synchronized(lock) {
-        writable(expected, allowActive = true); buffer.abandonStroke(); active = false; changed()
+        writable(expected, allowActive = true); buffer.abandonStroke(); active = false; lifted = false; changed()
+    }
+
+    /** What a `transform` gesture takes: the selection's bounds, else every pixel of the raster that is not transparent. */
+    private fun transformRegion(): Rectangle? =
+        selection?.bounds ?: PaintPixelTransform.contentBounds(buffer.workingImage, Rectangle(0, 0, imageWidth, imageHeight))
+
+    /**
+     * Takes what a `transform` would move off the raster while it is being placed, as Photoshop shows a free transform:
+     * a live edit, outside the history, that [abandonStroke] puts back and a `transform` gesture puts back before it
+     * lands. Null - and nothing taken - when there is nothing to move.
+     */
+    fun lift(): WorkspacePaintLift? = synchronized(lock) {
+        writable()
+        val region = transformRegion() ?: return null
+        val pixels = PaintPixelTransform.lifted(buffer.workingImage, region, selection)
+        buffer.willWrite(region)
+        PaintPixelTransform.clear(buffer.workingImage, region, selection)
+        active = true; lifted = true
+        changed()
+        WorkspacePaintLift(region, pixels)
     }
     fun gesture(request: JsonObject, name: String = request.getValue("mode").jsonPrimitive.content,
         expected: String? = null, checkpoint: () -> Unit = {}) = synchronized(lock) {
-        writable(expected)
+        val mode = request.getValue("mode").jsonPrimitive.content
+        val transform = mode == "transform"
+        writable(expected, allowActive = transform && lifted)
         validateOperationSchema(request, WorkspacePaintSessionSchemas.gesture)
+        if (lifted) { buffer.abandonStroke(); active = false; lifted = false }
+        val lockAlpha = request["lock_alpha"]?.jsonPrimitive?.boolean ?: false
+        // Keeping the alpha of what is painted while taking it away contradicts itself; the editor's eraser paints the
+        // background colour under lock transparency instead, which a public gesture asks for as a brush stroke.
+        require(!lockAlpha || (mode != "eraser" && mode != "clear")) { "lock_alpha does not apply to $mode: paint the colour with a brush instead" }
         // One tile patch is the rollback boundary for a fill, shape or complete public stroke.
+        // A transform moves the selection's pixels rather than painting inside it; with nothing to move it does nothing.
+        val area = if (transform) transformRegion() ?: run { changed(); return@synchronized } else gestureArea()
         try {
             paintRasterGesture(buffer.workingImage, request, object : WorkspaceRasterWork {
                 override fun checkpoint() = checkpoint()
                 override fun progress(fraction: Float, message: String) {}
-            }, before = { checkpoint(); buffer.willWrite(it) }, space = space)
-            checkpoint(); buffer.recordStroke(name); changed()
+            }, before = { checkpoint(); buffer.willWrite(it) }, space = space, area = area, selection = selection.takeIf { transform },
+                symmetryAxes = canvasWidth / 2f to canvasHeight / 2f)
+            // Every gesture lands through the selection, and with lock_alpha only on what is already painted.
+            if (!transform) buffer.confinePending(selection, lockAlpha)
+            checkpoint(); buffer.recordStroke(name)
+            // The selection goes where its pixels went.
+            if (transform) selection?.let { current ->
+                selection = PaintPixelTransform.mapSelection(current, rasterTransformMatrix(request, space))
+                selectionRevision++
+            }
+            changed()
         } catch (failure: Throwable) { buffer.abandonStroke(); publish(); throw failure }
+    }
+    /**
+     * What a fill, gradient or clear covers: the selection's bounds, else the layer's own area and whatever the session
+     * has painted - so a fill without a selection fills the layer rather than the whole extended raster, and a commit
+     * keeping the meshes does not split a canvas-sized layer off it. A layer with nothing on it yet takes the canvas.
+     */
+    private fun gestureArea(): Rectangle {
+        selection?.bounds?.let { return it }
+        val layer = space.layerArea()
+        val painted = buffer.touched?.let { if (layer.isEmpty) it else layer.union(it) } ?: layer
+        if (!painted.isEmpty) return painted
+        val left = kotlin.math.floor(space.canvasToImageX(0f)).toInt(); val top = kotlin.math.floor(space.canvasToImageY(0f)).toInt()
+        val right = kotlin.math.ceil(space.canvasToImageX(canvasWidth.toFloat())).toInt()
+        val bottom = kotlin.math.ceil(space.canvasToImageY(canvasHeight.toFloat())).toInt()
+        return Rectangle(left, top, right - left, bottom - top).intersection(Rectangle(0, 0, imageWidth, imageHeight))
     }
     fun undo(expected: String? = null) = synchronized(lock) { writable(expected); buffer.undo(); changed() }
     fun redo(expected: String? = null) = synchronized(lock) { writable(expected); buffer.redo(); changed() }
@@ -166,6 +308,7 @@ class WorkspacePaintSession internal constructor(
         materialId?.let { put("material_id", it) }
         put("width", width); put("height", height)
         put("canvas_rect", JsonArray(listOf(space.originX, space.originY, space.canvasWidth, space.canvasHeight).map(::JsonPrimitive)))
+        selection?.bounds?.let { put("selection", JsonArray(listOf(it.x, it.y, it.width, it.height).map(::JsonPrimitive))) }
         put("index", buffer.currentStrokeIndex)
         put("dirty", buffer.isDirty); put("active_stroke", active); put("closed", closed)
         putJsonArray("strokes") { buffer.strokeRecords.forEach { record ->
@@ -180,6 +323,8 @@ class WorkspacePaintSession internal constructor(
     companion object {
         /** The [layerId] of a session painting material item `<id>`. */
         const val MATERIAL_PREFIX = "material:"
+        /** Selection modes that change the selection as a whole; the op is for a shape meeting it. */
+        private val WHOLE_SELECTION_MODES = setOf("all", "none", "invert", "feather", "expand", "contract")
         private fun copy(image: BufferedImage) = BufferedImage(image.width, image.height, BufferedImage.TYPE_INT_ARGB).also {
             it.setRGB(0, 0, image.width, image.height, image.getRGB(0, 0, image.width, image.height, null, 0, image.width), 0, image.width)
         }

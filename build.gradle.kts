@@ -18,7 +18,7 @@ plugins {
 }
 
 group = "io.github.psd2live"
-version = "3.5.2"
+version = "3.7.0"
 
 // Cubism proprietary binaries under src/main/resources/cubism/ are opt-in only.
 // Default jars/distributions must NOT embed them. Enable with:
@@ -43,6 +43,13 @@ val hostOs = System.getProperty("os.name").lowercase().let { os ->
 	}
 }
 val hostArm = System.getProperty("os.arch").lowercase().let { it.startsWith("aarch64") || it.startsWith("arm") }
+
+// Compose refuses to package on Homebrew's JDK unless this is set. The macOS app does not use the jpackage
+// launcher (packaging/macos launches the bundled runtime itself), so that check does not apply here.
+if (hostOs == "macos") {
+	System.setProperty("compose.desktop.packaging.checkJdkVendor", "false")
+	extensions.extraProperties.set("compose.desktop.packaging.checkJdkVendor", "false")
+}
 
 kotlin {
 	jvmToolchain(21)
@@ -88,6 +95,8 @@ dependencies {
 	implementation("io.ktor:ktor-serialization-kotlinx-json")
 	runtimeOnly("org.slf4j:slf4j-nop:2.0.17")
 	implementation("net.java.dev.jna:jna:5.18.0")
+	// The main window's custom title bar on the JetBrains Runtime (Compose already brings this version).
+	implementation("org.jetbrains.runtime:jbr-api:1.9.0")
 	implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 	implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 	implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.11.0")
@@ -367,7 +376,8 @@ compose.desktop {
 			// installer is built below from the app image instead, with Inno Setup.
 			targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Deb)
 			packageName = "PSD2Live"
-			packageVersion = "3.5.2"
+			// One place bumps the version: the packages and the resource-stamped version.properties follow it.
+			packageVersion = project.version.toString()
 			description = "PSD2Live - Automated Live2D Rigging Pipeline"
 			copyright = "© 2026 PSD2Live. Licensed under GPL-3.0."
 			vendor = "PSD2Live"
@@ -377,6 +387,25 @@ compose.desktop {
 				menuGroup = "PSD2Live"
 				upgradeUuid = "8e9c4b1a-2d3e-4f5a-6b7c-8d9e0f1a2b3c"
 			}
+		}
+	}
+}
+
+// The released Windows app runs on the JetBrains Runtime: its custom title bar keeps the main window's native frame
+// (maximize, Snap, resize edges) under the app's own title bar. Other JDKs still build, test and run it, with the bar
+// drawn whole on an undecorated window, but a Windows package made on one would ship that.
+// -Ppsd2live.allowNonJbr=true packages anyway. macOS packageDmg uses whatever JDK runs Gradle: the Swift shell keeps
+// the system window frame, so the runtime does not have to be JBR.
+afterEvaluate {
+	tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>().configureEach {
+		val home = javaHome
+		val allowed = providers.gradleProperty("psd2live.allowNonJbr").map { it == "true" }.orElse(false)
+		doFirst {
+			val release = File(home.get(), "release")
+			val implementor = if (release.isFile) release.readLines().firstOrNull { it.startsWith("IMPLEMENTOR=") }.orEmpty() else ""
+			if ("JetBrains" !in implementor && !allowed.get() && hostOs != "macos") throw GradleException(
+				"Packaging needs the JetBrains Runtime 21 SDK (JBR with jpackage), not ${home.get()} ($implementor). " +
+					"Point JAVA_HOME at one, or pass -Ppsd2live.allowNonJbr=true to package with this JDK.")
 		}
 	}
 }
@@ -410,6 +439,28 @@ if (hostOs == "windows") afterEvaluate {
 		doFirst { dest.get().asFile.deleteRecursively() }
 	}
 	tasks.named("packageDistributionForCurrentOS") { dependsOn(packageExe) }
+}
+
+// macOS disk image (packageDmg): the Swift shell in packaging/macos replaces the jpackage launcher and keeps the
+// runtime that createDistributable bundled. The image matches the machine that builds it (Apple silicon or Intel).
+if (hostOs == "macos") afterEvaluate {
+	val distributions = compose.desktop.application.nativeDistributions
+	val createDistributable = tasks.named<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>("createDistributable")
+	val packageDmg = tasks.register<Exec>("packageDmg") {
+		group = "compose desktop"
+		description = "Builds a macOS .dmg whose app is the Swift shell around the bundled runtime."
+		dependsOn(createDistributable)
+		val script = file("packaging/macos/build-dmg.sh")
+		val image = createDistributable.get().destinationDir.dir("${distributions.packageName}.app")
+		val arch = if (hostArm) "arm64" else "x86_64"
+		val dmg = layout.buildDirectory.file("PSD2Live-${project.version}-macos-$arch.dmg")
+		inputs.file(script)
+		inputs.files("packaging/macos/launch.c", "packaging/macos/main.swift", "src/main/resources/icons/psd2live.png")
+		inputs.dir(image)
+		outputs.file(dmg)
+		commandLine("bash", script.absolutePath, "--image", image.get().asFile.absolutePath, "--version", project.version.toString())
+	}
+	tasks.named("packageDistributionForCurrentOS") { dependsOn(packageDmg) }
 }
 
 afterEvaluate {

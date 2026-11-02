@@ -148,7 +148,7 @@ internal class WorkspaceHost<V>(
         val result = documentCommands.execute(before.projectId, before.state, summary, edits, mutationAuthor(author),
             poses = { presentation.posesChanged(current, it) },
             beforeCommit = { _, document, model ->
-                applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+                showCommit(model, document, summary, current)
             })
         if (result.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -173,6 +173,8 @@ internal class WorkspaceHost<V>(
         val data = io.github.psd2live.project.WorkspaceAuxiliaryCodec.decode(before.auxiliary)
         val nodeIds = runtime.history(before.state).selections.mapTo(HashSet()) { it.node.id }
         val next = WorkspaceAuxiliaryEdits.apply(data, edit, before.model.rig.puppet.parameters, nodeIds)
+        // An edit that changes nothing keeps the state: no new token to reject edits in flight, no dirty project.
+        if (next == data) return@synchronized WorkspaceAuxiliarySnapshot(before.projectId, before.state, before.historyHead, data, nodeIds)
         val encoded = kotlinx.serialization.json.JsonObject(before.auxiliary + io.github.psd2live.project.WorkspaceAuxiliaryCodec.encode(next))
         val committed = runtime.updateAuxiliary(before.projectId, before.state, encoded) { _, _ ->
             presentation.savedDataInstalled(current, data, next)
@@ -248,7 +250,7 @@ internal class WorkspaceHost<V>(
         val workspaceId = commit?.workspaceId ?: current.facts().activeWorkspaceId
         val result = poseCommands.execute(captured.projectId, captured.state, workspaceId, arguments, mutationAuthor(author)) { _, document, model, pose ->
             presentation.authoredPose(current, pose, pose != PreviewSessions.read(captured.model.rig.puppet.parameters, captured.auxiliary, workspaceId), commit) {
-                if (document != captured.document) applyPreviewOrThrow(model, documentFrom(current), document, "Author pose", current)
+                if (document != captured.document) showCommit(model, document, "Author pose", current)
             }
         }
         val frame = resetAuthoredPlayback(captured.projectId, result.getValue("state").jsonPrimitive.content, current)
@@ -451,7 +453,7 @@ internal class WorkspaceHost<V>(
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         // The session checks its own lineage; the live state is never substituted for it.
         val result = skeletonDraftSessions.commit(sessionId, state, sessionState, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, "Edit skeleton", current)
+            showCommit(model, document, "Edit skeleton", current)
         }
         if (result.mutation.applied) {
             scheduleHistoryPersistence(captured.projectId)
@@ -466,6 +468,8 @@ internal class WorkspaceHost<V>(
     override fun solveSkeletonPose(request: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject = captureQueries().solveSkeletonPose(request)
 
     override fun motionClips(): List<io.github.psd2live.core.MotionClip> = captureQueries().motionClips()
+
+    override fun modelSidecars(): WorkspaceSidecars = captureQueries().modelSidecars()
 
     override suspend fun editMotion(state: String, request: kotlinx.serialization.json.JsonObject): WorkspaceMutationResult {
         var changed = emptyList<String>()
@@ -574,8 +578,11 @@ internal class WorkspaceHost<V>(
         current: V, document: WorkspaceDocument, preview: io.github.psd2live.core.RigPreviewModel,
         summary: String, author: MutationAuthor, taskId: String? = null, checkpoint: Boolean = false) =
         runtime.commitPrepared(capture.projectId, capture.state, summary, author, document, preview, taskId, checkpoint) { _, next, model ->
-            applyPreviewOrThrow(model, documentFrom(current), next, summary, current)
+            showCommit(model, next, summary, current)
         }
+    /** For tests: runs [hook] inside each commit after the presentation was shown it and before its state is published. */
+    internal fun beforePublishingForTest(hook: (() -> Unit)?) { runtime.beforePublish = hook }
+
     internal fun projectSaved(capture: ProjectCapture<V>) = runtime.saved(capture.runtimeState).also {
         // Queued after the history writes before it, which may still record the marker.
         if (runtime.state.value.capture?.dirty != true) schedulePersistence {
@@ -658,7 +665,7 @@ internal class WorkspaceHost<V>(
             runtime.install(expectedRuntime, id, document, preview, migrated?.state(),
                 auxiliary = JsonObject(auxiliaryJson(state) + ("assetCatalog" to store.existingAssetCatalog(id).encode())),
                 discardUnsaved = true, dirty = imported.dirty) {
-                if (migrated != null) applyPreviewOrThrow(preview, imported.document, document, "Recovered legacy workspace", state)
+                if (migrated != null) showCommit(preview, document, "Recovered legacy workspace", state, base = null)
             }
             discardEditorQueues()
             workspaceStore = store
@@ -689,35 +696,37 @@ internal class WorkspaceHost<V>(
     }
 
     /** Completed GUI drafts use the same candidate/rebuild/CAS boundary as application commands. */
-    override fun submitEditorDraft(projectId: String, state: String, document: WorkspaceDocument,
+    override fun submitEditorDraft(projectId: String, state: String, draft: WorkspaceEditorDraft,
                                    settingsIntents: List<kotlinx.serialization.json.JsonObject>,
                                    summary: String, author: MutationAuthor): kotlinx.coroutines.Deferred<WorkspaceMutationResult> =
-        submitDraft(projectId, state, document, summary, author) { before, model, draft ->
-            generationCommands.prepareEditorDraft(before, model, draft, settingsIntents)
+        submitDraft(projectId, state, draft, summary, author) { before, model, draft, yielded ->
+            // A yielded setting's switch is withdrawn whole: what it derives and the poses it releases go with it.
+            generationCommands.prepareEditorDraft(before, model, draft, settingsIntents.without(yielded))
         }
 
-    override fun submitEditorSettingsDraft(projectId: String, state: String, changes: List<JsonObject>,
+    override fun submitEditorSettingsDraft(projectId: String, state: String, draft: WorkspaceEditorDraft, changes: List<JsonObject>,
                                             summary: String, author: MutationAuthor): kotlinx.coroutines.Deferred<WorkspaceMutationResult> =
-        submitDraft(projectId, state, documentFrom(presentation.current()) ?: runtime.capture().document, summary, author) { before, model, _ ->
-            generationCommands.prepareSettingsDraft(before, model, changes)
+        submitDraft(projectId, state, draft, summary, author) { before, model, _, yielded ->
+            val kept = changes.without(yielded)
+            if (kept.isEmpty()) before else generationCommands.prepareSettingsDraft(before, model, kept)
         }
 
-    private fun submitDraft(projectId: String, state: String, document: WorkspaceDocument, summary: String, author: MutationAuthor,
-                            prepare: suspend (WorkspaceDraft, io.github.psd2live.core.RigPreviewModel, WorkspaceDocument) -> WorkspaceDraft): kotlinx.coroutines.Deferred<WorkspaceMutationResult> {
+    private fun List<JsonObject>.without(keys: Set<String>): List<JsonObject> =
+        if (keys.isEmpty()) this else mapNotNull { change -> JsonObject(change - keys).takeIf { it.isNotEmpty() } }
+
+    private fun submitDraft(projectId: String, state: String, editorDraft: WorkspaceEditorDraft, summary: String, author: MutationAuthor,
+                            prepare: suspend (WorkspaceDraft, io.github.psd2live.core.RigPreviewModel, WorkspaceDocument, Set<String>) -> WorkspaceDraft): kotlinx.coroutines.Deferred<WorkspaceMutationResult> {
         val expectedUi = presentation.current()
+        val document = editorDraft.document
         val submitted = draftQueue.submit(projectId, state, document, summary, author,
-            beforeCommit = { _, next, model, following ->
+            origin = editorDraft.origin, yieldedSettings = editorDraft.yieldedSettings,
+            yielded = { fields -> presentation.draftYielded(expectedUi, fields) },
+            beforeCommit = { _, next, model ->
                 val current = presentation.current()
                 check(current.facts().projectId == expectedUi.facts().projectId &&
                     current.facts().openGeneration == expectedUi.facts().openGeneration) { "Editor draft belongs to an old project load" }
-                val currentDocument = documentFrom(current) ?: document
-                if (io.github.psd2live.project.WorkspaceRevisions.of(currentDocument) == io.github.psd2live.project.WorkspaceRevisions.of(document)) {
-                    applyPreviewOrThrow(model, currentDocument, next, summary, current)
-                } else {
-                    check(following != null && io.github.psd2live.project.WorkspaceRevisions.of(currentDocument) ==
-                        io.github.psd2live.project.WorkspaceRevisions.of(following)) { "Editor draft changed before its commit" }
-                    // A later queued completion owns the visible draft. Preserve it while publishing this history step.
-                }
+                // Fields still showing this draft follow its commit; a later queued completion owns the others.
+                showCommit(model, next, summary, current, base = document)
             }, committed = { result ->
                 synchronized(historyLock) {
                     val current = presentation.current()
@@ -741,11 +750,10 @@ internal class WorkspaceHost<V>(
                     if (draftQueue.isRejectedTail(submitted)) runtime.withCapture { captured ->
                         presentation.withCurrent { current ->
                             if (captured.projectId == projectId && current.facts().projectId == expectedUi.facts().projectId &&
-                                current.facts().openGeneration == expectedUi.facts().openGeneration &&
-                                io.github.psd2live.project.WorkspaceRevisions.of(documentFrom(current) ?: document) ==
-                                    io.github.psd2live.project.WorkspaceRevisions.of(document)) {
-                                applyPreviewOrThrow(captured.model, documentFrom(current), captured.document,
-                                    failure.message ?: "Editor draft rejected", current)
+                                current.facts().openGeneration == expectedUi.facts().openGeneration) {
+                                // Withdraws the fields still showing the rejected draft; later edits stay drafts.
+                                showCommit(captured.model, captured.document, failure.message ?: "Editor draft rejected", current,
+                                    base = document)
                                 draftQueue.forgetRejected(submitted)
                             }
                         }
@@ -775,14 +783,11 @@ internal class WorkspaceHost<V>(
         val captureAuthor = mutationAuthor(if (actor == "agent") MutationAuthor.AGENT else MutationAuthor.USER)
         val state = presentation.current()
         require(!state.facts().analyzing && recoveringProjectId == null && !state.facts().canvasEditBusy) { "Workspace still has an operation in progress" }
-        val document = documentFrom(state) ?: before.document
-        val changed = io.github.psd2live.project.WorkspaceRevisions.of(document) != before.revision
-        // Preparation can suspend without holding the history lock or blocking the GUI thread.
-        val model = if (changed) previewBuilder.build(document, before.model) else before.model
-        currentCoroutineContext().ensureActive()
+        // The runtime's document is what a capture records: the editor's drafts reached it through the draft queue
+        // above, and nothing the presentation shows is written back. Only a checkpoint appends a node.
         synchronized(historyLock) {
-            val result = commitPrepared(before, state, document, model, summary,
-                captureAuthor, checkpoint = alwaysCommit)
+            val result = if (alwaysCommit) commitPrepared(before, state, before.document, before.model, summary, captureAuthor, checkpoint = true)
+                else WorkspaceCommit(before, false)
             if (result.applied) scheduleHistoryPersistence(before.projectId)
             val tasks = tasksForProject(before.projectId)
             val catalog = io.github.psd2live.project.WorkspaceAssetCatalog.read(result.capture.auxiliary)
@@ -794,11 +799,10 @@ internal class WorkspaceHost<V>(
                 if (presentation.shownHistoryHead() != captured.historyHead)
                     presentation.historyChanged(captureQueries().history())
                 presentation.withCurrent { ui ->
-                    val shown = documentFrom(ui)?.let(io.github.psd2live.project.WorkspaceRevisions::of) ?: captured.revision
-                    if (ui.facts().workspaceEditBusy || shown != captured.revision) throw WorkspaceBusy()
+                    if (ui.facts().workspaceEditBusy) throw WorkspaceBusy()
                     ProjectCapture(before.projectId, history, presentation.encode(captured, ui, checkpoint = false), tasks, workspaceStore,
                         spatialByViewId.toMap(), result.applied, captured.state,
-                        JsonObject(captured.auxiliary + ("assetCatalog" to catalog.encode())), baseline = ui,
+                        JsonObject(captured.auxiliary + ("assetCatalog" to catalog.encode())), baseline = presentation.savedView(captured, ui),
                         model = captured.model, layerVisibility = captured.document.layerVisibility)
                 }
             }
@@ -988,7 +992,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating || recoveringProjectId != null) throw WorkspaceBusy()
         val result = assetLayerCommands.execute(before.projectId, before.state, operation, summary, mutationAuthor(MutationAuthor.AGENT), taskId) {
-                _, document, model -> applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+                _, document, model -> showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1006,7 +1010,7 @@ internal class WorkspaceHost<V>(
         val ui = presentation.current()
         if (ui.facts().analyzing || ui.facts().generating) throw WorkspaceBusy()
         val result = textureCommands.execute(before.projectId, before.state, edit, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(ui), document, "Texture edit: ${edit.operation}", ui)
+            showCommit(model, document, "Texture edit: ${edit.operation}", ui)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId); presentation.historyChanged(history()); presentation.modelPublished(result.commit.capture.model)
@@ -1035,7 +1039,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = layerCommands.execute(before.projectId, before.state, operation, summary, mutationAuthor(MutationAuthor.AGENT), taskId) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1060,7 +1064,7 @@ internal class WorkspaceHost<V>(
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = generationCommands.execute(before.projectId, before.state, operation, summary, mutationAuthor(MutationAuthor.AGENT),
             poses = { presentation.posesChanged(current, it) }) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1115,7 +1119,7 @@ internal class WorkspaceHost<V>(
             if (document.rigEdits.assetLayers != before.document.rigEdits.assetLayers ||
                 document.rigEdits.calibrationLayerIds != before.document.rigEdits.calibrationLayerIds)
                 validateRegisteredNeutral(model, document.rigEdits.assetLayers.filter { (id, record) -> before.document.rigEdits.assetLayers[id] != record }.keys)
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.applied) {
             draftQueue.forgetRejected()
@@ -1175,6 +1179,11 @@ internal class WorkspaceHost<V>(
     override fun structureMeshPreview(request: JsonObject, checkpoint: () -> Unit): JsonObject =
         captureQueries().structureMeshPreview(request, checkpoint)
 
+    override fun findObjects(request: JsonObject): JsonObject = captureQueries().findObjects(request)
+
+    override fun planObjectEdit(operation: String, request: JsonObject): Pair<JsonObject, JsonObject> =
+        captureQueries().planObjectEdit(operation, request)
+
     private suspend fun partitionSource(expectedState: String, operations: List<WorkspaceDocumentOperation>, author: MutationAuthor): WorkspaceMutationResult = editMutex.withLock {
         val before = captureForMutation()
         requireExpected(expectedState, before)
@@ -1183,7 +1192,7 @@ internal class WorkspaceHost<V>(
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val summary = "Partitioned ${operations.size} source layers"
         val result = partitionCommands.execute(before.projectId, before.state, operations, summary, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1201,7 +1210,7 @@ internal class WorkspaceHost<V>(
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val summary = "Updated the generated rig"
         val result = generationUpdateCommands.execute(before.projectId, before.state, summary, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1219,7 +1228,7 @@ internal class WorkspaceHost<V>(
         val summary = "Imported ${paths.size} image layers"
         val result = imageLayerCommands.importImages(before.projectId, before.state, paths, insertion, summary,
             mutationAuthor(MutationAuthor.USER)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1272,7 +1281,7 @@ internal class WorkspaceHost<V>(
         require(session.projectId == before.projectId && session.workspaceState == state) { "Paint session belongs to another workspace state" }
         val summary = "Painted source layer "+session.layerId
         val result = paintSessions.commit(sessionId, sessionState, rebuildMesh, preserveSourceRaster, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1296,7 +1305,7 @@ internal class WorkspaceHost<V>(
         }
         val summary = "Painted source layer $layerId"
         val project: (WorkspaceCapture<io.github.psd2live.core.RigPreviewModel>, WorkspaceDocument, io.github.psd2live.core.RigPreviewModel) -> Unit = { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         val result = if (operation != null) rasterCommands.execute(before.projectId, before.state, operation, summary,
             mutationAuthor(MutationAuthor.AGENT), beforeCommit = project)
@@ -1320,10 +1329,14 @@ internal class WorkspaceHost<V>(
 
     override fun listInteriorEffects() = captureQueries().listInteriorEffects()
     override fun listSwings() = captureQueries().listSwings()
+    override fun hitAreas() = captureQueries().hitAreas()
+    override fun hitAreaModel() = captureQueries().hitAreaModel()
     override fun layoutState() = captureQueries().layoutState()
+    override fun rigModules() = captureQueries().rigModules()
 
     override fun generatedOverrideIssues() = captureQueries().generatedOverrideIssues()
     override fun supersededEntryNotes() = captureQueries().supersededEntryNotes()
+    override fun seeThroughNotes() = captureQueries().seeThroughNotes()
     override fun regenerationIssues() = captureQueries().regenerationIssues()
     override fun skeletonBindingIssues() = captureQueries().skeletonBindingIssues()
     override fun staleRegenerations() = captureQueries().staleRegenerations()
@@ -1339,7 +1352,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = simulationCommands.execute(before.projectId, before.state, operation, summary, mutationAuthor(author), taskId, autoBake) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1403,7 +1416,7 @@ internal class WorkspaceHost<V>(
         requireExpected(arguments.getValue("state").jsonPrimitive.content, capture)
         val current = presentation.current()
         val result = swingSessions.execute(capture.projectId, capture.state, current.facts().activeWorkspaceId, arguments, mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, "Set swing preview", current)
+            showCommit(model, document, "Set swing preview", current)
         }
         presentation.swingPreview(result)
         if (arguments.getValue("mode").jsonPrimitive.content == "commit") {
@@ -1499,7 +1512,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = warpControlCommands.execute(before.projectId, before.state, WorkspaceDocumentOperation(operation, request), mutationAuthor(author)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, "Edit Warp controls", current)
+            showCommit(model, document, "Edit Warp controls", current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1516,7 +1529,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = warpCommands.execute(before.projectId, before.state, request, mutationAuthor(MutationAuthor.AGENT)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, "Created independent Warp", current)
+            showCommit(model, document, "Created independent Warp", current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1565,7 +1578,7 @@ internal class WorkspaceHost<V>(
         val current = presentation.current()
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val result = physicsCommands.execute(before.projectId, before.state, operation, summary, mutationAuthor(MutationAuthor.AGENT), taskId) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1583,7 +1596,7 @@ internal class WorkspaceHost<V>(
         if (current.facts().analyzing || current.facts().generating) throw WorkspaceBusy()
         val summary = "Edit physics group"
         val result = physicsCommands.executeIntent(before.projectId, before.state, intent, summary, mutationAuthor(MutationAuthor.USER)) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         }
         if (result.commit.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1624,7 +1637,7 @@ internal class WorkspaceHost<V>(
             if (document.rigEdits.assetLayers != before.document.rigEdits.assetLayers ||
                 document.rigEdits.calibrationLayerIds != before.document.rigEdits.calibrationLayerIds)
                 validateRegisteredNeutral(model, document.rigEdits.assetLayers.filter { (id, record) -> before.document.rigEdits.assetLayers[id] != record }.keys)
-            applyPreviewOrThrow(model, documentFrom(current), document, summary, current)
+            showCommit(model, document, summary, current)
         })
         if (result.applied) {
             scheduleHistoryPersistence(before.projectId)
@@ -1642,8 +1655,7 @@ internal class WorkspaceHost<V>(
         val before = captureForMutation()
         val current = presentation.current()
         val selected = runtime.checkout(before.projectId, before.state, nodeId) { _, document, model ->
-            applyPreviewOrThrow(model, documentFrom(current), document, "Checked out history node $nodeId", current,
-                restoreCheckedOutPose = true)
+            showCommit(model, document, "Checked out history node $nodeId", current, restoreCheckedOutPose = true, base = null)
         }
         discardEditorQueues()
         scheduleHistoryPersistence(before.projectId)
@@ -1652,9 +1664,6 @@ internal class WorkspaceHost<V>(
             applied = before.historyHead != selected.historyHead, state = selected.state, projectId = selected.projectId)
     }
 
-
-	/** The document the presentation shows, or null when it shows the runtime's. */
-	private fun documentFrom(state: V): WorkspaceDocument? = presentation.document(state)
 
 
 	private fun tasksForProject(projectId: String): List<WorkspaceTaskSnapshot> = synchronized(historyLock) {
@@ -1715,9 +1724,7 @@ internal class WorkspaceHost<V>(
         if (isClosed.get()) return
         val read = runtime.read()
         val capture = read.runtime.capture ?: return
-        val shown = documentFrom(state) ?: return
-        if (capture.projectId == state.facts().projectId && io.github.psd2live.project.WorkspaceRevisions.of(shown) == capture.revision)
-            scheduleRecoveryCheckpoint(read)
+        if (capture.projectId == state.facts().projectId) scheduleRecoveryCheckpoint(read)
     }
 
     /**
@@ -1755,18 +1762,18 @@ internal class WorkspaceHost<V>(
         }
     }
 
-	private fun applyPreviewOrThrow(
-		preview: io.github.psd2live.core.RigPreviewModel,
-		expected: WorkspaceDocument?,
-		next: WorkspaceDocument,
-		status: String,
-        expectedUi: V = presentation.current(),
+    /**
+     * Shows a commit to the presentation inside the runtime's commit. [base] is the document the presentation's
+     * untouched fields mirror: the runtime's before this commit unless the caller says otherwise.
+     */
+    private fun showCommit(
+        preview: io.github.psd2live.core.RigPreviewModel,
+        next: WorkspaceDocument,
+        status: String,
+        view: V = presentation.current(),
         restoreCheckedOutPose: Boolean = false,
-	) {
-		if (!presentation.project(expectedUi, preview, expected, next, status, restoreCheckedOutPose)) {
-			throw IllegalStateException("Workspace changed while the operation was being built; retry from current state")
-		}
-	}
+        base: WorkspaceDocument? = runtime.capture().document,
+    ) = presentation.show(view, preview, base, next, status, restoreCheckedOutPose)
 
     private val repository = io.github.psd2live.project.ProjectRepository()
     private val saves = Mutex()

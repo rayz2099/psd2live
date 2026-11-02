@@ -128,6 +128,7 @@ class PaintSession(val handle: WorkspacePaintSession) {
         sync(); markDirty(Rectangle(0, 0, docWidth, docHeight)); refreshPreview()
     }
     private fun sync() {
+        syncSelection()
         isDirty = handle.isDirty && !handle.finished
         currentStrokeIndex = handle.index
         val next = handle.strokes.map { PaintStrokeRecord(it.id,
@@ -169,7 +170,10 @@ class PaintSession(val handle: WorkspacePaintSession) {
     }
     internal fun beginStroke() = handle.beginStroke()
     internal fun segment(x0: Float, y0: Float, x1: Float, y1: Float, tip: RasterPaintEngine.Tip,
-        color: Color, opacity: Float, erase: Boolean) = handle.segment(x0, y0, x1, y1, tip, color.toArgb(), opacity, erase)
+        color: Color, opacity: Float, erase: Boolean, lockAlpha: Boolean = false) =
+        handle.segment(x0, y0, x1, y1, tip, color.toArgb(), opacity, erase, lockAlpha)
+    internal fun blurSegment(x0: Float, y0: Float, x1: Float, y1: Float, tip: RasterPaintEngine.Tip, strength: Float) =
+        handle.blurSegment(x0, y0, x1, y1, tip, strength)
     internal fun abandonStroke() = handle.abandonStroke()
     fun recordStroke(name: String) = handle.recordStroke(name)
     fun canUndo() = handle.canUndo()
@@ -181,17 +185,57 @@ class PaintSession(val handle: WorkspacePaintSession) {
     fun dismiss() { handle.dismiss(); detach() }
     fun sample(x: Int, y: Int) = handle.sample(x, y)
     fun clear(name: String) = handle.gesture(buildJsonObject { put("mode", "clear") }, name)
-    fun bucket(x: Int, y: Int, color: Color, tolerance: Int, name: String) =
+    fun bucket(x: Int, y: Int, color: Color, tolerance: Int, name: String, contiguous: Boolean = true, lockAlpha: Boolean = false) =
         handle.gesture(buildJsonObject {
             put("mode", "bucket"); put("point", JsonArray(listOf(JsonPrimitive(x), JsonPrimitive(y))))
-            put("tolerance", tolerance); put("color", rgba(color))
+            put("tolerance", tolerance); put("color", rgba(color)); put("contiguous", contiguous); put("lock_alpha", lockAlpha)
         }, name)
     fun shape(x0: Int, y0: Int, x1: Int, y1: Int, shape: PaintShape, color: Color, opacity: Float,
-        strokeWidth: Float, filled: Boolean, name: String) = handle.gesture(buildJsonObject {
+        strokeWidth: Float, filled: Boolean, name: String, lockAlpha: Boolean = false) = handle.gesture(buildJsonObject {
             put("mode", "shape"); put("from", JsonArray(listOf(JsonPrimitive(x0), JsonPrimitive(y0))))
             put("to", JsonArray(listOf(JsonPrimitive(x1), JsonPrimitive(y1)))); put("shape", shape.name.lowercase())
             put("color", rgba(color)); put("opacity", opacity); put("stroke_width", strokeWidth); put("filled", filled)
+            put("lock_alpha", lockAlpha)
         }, name)
+    /** Fills the selection - the whole layer without one - with [color]. */
+    fun fill(color: Color, opacity: Float, name: String, lockAlpha: Boolean = false) = handle.gesture(buildJsonObject {
+        put("mode", "fill"); put("color", rgba(color)); put("opacity", opacity); put("lock_alpha", lockAlpha)
+    }, name)
+    fun gradient(x0: Float, y0: Float, x1: Float, y1: Float, from: Color, to: Color, radial: Boolean, opacity: Float,
+        name: String, lockAlpha: Boolean = false) = handle.gesture(buildJsonObject {
+        put("mode", "gradient"); put("from", JsonArray(listOf(JsonPrimitive(x0), JsonPrimitive(y0))))
+        put("to", JsonArray(listOf(JsonPrimitive(x1), JsonPrimitive(y1)))); put("color", rgba(from)); put("end_color", rgba(to))
+        put("kind", if (radial) "radial" else "linear"); put("opacity", opacity); put("lock_alpha", lockAlpha)
+    }, name)
+    /** Takes the selection's pixels - the layer's without one - off the raster for a free transform; null with nothing to take. */
+    internal fun lift() = handle.lift()
+    /** Lays the lifted pixels down through [matrix], in the layer's frame, as one stroke. */
+    fun transform(matrix: io.github.psd2live.project.LayerTransform, smooth: Boolean, name: String) = handle.gesture(buildJsonObject {
+        put("mode", "transform"); put("matrix", JsonArray(matrix.toList().map(::JsonPrimitive))); put("smooth", smooth)
+    }, name)
+    /** Changes the selection with one [io.github.psd2live.application.WorkspacePaintSessionSchemas.selection] request. */
+    fun select(request: JsonObject) = handle.select(request)
+    /** Whether the session has a selection - which may be too faint to have an edge ([selectionOutline] empty). */
+    val hasSelection: Boolean get() = selectionBounds != null
+
+    /** The selection's bounds in raster pixels, or null without one. */
+    var selectionBounds by mutableStateOf<Rectangle?>(null)
+        private set
+
+    /**
+     * The selection's edge in raster pixels ([io.github.psd2live.core.PaintSelection.outline]), traced again only
+     * when the selection changes: a stroke does not touch it.
+     */
+    var selectionOutline by mutableStateOf(FloatArray(0))
+        private set
+    private var outlineRevision = -1
+    private fun syncSelection() {
+        val revision = handle.selectionRevision
+        if (revision == outlineRevision) return
+        outlineRevision = revision
+        selectionBounds = handle.selectionBounds
+        selectionOutline = handle.selectionOutline()
+    }
     private fun rgba(color: Color): JsonArray {
         val argb = color.toArgb()
         return JsonArray(listOf(argb ushr 16 and 255, argb ushr 8 and 255, argb and 255, argb ushr 24 and 255).map(::JsonPrimitive))

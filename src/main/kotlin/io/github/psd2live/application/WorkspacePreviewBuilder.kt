@@ -56,7 +56,7 @@ internal class WorkspacePreviewBuilder {
         val sameLayers = current.analysis.source.layers.size == layers.size && current.analysis.source.layers.all { it.id.raw in layers }
         if (sameLayers && !RigGenerationChange.changed(current, config)) return document
         val pins = document.rigEdits.splitDrawableIds
-        val owned = current.rig.layerIdByDrawableId.entries.groupBy({ it.value }, { it.key })
+        val owned = current.stableLayerIdByDrawableId.entries.groupBy({ it.value }, { it.key })
         val added = owned.filter { (layer, meshes) -> layer !in pins && meshes.size == 1 &&
             (layer in layers || layers.any { layer.startsWith("$it:") }) }.mapValues { it.value.single() }
         if (added.isEmpty()) return document
@@ -64,15 +64,10 @@ internal class WorkspacePreviewBuilder {
     }
 
     /**
-     * Persist the generation baseline and ordered topology migration together with the settings. Generation reads the
-     * document without its pending layers ([WorkspaceLayoutPreview.base]) against the generated model; a project not
-     * generated yet has nothing to normalize, and its first generation builds from scratch.
+     * Persist the generation baseline and ordered topology migration together with the settings, for every workspace.
      */
     suspend fun normalizeMeshEdits(input: WorkspaceDocument, current: RigPreviewModel): WorkspaceDocument {
-        if (!input.layout.generation.generated || current.layoutPreview) return input
-        WorkspaceLayoutPreview.requireNoPendingMeshEdits(current.config.rigEdits, input.rigEdits)
-        if (!WorkspaceLayoutPreview.active(input)) return normalizeGenerated(input, current.generated)
-        return WorkspaceLayoutPreview.restore(input, normalizeGenerated(WorkspaceLayoutPreview.base(input), current.generated))
+        return normalizeGenerated(input, current)
     }
 
     private suspend fun normalizeGenerated(input: WorkspaceDocument, current: RigPreviewModel): WorkspaceDocument {
@@ -214,40 +209,33 @@ internal class WorkspacePreviewBuilder {
         val after = document.source.layers.associateBy { it.id.raw }
         val created = io.github.psd2live.core.RigGenerationSource.createdCoverage(config.rigEdits).keys +
             io.github.psd2live.core.RigGenerationSource.createdCoverage(current.config.rigEdits).keys
+        // Reference layers stay out of generation: their opacity is the only source field an edit may change.
+        val references = document.layout.referenceLayerIds
         for ((id, layer) in after) {
             val old = before[id] ?: if (id in created) continue else return false
             if (old !== layer && old != layer && !(old is io.github.psd2live.project.WorkspaceSourceLayer && layer is io.github.psd2live.project.WorkspaceSourceLayer &&
-                    old.copy(layerTransform = null, order = 0) == layer.copy(layerTransform = null, order = 0) && (id in created || old.order == layer.order))) return false
+                    (id in created || old.order == layer.order) &&
+                    (old.copy(layerTransform = null, order = 0) == layer.copy(layerTransform = null, order = 0) ||
+                        (id in references && old.copy(layerTransform = null, order = 0, opacity = layer.opacity) ==
+                            layer.copy(layerTransform = null, order = 0))))) return false
         }
         return before.keys.all { it in after || it in created }
     }
 
     /**
-     * The model of [document]. Its generated layers build as always, against [current]'s generated model; layers the
-     * generators do not read yet show over them as plain meshes ([WorkspaceLayoutPreview]).
+     * The complete editable model of [document], with ordinary ordered replay for all layers.
      */
     suspend fun build(document: WorkspaceDocument, current: RigPreviewModel? = null,
                       legacyDrawOrders: Map<String, Float> = current?.config?.drawOrderOverrides.orEmpty()): RigPreviewModel =
         // The reference layers in the model sit in its guide-image part.
-        WorkspaceReferenceMeshes.sketched(buildPreview(document, current, legacyDrawOrders), document)
-
-    private suspend fun buildPreview(document: WorkspaceDocument, current: RigPreviewModel?, legacyDrawOrders: Map<String, Float>): RigPreviewModel {
-        val context = currentCoroutineContext()
-        if (!document.layout.generation.generated) return runInterruptible(Dispatchers.Default) {
-            WorkspaceLayoutPreview.ungenerated(document) { context.ensureActive() }
-        }
-        val previous = current?.takeUnless { it.layoutPreview }?.generated
-        if (!WorkspaceLayoutPreview.active(document)) return buildGenerated(document, previous, legacyDrawOrders)
-        val base = buildGenerated(WorkspaceLayoutPreview.base(document), previous, legacyDrawOrders)
-        return runInterruptible(Dispatchers.Default) { WorkspaceLayoutPreview.augment(base, document) { context.ensureActive() } }
-    }
+        WorkspaceReferenceMeshes.sketched(buildGenerated(document, current, legacyDrawOrders), document)
 
     private suspend fun buildGenerated(document: WorkspaceDocument, current: RigPreviewModel?,
                                        legacyDrawOrders: Map<String, Float>): RigPreviewModel =
         importedRecordsCheckpointed(buildModel(document, current, legacyDrawOrders), current).let { model ->
             // A model reused across a layer move carries the moved layers, so the canvas and paint read where they now are.
             if (model.analysis.source !== document.source && model.analysis.source != document.source &&
-                pipeline.sameArt(model.analysis.source, document.source)) model.copy(analysis = model.analysis.copy(source = document.source))
+                pipeline.sameArt(model.analysis.source, document.source, document.layout.referenceLayerIds)) model.copy(analysis = model.analysis.copy(source = document.source))
             else model
         }
 
@@ -262,7 +250,7 @@ internal class WorkspacePreviewBuilder {
                 else decoded.copy(drawOrderOverrides = legacyDrawOrders)
             val materializable = pipeline.materializable(config)
             val revision = if (materializable) WorkspaceRevisions.of(document) else null
-            val fast = current != null && pipeline.canFastUpdateRig(current, document.source, config)
+            val fast = current != null && pipeline.canFastUpdateRig(current, document.source, config, document.layout.referenceLayerIds)
             // A revision built before - in this process or by whoever saved the archive - builds from its authored rig,
             // unless the current model updates more cheaply: entries added to its journal act on its authored rig, any other
             // edit of a checkpointed journal replays the entries after the checkpoint, and with its base at hand an edit of
@@ -315,7 +303,9 @@ internal class WorkspacePreviewBuilder {
                 current != null && (current.analysis.source === document.source || current.analysis.source == document.source) &&
                     current.config.copy(parentOverrides = config.parentOverrides, rigEdits = config.rigEdits,
                         drawOrderOverrides = config.drawOrderOverrides, hairSimulationFront = config.hairSimulationFront,
-                        hairSimulationBack = config.hairSimulationBack) == config -> pipeline.rebuildPreview(current, config, progress)
+                        hairSimulationBack = config.hairSimulationBack, seeThroughBrows = config.seeThroughBrows,
+                        seeThroughEyes = config.seeThroughEyes, seeThroughOpacity = config.seeThroughOpacity) == config ->
+                    pipeline.rebuildPreview(current, config, progress)
                 // A source edit (paint, image replace, their undo) rebuilds in full; the current atlas only lends
                 // the pages and preview PNG strips its pixels did not change.
                 else -> pipeline.buildPreview(document.source, config, progress, current?.atlas)

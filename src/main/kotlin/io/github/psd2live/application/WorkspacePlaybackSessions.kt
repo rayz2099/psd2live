@@ -171,7 +171,7 @@ internal class WorkspacePlaybackSessions(private val runtime: WorkspaceRuntime<R
             val oneShot = session.motionId?.let { clip(capture, it) }?.let { MotionClips.sampleAll(it, session.motionTime.toDouble(), false) }.orEmpty()
             val generated = session.animationClock.sample(capture.model, true, false, oneShot)
             boundedPreviewPose(pose.values + generated.filterKeys { it !in pose.locked }, capture.model.rig.puppet.parameters)
-        } else sample(capture.model, pose, clip, session.time)
+        } else sample(capture.model, pose, clip, session.time, frozen = frozen(capture, clip))
         val values = pointerPreviewPose(base, session.pointer?.first ?: 0f, session.pointer?.second ?: 0f,
             capture.model.rig.puppet.parameters, session.tracking && session.pointer != null, pose.locked,
             session.trackingClock.takeIf { session.smoothTracking })
@@ -186,13 +186,29 @@ internal class WorkspacePlaybackSessions(private val runtime: WorkspaceRuntime<R
         putJsonObject("values") { values.forEach { (id, value) -> put(id.raw, value) } }
     }
 
+    /** The last record decoded: playback asks every frame, and the record changes only with an auxiliary edit. */
+    @Volatile private var decodedAids: Pair<JsonElement?, io.github.psd2live.project.TimelineAids>? = null
+
+    private fun timelineAids(record: JsonElement?): io.github.psd2live.project.TimelineAids {
+        decodedAids?.let { (source, aids) -> if (source === record) return aids }
+        return io.github.psd2live.project.TimelineAidsCodec.decode(record).also { decodedAids = record to it }
+    }
+
+    /** The tracks of [clip] the motion editor froze: they hold their value while the clip plays or scrubs. */
+    private fun frozen(capture: WorkspaceCapture<RigPreviewModel>, clip: MotionClip?): Map<ParameterId, Float> {
+        if (clip == null) return emptyMap()
+        val aids = timelineAids(capture.auxiliary[io.github.psd2live.project.TimelineAidsCodec.KEY])
+        return aids.clip(io.github.psd2live.project.TimelineAids.keyOf(clip.id, clip.builtin)).frozen
+            .filterKeys { id -> clip.curve(id) != null }.mapKeys { ParameterId(it.key) }
+    }
+
     private fun clip(capture: WorkspaceCapture<RigPreviewModel>, id: String): MotionClip? {
         val document = capture.document
         return document.rigEdits.motionClips.firstOrNull { it.id == id && (it.builtin == null || enabled(capture, it.builtin)) }
             ?: id.takeIf { it.startsWith("preset:") }?.removePrefix("preset:")?.let { name ->
                 if (name !in MotionClips.BUILTIN_NAMES || !enabled(capture, name)) null
                 else MotionClips.overrideOf(document.rigEdits.motionClips, name) ?: MotionPresets.clip(id, name,
-                    document.rigEdits.skeleton, document.rigEdits.motionPresets[name] ?: MotionPresetSettings())
+                    document.rigEdits.skeleton, MotionPresetSettings.of(capture.model.config, name), document.rigEdits.idRenames.parameters)
             }
     }
 
@@ -206,7 +222,8 @@ internal class WorkspacePlaybackSessions(private val runtime: WorkspaceRuntime<R
 
     private fun motionId(capture: WorkspaceCapture<RigPreviewModel>, name: String): String {
         val clips = capture.document.rigEdits.motionClips
-        return OneShotMotionPlayer.clipOf(name, capture.document.rigEdits.skeleton, clips, capture.document.rigEdits.motionPresets)
+        return OneShotMotionPlayer.clipOf(name, capture.document.rigEdits.skeleton, clips, capture.document.rigEdits.motionPresets,
+            capture.document.rigEdits.idRenames.parameters)
             ?.takeIf { resolved -> clips.any { it.id == resolved.id } }?.id
             ?: clips.firstOrNull { it.id == name }?.id
             ?: MotionClips.BUILTIN_NAMES.firstOrNull { it.equals(name, true) }?.let { "preset:$it" }
@@ -222,9 +239,10 @@ internal class WorkspacePlaybackSessions(private val runtime: WorkspaceRuntime<R
 
         /** GUI scrubbing and process sessions use the same bounded, lock-aware frame composition. */
         fun sample(model: RigPreviewModel, pose: WorkspacePose, clip: MotionClip?, time: Float,
-                   tracking: Boolean = false, pointer: Pair<Float, Float>? = null): Map<ParameterId, Float> {
+                   tracking: Boolean = false, pointer: Pair<Float, Float>? = null,
+                   frozen: Map<ParameterId, Float> = emptyMap()): Map<ParameterId, Float> {
             require(time.isFinite() && time >= 0f)
-            val motion = clip?.let { MotionClips.sampleAll(it, time.toDouble(), loop = false) }.orEmpty()
+            val motion = (clip?.let { MotionClips.sampleAll(it, time.toDouble(), loop = false) }.orEmpty() + frozen)
                 .filterKeys { it !in pose.locked }
             return pointerPreviewPose(pose.values + motion, pointer?.first ?: 0f, pointer?.second ?: 0f,
                 model.rig.puppet.parameters, tracking && pointer != null, pose.locked)

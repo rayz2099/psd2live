@@ -91,6 +91,7 @@ import io.github.psd2live.ui.tutorial.tutorialTarget
 import io.github.psd2live.ui.views.BrushShapeIcon
 import io.github.psd2live.ui.views.GlueSubToolIcon
 import io.github.psd2live.ui.views.PaintShapeIcon
+import io.github.psd2live.ui.views.PaintSelectShapeIcon
 import io.github.psd2live.ui.views.SkeletonEditSubToolIcon
 import io.github.psd2live.ui.views.SkeletonPoseSubToolIcon
 import io.github.psd2live.ui.views.VertexGroupKindIcon
@@ -174,7 +175,7 @@ private fun BarOption(editor: CanvasEditor, option: ToolOption, focus: () -> Uni
             valueRange = option.range(editor),
             scrub = { start, dx -> option.scrubbed(start, dx, editor.brushSizeLimit) },
             logarithmic = option.logarithmic,
-            onCommit = focus,
+            onCommit = { option.finish?.invoke(editor); focus() },
             rise = true,
         )
         is ChoiceOption<*> -> BarChoice(editor, option, focus)
@@ -458,6 +459,7 @@ private fun <T> MenuChoiceRadios(editor: CanvasEditor, option: ChoiceOption<T>) 
 
 /** Whether [choice] has a drawing of its own: the variants of the tools, and the falloff curves. */
 private fun choiceHasIcon(choice: Any?): Boolean = choice is BrushShape || choice is PaintShape || choice is GlueSubTool ||
+    choice is io.github.psd2live.ui.PaintSelectShape ||
     choice is SkeletonEditSubTool || choice is SkeletonPoseSubTool || choice is VertexGroupKind || choice is BrushFalloff
 
 @Composable
@@ -465,6 +467,7 @@ private fun ChoiceIcon(choice: Any?, tint: Color) {
     when (choice) {
         is BrushShape -> BrushShapeIcon(choice, tint)
         is PaintShape -> PaintShapeIcon(choice, tint)
+        is io.github.psd2live.ui.PaintSelectShape -> PaintSelectShapeIcon(choice, tint)
         is GlueSubTool -> GlueSubToolIcon(choice, tint)
         is SkeletonEditSubTool -> SkeletonEditSubToolIcon(choice, tint)
         is SkeletonPoseSubTool -> SkeletonPoseSubToolIcon(choice, tint)
@@ -538,6 +541,12 @@ internal fun OptionIconView(icon: OptionIcon, tint: Color) {
             shape(path { m(6.6f, 4f); l(6.6f, 14f); l(1.8f, 14f); z() })
             outline(path { m(11.4f, 4f); l(11.4f, 14f); l(16.2f, 14f); z() })
         }
+        // A shape between two keys: a square at the key between two dots on its track.
+        OptionIcon.KEYFORM -> GridIcon(modifier, tint) { line(1.8f, 9f, 16.2f, 9f, ICON_FINE); dot(3f, 9f, 1.6f); dot(15f, 9f, 1.6f); fillBox(6.4f, 6.4f, 5.2f, 5.2f, 1f) }
+        // A clipboard.
+        OptionIcon.KEYFORM_PASTE -> GridIcon(modifier, tint) { box(3.4f, 3.6f, 11.2f, 12.6f, 1.6f, ICON_FINE); fillBox(6.4f, 1.8f, 5.2f, 3.4f, 1f) }
+        // The key between two others, hollow, on the line from one to the other.
+        OptionIcon.INTERPOLATE -> GridIcon(modifier, tint) { line(4.6f, 9f, 13.4f, 9f, ICON_FINE); dot(3f, 9f, 1.8f); dot(15f, 9f, 1.8f); ring(9f, 9f, 2.4f, ICON_FINE) }
     }
 }
 

@@ -16,7 +16,7 @@
 | `:targets:gltf` | `gltf`：glTF 2.0 二进制（`.glb`），变形按参数关键点烘焙为变形目标，由宿主提供的几何求值器采样 | MIT |
 | `:targets:unity` | `unity`：Unity 预制体（`.p2lunity` + 贴图 + Editor 导入脚本），参数关键点烘焙为 Blend Shape，动作写成 Animator 片段 | MIT |
 | `:targets:web` | `web`：网页播放器（运行时的 WebAssembly 构建、WebGL 播放脚本、页面与模型） | MIT |
-| `:targets:cubism` | `PuppetModel` 与 IR 的双向转换器（`PuppetIr`）、`moc3`、`cmo3`、`vtube-studio`、motion3 / physics3 写出 | GPL-3 |
+| `:targets:cubism` | `PuppetModel` 与 IR 的双向转换器（`PuppetIr`）、`moc3`、`cmo3`、`vtube-studio`、motion3 / physics3 / exp3 / pose3 写出 | GPL-3 |
 | `:targets:psd` | `psd-pose`：指定姿势的分层 PSD | GPL-3 |
 | 根项目 | `RigIrCompiler`（预览模型 → IR）、`IrFrameRenderer`（宿主提供的渲染器）、`ExportService`、CLI 与界面 | GPL-3 |
 
@@ -27,6 +27,7 @@ MIT 模块不依赖任何 GPL 模块，由 Gradle 依赖关系在编译期保证
 - 网格的静止位置与各变形器的关键形都在父变形器的空间中：根部为画布像素（y 向下），Warp 子对象为其 0–1 格子空间，旋转子对象为其局部像素坐标。
 - 所有 ID 稳定，重新生成后不变。
 - 动作片段已经从预设编译成参数曲线；Bezier 段的控制点时间限制在段内，按时间线性推进曲线参数求值（与 Cubism 的 `AreBeziersRestricted` 一致）。
+- 表情、姿势与动作事件来自工程（`RigEditOverlay.expressions` / `pose`、`MotionClip.events`，见[表情、姿势与事件](#表情姿势与事件)），编译时去掉模型中已不存在的参数与部件；表情和姿势在 `advanced` 中，片段事件在 `Clip.events` 中。
 - `restPose` 给出需要画布空间基础网格的格式烘焙基础网格时使用的参数值（例如嘴保持张开，使纹理坐标覆盖整幅图）。
 - `PuppetIr` 双向无损：`toPuppet(toIr(model))` 与原模型逐字段一致。两边新增字段时须在同一改动中更新转换器。
 
@@ -36,16 +37,16 @@ MIT 模块不依赖任何 GPL 模块，由 Gradle 依赖关系在编译期保证
 
 | ID | 类别 | 输出 | 主要损失 |
 | --- | --- | --- | --- |
-| `moc3` | 结构化绑定 | `.moc3`、model3、physics3、motion3、cdi3、贴图 | 按目标运行时版本剥离不支持的功能 |
-| `cmo3` | 结构化绑定 | Cubism Editor 工程；有动作片段时另写同名 `.can3`（Cubism Animator 工程） | 生成器意图不保留；动作片段中眨眼、口型效果曲线不写入（见 [Cubism Animator](#cubism-animator)） |
+| `moc3` | 结构化绑定 | `.moc3`、model3、physics3、motion3、exp3、pose3、cdi3、userdata3、贴图 | 按目标运行时版本剥离不支持的功能；Cubism 5.3 的混合模式在更早的版本改为最接近的旧模式（滤色与加算类为加算，乘算类为乘算，其余为普通，Alpha 混合改为 over），每个受影响的网格与隔离部件按 ID 记一条 `blend_mode` 损失（默认 `approximated`，可由导出选项改写），注明改成的模式（`cmo3`、`vtube-studio` 按同一目标版本相同处理）；多网格的[点击区域](#点击区域)拆成同名多项 |
+| `cmo3` | 结构化绑定 | Cubism Editor 工程；有动作片段时另写同名 `.can3`（Cubism Animator 工程）；参数循环写入 `isRepeat`（Cubism 5.3 目标，更早的目标去掉并列入损失报告） | 生成器意图不保留；动作片段中眨眼、口型效果曲线不写入（见 [Cubism Animator](#cubism-animator)）；表情与姿势不写入（记为 `structure` / `dropped`） |
 | `dragonbones` | 结构化绑定 | `_ske.json`、每页 `_tex_<i>.json` 与贴图 | 与 Spine 相同的参数动画与片段烘焙；关键点取整到帧；透明度以整百分比记录；运行时以 16 位偏移寻址每个动画的变形数据，超出时按更大容差精简并报告（骨架模型的整身片段误差较大）；遮罩、屏幕色、物理未写入 |
-| `vtube-studio` | 结构化绑定 | `moc3` 的全部文件 + `.vtube.json` | 同 `moc3`；面部跟踪只映射标准参数（头、身体、眼、视线、眉、嘴、呼吸），每个动作片段一个热键；其余设置由 VTube Studio 取默认值 |
+| `vtube-studio` | 结构化绑定 | `moc3` 的全部文件 + `.vtube.json` | 同 `moc3`；面部跟踪映射标准参数（头、身体、眼、视线、眉、嘴、呼吸），每个动作片段一个热键、每个表情一个 `ToggleExpression` 热键；其余设置由 VTube Studio 取默认值。用 Rig 模块生成的模型（带模块参数）映射另行调过：身体随头转动并加大平滑，略晚一拍；眼睛开合有死区与饱和并夹紧（可睁大到 2 的眼睛不会被普通睁眼撑大）；嘴开合过驱，嘴形中间有死区；嘴角笑容带笑眼；面捕的歪嘴、鼓腮接到对应参数 |
 | `spine` | 结构化绑定 | 骨骼 JSON 或 `.skel`、`.atlas`、贴图页 | 旋转变形器成为骨骼链，网格挂在最近的旋转骨骼上；每个参数成为一段 1 秒动画（时间即参数归一化值），键入骨骼变换与骨骼空间内的变形，交叉项按 Spine 骨骼运算测量并报告；动作片段按帧采样后精简关键帧；无 Warp、混合形、Glue（已烘焙）；遮罩转为按轮廓多边形裁剪（反相遮罩丢弃）；驱动骨骼旋转的摆锤转为物理约束（近似），其余物理与屏幕色未写入 |
 | `p2lrt` | 结构化绑定 | `.p2lrt`（PSD2Live 运行时） | 编辑器附带数据（来源图层、图块、编辑路径）不写入；GPU 绘制由宿主完成，运行时的 `p2l_render`（ABI 1.3 起）可在 CPU 上画出遮罩与全部合成模式 |
 | `web` | 结构化绑定 | `index.html`、`p2l.js`、`p2l_runtime.wasm`、`.p2lrt` | 按运行时头文件的合成规则绘制全部颜色与 Alpha 混合模式（需要读取下层的模式复制网格下方像素后在着色器中合成）和隔离组（子网格先画入图层，再按组的不透明度、乘算/屏幕色、遮罩与混合模式合成）；遮罩（含组遮罩）以模板缓冲近似，纹素不透明度 ≥ 0.5 视为覆盖；无法创建图层帧缓冲时隔离组按直通绘制；需通过 http 访问 |
 | `gltf` | 结构化绑定 | `.glb`（无光照材质、变形目标、权重动画） | 每个参数关键点一个变形目标，参数组合为叠加近似并报告误差；绘制顺序按静止值以深度分层；遮罩、混合模式、按参数变化的透明度与物理不写入 |
 | `unity` | 结构化绑定 | `.p2lunity`、贴图页、一次性安装脚本 | 需要 Unity 6.0（6000.0）或更高。绘制顺序上相邻且同一张贴图的网格合成一个蒙皮网格，交叉换页时每段保留自己的 `sortingOrder`；每个参数关键点一个 Blend Shape，参数组合为叠加近似并报告误差；动作进 Animator，默认播放名为 Idle 的片段，预制体使用旁边的 `.controller`；遮罩、非普通混合、屏幕色、不透明度曲线与物理不写入。导出目录整份拷进 `Assets` 后，安装脚本把导入器放到 `Assets/PSD2Live/Editor` 并删除自己，第二个角色同样整份复制 |
-| `psd-pose` | 合成/时间轴 | 每个可见网格一层，按静止绘制顺序 | 变形器和参数不保留；按参数变化的绘制顺序取静止值 |
+| `psd-pose` | 合成/时间轴 | 每个可见网格一层，按静止绘制顺序 | 变形器和参数不保留；按参数变化的绘制顺序取静止值；每个网格按普通混合单独渲染，颜色混合写为图层混合模式（滤色等 Cubism 5.3 模式写对应模式）；Cubism 5.3 之前的加算 / 乘算写为线性减淡（添加）/ 正片叠底，在不透明的下层上颜色相同，仅下方无像素处图层自身像素可见，报告为 `approximated`；over 以外的 Alpha 混合没有图层对应，按 over 合成并报告 |
 | `png-sequence` | 光栅 | 编号 PNG 帧 | 结构全部烘焙为像素 |
 | `sprite-sheet` | 光栅 | 网格排列的精灵表 PNG + TexturePacker（hash）JSON | 同上 |
 | `gif` | 光栅 | 动态 GIF | 256 色（由整段动作自身的像素中位切分出 255 色，所有帧共用）、1 位透明 |
@@ -68,6 +69,19 @@ MIT 模块不依赖任何 GPL 模块，由 Gradle 依赖关系在编译期保证
 | `psd-pose` | `clip` 与 `time`（秒）按动作片段摆姿势，或 `pose`（`ParamAngleX=20,ParamEyeLOpen=0`，覆盖片段）；`scale`（0.25–2，默认 1） |
 | 视频类 | 同光栅类，另有 `ffmpeg`（ffmpeg 路径；缺省依次取环境变量 `PSD2LIVE_FFMPEG`、安装包自带的 `resources/ffmpeg/` 与 PATH） |
 | 光栅类 | `clip`（片段 ID 或名称，默认第一个片段，无片段时为静止姿势；未知时报错并列出现有片段）、`fps`（默认片段帧率）、`size`（长边像素，默认 1024）、`background`（ARGB 十六进制，默认透明）、`physics`（默认 true）；`gif` 另有 `dither`（Floyd–Steinberg 抖动，默认 true）。`sprite-sheet` 在渲染前按帧数与尺寸检查，超过 16384 px 时直接拒绝 |
+
+## 表情、姿势与事件
+
+表情、姿势与动作事件是工程数据，和动作片段一样不改变 Rig，由 `core/ModelSidecars.kt` 定义，编辑走 `expression_*` / `pose_*` / `motion_set_event` 等文档操作（见 [MCP 编辑参考](../agent/MCP_AUTHORING.md)）。`RigIrCompiler` 把它们编进 IR，各目标照 IR 写出：
+
+- **表情**：`RigEditOverlay.expressions` 为 null 时，生成的 Rig 使用标准表情（`ModelExpressions.standard`：微笑、悲伤、生气、惊讶，名称随界面语言，各自只保留模型已有的参数，一个参数也没有的略去；Rig 模块的参数（眼形、眉角度、笑眼、眯眼、脸红等）在模型有时把各表情推得更远；害羞、困倦、阴沉三个只在模型有脸红参数、拟合眼的眯眼参数、阴沉参数时生成），导入的 CMO3 模型没有表情；第一次编辑把当时的列表收进工程，此后只导出工程中的列表（没有条目的表情照样导出，作为宿主重置用的无表情）。`moc3` 每个表情写一个 `<base>.<id>.exp3.json`（`Type`、`FadeInTime`、`FadeOutTime`、`Parameters` 的 `Id` / `Value` / `Blend`），并按列表顺序写入 model3 的 `FileReferences.Expressions`（`Name` 为表情名称，`File` 为文件名）；`p2lrt` 写 `EXPR` 块。表情 ID 限定为文件名安全的 1–64 个字符，名称在工程内唯一。
+- **姿势**：`moc3` 写 `<base>.pose3.json`（`Type`、`FadeInTime`、`Groups` 中每个部件的 `Id` 与 `Link`）并写入 model3 的 `FileReferences.Pose`，只保留模型中存在的部件，没有组时不写；`p2lrt` 写 `POSE` 块（只保留至少两个部件的组）。
+- **事件**：片段事件写进 motion3 的 `UserData`（按时间排序，`Meta.UserDataCount` / `TotalUserDataSize` 同步），`.can3` 写进场景的用户数据帧，`p2lrt` 写进片段扩展记录。只有事件、没有曲线的片段与其他空片段一样不导出。
+- **参数与部件的变化**：删除参数时其表情条目一并删除，缩小参数范围时覆盖方式的值收进新范围（`WorkspaceDocumentEdits.parameter`）。`ModelSidecars.withIdRenamed` 是改写参数或部件 ID 时同步动作曲线、表情条目与姿势部件的通用接口，ID 转变应调用它（尚未接线）；其他情况下（删除摆动、模拟或图层，重新生成）留下的悬空引用保留在工程中：编辑只校验本次写入的条目与部件（一个表情或姿势组只保留自己原有的悬空引用），`expression_get` / `expression_list` 的 `missing` 与 `pose_get` 的 `missing_parts` 列出它们，导出时跳过。
+- **写出的 ID**：`moc3` 的 exp3、pose3 与 motion3 按 moc 实际写入的 ID 命名对象（`Moc3Sidecars.withWrittenIds`，与 cdi3 相同）：超长被缩短的 ID 换成缩短后的写法，未写入的部件（按 `hidden_parts` / `guide_parts` 省略的）从姿势中去掉，组空了一并去掉，动作中它们的透明度曲线也去掉（同步曲线、段与点的计数）；ID 全部原样写入时不解析这些文件。
+- **预览**：编辑器的预览 bundle 不带 pose3（Cubism SDK 加载 pose3 时会隐藏每组第一个以外的部件），只有写出的文件带。
+- **导出变化（3.6.0 之后）**：生成的 Rig 在 `moc3` / `vtube-studio` 中多写标准表情的 exp3、model3 的 `Expressions` 与 VTube Studio 的切换热键；导入的 CMO3 未编辑表情时不再在 `p2lrt` 中带标准表情；生成的 Rig 被 CMO3 替换导入时，当时的标准表情收进工程。
+- **读回**：`PSD2LivePipeline` 的 bundle 校验解析 model3 引用的每个 exp3、pose3 与 motion3。仅网格导出不写表情与姿势。
 
 ## Cubism Animator
 
@@ -107,6 +121,15 @@ Spine 有骨骼没有参数。导出的骨骼空间原点为画布底边中点�
 ## Unity
 
 需要 Unity 6.0（6000.0）或更高版本。导出目录可整份放进 Unity 工程的 `Assets`。附带的安装脚本把 `Psd2LiveUnityImporter.cs` 装到 `Assets/PSD2Live/Editor`（已有且版本不旧则不覆盖）后删掉自己，所以第二个角色也整份复制即可。导入器把绘制顺序上相邻、且落在同一张贴图上的网格合成一个蒙皮网格，贴在共享根骨骼上；另一张贴图的部件插在中间时这一段断开，每段使用自己的 `sortingOrder`，所以前发不会因为和后发同页而被整页画到脸的前面。每个参数的非默认关键点成为一个 Blend Shape（权重 0–100 的帽函数，与 glTF 相同），多个参数同时变化时是叠加近似。动作片段按 `clip_fps` 采样成 Animator 片段，有名为 Idle 的片段时它是默认状态，否则播放第一个片段；其余片段写在同名 `.controller` 里，没有过渡就不会自动播放。预制体的 Animator 在该文件生成后指向它，场景里仍指向内嵌控制器的实例会在导入或层级变化时改过去。每个参数另有一条不进入默认状态机的 `param_<id>` 片段，可在项目里单独播放。单位是 `pixels_per_unit`（默认 100）分之一，y 向上，原点在画布中心；贴图 V 从 PSD2Live 的左上原点翻到 Unity 的左下原点。角色在画面外时不播放。验证：目标模块的单元测试对照一个滑动方块的顶点、Blend Shape 与 0.5 秒权重；完整角色 tml 在 Unity 6000.4.7f1 的内置渲染管线工程中以静止姿势导入，Play 播放 Idle。
+
+## 点击区域
+
+文档的点击区域（`rigEdits.hitAreas`，编辑器检查器、层级右键菜单与 MCP `hit_area_*` 编辑）按测试顺序编译为 `RigIR.hitAreas`：每个区域有自己的 ID（如 `HitAreaHead`）、宿主查询用的名称（如 `Head`）和所覆盖的网格。网格拆分（连通块、多边形、深度切分）时分片接替原网格在区域中的位置，删除图层时其网格移出区域（区域因此没有网格时一并删除）。IR 保留区域所指的全部网格；目标写入时跳过 Rig 中已不存在的网格，并为每个记 `structure` / `dropped` 损失，网格全都不在的区域仍算文档自己的区域，不退回运行时的自动区域。不承载点击区域的目标（`cmo3`、`spine`、`dragonbones`、`gltf`、`unity`、`psd-pose` 与光栅类）为每个区域记 `structure` / `dropped` 损失。
+
+- **`moc3` / `vtube-studio`**：写入 model3.json 的 `HitAreas`，每项 `Name` 为区域名称、`Id` 为 moc 中写出的 ArtMesh ID（ID 被缩短时取缩短后的值；未写入 moc 的网格，例如导出选项省略的隐藏网格，不列出并记 `structure` / `dropped` 损失，一项都不剩时不写 `HitAreas`）。model3 每项只指一个 ArtMesh，因此多网格区域写成同名的多项，并记 `structure` / `approximated` 损失（只按名称找第一项的宿主只测到第一个网格）；区域自身的 ID 不在 model3 中。没有点击区域的文档不写 `HitAreas`，导出逐字节不变。
+- **`p2lrt`**：版本 2 写入可选块 `HITA`（区域 ID、名称、网格索引）；文档没有点击区域时沿用由语义自动得到的 `HitAreaHead`（脸）与 `HitAreaBody`（上衣，否则颈或下装）。版本 1 没有点击区域，文档的每个区域记 `structure` / `dropped` 损失。
+- **命中规则**：按列表顺序取第一个命中的区域；网格可见、不透明度大于 0 且其三角形（含边）包含该点即命中。编辑器预览单击、MCP `hit_area_test` 与运行时 `p2l_hit_test` 用同一规则。Cubism SDK 示例按网格的包围矩形判断，与此可能不同。
+- 二进制 IR（`RigIrBinary`）自编码版本 6 起写入该字段，更早版本读取为空。
 
 ## 损失报告
 
