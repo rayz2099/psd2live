@@ -95,6 +95,10 @@ internal fun ModelPresetsSection(
 	state: PSD2LiveState,
 	viewModel: PSD2LiveViewModel,
 ) {
+    if (state.rigEdits.modifierStack != null) {
+        ModifierStackPanel(state, viewModel)
+        return
+    }
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	val isBusy = state.isAnalyzing || state.isGenerating || state.workspaceEditBusy || state.editorDraftBusy
@@ -109,6 +113,9 @@ internal fun ModelPresetsSection(
 	Column(modifier = Modifier.fillMaxWidth()) {
 		// Open or close every group, and reset every preset.
 		PanelToolbar {
+            io.github.psd2live.ui.components.CompactButton(tr("modifier.convert"), {
+                viewModel.editModifier("modifier_convert", kotlinx.serialization.json.JsonObject(emptyMap()))
+            }, enabled = !isBusy && state.previewModel != null, height = 22.dp)
 			Spacer(Modifier.weight(1f))
 			PanelExpandCollapseButtons(onExpandAll = { expandAll(true) }, onCollapseAll = { expandAll(false) }, enabled = !state.meshOnly)
 			PanelResetButton(onClick = { viewModel.resetModelPresetsToDefault() }, enabled = !isBusy, tooltip = tr("settings.resetHint"))

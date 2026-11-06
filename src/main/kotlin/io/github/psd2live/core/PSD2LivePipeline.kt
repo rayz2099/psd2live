@@ -34,6 +34,8 @@ import java.nio.file.StandardOpenOption
 import io.github.psd2live.core.legacy.RigGenerationMigration
 
 class PSD2LivePipeline {
+	internal var deferRuntimeBundles = false
+	internal val modifierCache = io.github.psd2live.core.modifier.RigModifierEvaluationCache()
 	internal val meshCache = PreviewMeshCache()
 	private val generatedGeometry = GeneratedGeometryCache()
 	fun inspect(psd: Path, config: PipelineConfig = PipelineConfig()): PipelineAnalysis {
@@ -63,24 +65,41 @@ class PSD2LivePipeline {
 		config: PipelineConfig = PipelineConfig(),
 		progress: ProgressListener = ProgressListener { _, _ -> },
 		previousAtlas: PackedAtlas? = null,
-	): RigPreviewModel {
+	): RigPreviewModel = buildPreviewInputs(analysis, config, progress, previousAtlas, ordinaryMaterials = false)
+
+    internal fun buildOrdinaryPreview(source: SourceArt, config: PipelineConfig, progress: ProgressListener,
+                                      previousAtlas: PackedAtlas?): RigPreviewModel {
+        val analysis = if (config.rigEdits.importedCmo3 != null) Cmo3ModelImport.analysis(source, config)
+            else RigGenerationSource.analyze(source, config)
+        return buildPreviewInputs(analysis, config, progress, previousAtlas, ordinaryMaterials = true)
+    }
+
+    private fun buildPreviewInputs(analysis: PipelineAnalysis, config: PipelineConfig, progress: ProgressListener,
+                                   previousAtlas: PackedAtlas?, ordinaryMaterials: Boolean): RigPreviewModel {
+        if (config.rigEdits.modifierStack != null) {
+            return io.github.psd2live.core.modifier.RigModifierPipeline.build(this, analysis, config, progress, previousAtlas)
+        }
         if (RigLayerDeletion.deferred(config)) {
-            return RigLayerDeletion.preview(buildPreview(analysis.source, RigLayerDeletion.generationConfig(config), progress, previousAtlas), config, previousAtlas)
+            val generation = RigLayerDeletion.generationConfig(config)
+            val base = if (ordinaryMaterials) buildOrdinaryPreview(analysis.source, generation, progress, previousAtlas)
+                else buildPreview(analysis.source, generation, progress, previousAtlas)
+            return RigLayerDeletion.preview(base, config, previousAtlas)
         }
         if (config.rigEdits.importedCmo3 != null) {
             val importedAnalysis = Cmo3ModelImport.analysis(analysis.source, config)
             val (atlas, baseRig) = Cmo3ModelImport.baseRig(analysis.source, config)
             val rig = baseRig.withRigEdits(config.rigEdits, config.layerVisibility, config.drawOrderOverrides, SeeThroughLayers.Settings.of(config))
-            val bundle = buildRuntimeBundle("psd2live-preview", importedAnalysis, atlas, rig, config).first
+            val bundle = previewBundle(importedAnalysis, atlas, rig, config, ordinaryMaterials || deferRuntimeBundles)
             return RigPreviewModel(importedAnalysis, atlas, rig, config, bundle, PreviewRigSources.of(baseRig))
         }
         val inputs = generationInputs(analysis, config, progress, previousAtlas)
-        val (effectiveAnalysis, fullAtlas, baseRig) = generatedBase(inputs, config, progress)
+        val (effectiveAnalysis, fullAtlas, generated) = generatedBase(inputs, config, progress)
+        val baseRig = if (ordinaryMaterials) io.github.psd2live.core.modifier.RigOrdinaryMaterials.of(generated, effectiveAnalysis) else generated
 		// The base packs superseded layers (the originals of a split) too; once no mesh samples them the model
 		// packs only the layers it shows, as exports do.
 		val (atlas, rig) = RigLayerDeletion.compact(fullAtlas, effectiveAnalysis, effectiveAnalysis,
 			baseRig.withRigEdits(config.rigEdits, config.layerVisibility, config.drawOrderOverrides, SeeThroughLayers.Settings.of(config)), config, previousAtlas)
-		val runtimeBundle = buildRuntimeBundle("psd2live-preview", effectiveAnalysis, atlas, rig, config).first
+		val runtimeBundle = previewBundle(effectiveAnalysis, atlas, rig, config, ordinaryMaterials || deferRuntimeBundles)
 		return RigPreviewModel(effectiveAnalysis, atlas, rig, config, runtimeBundle, PreviewRigSources.of(baseRig, inputs.bindingKey),
 			generationAtlas = fullAtlas.takeIf { it !== atlas })
 	}
@@ -109,6 +128,7 @@ class PSD2LivePipeline {
 	internal fun materializedPreview(source: SourceArt, config: PipelineConfig, authored: AuthoredRig, bindingKey: String,
 	                                 progress: ProgressListener = ProgressListener { _, _ -> },
 	                                 previousAtlas: PackedAtlas? = null, rebind: Boolean = false): RigPreviewModel? {
+        if (config.rigEdits.modifierStack != null) return buildPreview(source, config, progress, previousAtlas)
 		require(materializable(config)) { "This document's preview is not built from an authored rig" }
 		// Deletions after a journal that creates or splits meshes filter the full model, as [buildPreview] does.
 		if (RigLayerDeletion.deferred(config)) return materializedPreview(source, RigLayerDeletion.generationConfig(config), authored, bindingKey,
@@ -158,9 +178,14 @@ class PSD2LivePipeline {
 	private fun generationInputs(input: PipelineAnalysis, config: PipelineConfig, progress: ProgressListener,
 	                             previousAtlas: PackedAtlas? = null): GenerationInputs {
 		val baselineConfig = RigGenerationBaseline.restore(MeshGenerationBaseline.restore(config))
-		val analyses = RigBuildProfile.stage("pipeline: analysis prepare") { RigGenerationSource.prepare(input, baselineConfig, config) }
+		val base = RigBuildProfile.stage("pipeline: analysis prepare") { RigGenerationSource.prepare(input, baselineConfig, config) }
 		val generationConfig = baselineConfig.copy(parentOverrides = generatedParentOverrides(config))
-		val atlas = RigBuildProfile.stage("pipeline: atlas layout") { AtlasLayout.pack(analyses.textures.layers, config, progress, previousAtlas) }
+		val assets = io.github.psd2live.core.modifier.RigModifierRasterAssets.restored(config)
+		val analyses = if (assets.isEmpty()) base else base.copy(textures = base.textures.copy(layers = base.textures.layers + assets))
+		val atlas = RigBuildProfile.stage("pipeline: atlas layout") {
+			val packed = AtlasLayout.pack(base.textures.layers, config, progress, previousAtlas)
+			io.github.psd2live.core.modifier.RigModifierRasterAssets.append(packed, assets, config)
+		}
 		val visible = ArtPrimitiveJournal.visibleAnalysis(analyses.textures, config.rigEdits)
 		return GenerationInputs(baselineConfig, analyses, generationConfig, atlas, visible)
 	}
@@ -285,6 +310,7 @@ class PSD2LivePipeline {
 		config: PipelineConfig,
 		progress: ProgressListener = ProgressListener { _, _ -> },
 	): RigPreviewModel {
+        if (config.rigEdits.modifierStack != null) return buildPreview(current.analysis.source, config, progress, current.atlas)
         // A generated model's regeneration merges and checkpoints where the document builds ([RigRegenerationCheckpoint]).
         if (!(materializable(config) && materializable(current.config)) && RigGenerationChange.changed(current, config)) {
             val prepared = RigGenerationMigration.prepare(this, current, config,
@@ -513,6 +539,8 @@ class PSD2LivePipeline {
 		baseName: String = "psd2live-preview",
 		stored: AuthoredRig? = null,
 	): RigPreviewModel {
+        if (config.rigEdits.modifierStack != null || current.config.rigEdits.modifierStack != null)
+            return buildPreview(current.analysis.source, config, previousAtlas = current.atlas)
 		// A deferred deletion model keeps the complete generated base and atlas; only its replayed rig and
 		// analysis are filtered. Replay onto that base and filter the same way instead of regenerating it.
 		if (RigLayerDeletion.deferred(config) != RigLayerDeletion.deferred(current.config)) return buildPreview(current.analysis.source, config)
@@ -564,6 +592,7 @@ class PSD2LivePipeline {
 		ignoredOpacity: Set<String> = emptySet(),
 	): Boolean {
 		if (current == null) return false
+        if (config.rigEdits.modifierStack != null || current.config.rigEdits.modifierStack != null) return false
 		if (current.config.rigEdits.importedCmo3 != config.rigEdits.importedCmo3) return false
 		if (!sameArt(current.analysis.source, source, ignoredOpacity)) return false
 		if (current.config.rigEdits.skeleton != config.rigEdits.skeleton) return false
@@ -618,7 +647,9 @@ class PSD2LivePipeline {
 		val cleaned = io.github.psd2live.core.interior.InteriorLifecycle.exportModel(rig.puppet, config.rigEdits,
 			PhysicsCatalog.active(analysis, config, rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }, rig.puppet))
 		val idWarnings = RigIdCheck.checked(generatedLabel, cleaned)
-		val exportPuppet = restMeshesToCanvasSpace(cleaned, if (imported) emptyMap() else mapOf(StandardParameters.MOUTH_OPEN to 1.0f))
+		val restPose = rig.modifierOutput?.restPose?.mapKeys { org.umamo.runtime.model.ParameterId(it.key) }
+            ?: if (imported) emptyMap() else mapOf(StandardParameters.MOUTH_OPEN to 1.0f)
+		val exportPuppet = restMeshesToCanvasSpace(cleaned, restPose)
 		val outputRoot = outputDirectory.toAbsolutePath().normalize()
 		Files.createDirectories(outputRoot)
 		val files = mutableListOf<ExportedFile>()
@@ -679,6 +710,12 @@ class PSD2LivePipeline {
 	 * strip-encoded PNGs ([AtlasPage.previewPng]), which re-encode only changed rows; files written for the user
 	 * carry the canonical encoding, and no pose3.
 	 */
+	internal fun previewBundle(analysis: PipelineAnalysis, atlas: PackedAtlas, rig: BuiltRig, config: PipelineConfig,
+	                           defer: Boolean = deferRuntimeBundles): CubismRuntimeBundle {
+		val build = { RigBuildProfile.stage("pipeline: runtime bundle") { buildRuntimeBundle("psd2live-preview", analysis, atlas, rig, config).first } }
+		return if (defer) CubismRuntimeBundle.deferred(build) else build()
+	}
+
 	internal fun buildRuntimeBundle(
 		baseName: String,
 		analysis: PipelineAnalysis,

@@ -26,6 +26,11 @@ import io.github.psd2live.format.model.ChannelValue as IrChannelValue
  * [toIr] separately.
  */
 public object PuppetIr {
+	/** Convert parameter declarations without traversing geometry, textures or keyforms. */
+	public fun parametersToIr(model: PuppetModel): List<IrParameter> = model.parameters.map {
+		IrParameter(it.id.raw, it.name, it.min, it.max, it.default,
+			it.kind == ParameterKind.BLEND_SHAPE, it.repeat, it.keys?.let { keys -> Floats.of(keys.toFloatArray()) })
+	}
 	public fun toIr(
 		model: PuppetModel,
 		pages: List<TexturePage> = emptyList(),
@@ -35,8 +40,7 @@ public object PuppetIr {
 		parameterRoles: List<ParameterRole> = emptyList(),
 	): RigIR = RigIR(
 		canvas = Canvas(model.canvasWidth, model.canvasHeight, model.worldOriginX, model.worldOriginY, model.pixelsPerUnit),
-		parameters = model.parameters.map { IrParameter(it.id.raw, it.name, it.min, it.max, it.default,
-			it.kind == ParameterKind.BLEND_SHAPE, it.repeat, it.keys?.let { keys -> Floats.of(keys.toFloatArray()) }) },
+		parameters = parametersToIr(model),
 		parameterLinks = model.parameterLinks.map { IrParameterLink(it.horizontal.raw, it.vertical.raw) },
 		parameterTree = model.parameterTree.map(::node),
 		parameterRoles = parameterRoles,
@@ -46,7 +50,7 @@ public object PuppetIr {
 		rootChildren = model.rootChildren.map(::child),
 		rootPart = model.rootPartId?.raw,
 		deformers = model.deformers.map(::deformer),
-		meshes = model.drawables.map(::mesh),
+		meshes = model.drawables.map(::meshToIr),
 		glues = model.glues.map { glue -> IrGlue(glue.id, glue.meshA.raw, glue.meshB.raw,
 			glue.pairs.map { IrGluePair(it.indexA, it.indexB, it.weightA, it.weightB) }, channels(glue.channelGrids), glue.intensity) },
 		renderRoot = renderGroup(model.renderRoot),
@@ -203,7 +207,7 @@ public object PuppetIr {
 			deformer.handleLength)
 	}
 
-	private fun mesh(drawable: Drawable) = Mesh(
+	fun meshToIr(drawable: Drawable) = Mesh(
 		id = drawable.id.raw, name = drawable.name, parent = drawable.parentDeformerId?.raw,
 		blend = colorBlend(drawable.blendMode), alphaBlend = alphaBlend(drawable.alphaBlendMode),
 		maskedBy = drawable.maskedBy.map { it.raw }, invertMask = drawable.invertMask,

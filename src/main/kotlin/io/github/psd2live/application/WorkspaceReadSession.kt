@@ -1,5 +1,7 @@
 package io.github.psd2live.application
 
+import io.github.psd2live.core.PhysicsCatalog
+
 import io.github.psd2live.core.*
 import io.github.psd2live.project.*
 import kotlinx.serialization.json.*
@@ -170,14 +172,14 @@ internal class WorkspaceReadSession(
 
     override fun currentPuppet(): PuppetModel? = read.runtime.capture?.model?.rig?.puppet
     override fun skeletonSpec(): SkeletonSpec? = read.runtime.capture?.document?.rigEdits?.skeleton
-    override fun motionClips(): List<MotionClip> = read.runtime.capture?.document?.rigEdits?.motionClips.orEmpty()
+    override fun motionClips(): List<MotionClip> = read.runtime.capture?.document?.rigEdits?.let(MotionCatalog::entries).orEmpty()
     override fun modelSidecars(): WorkspaceSidecars = capture().let { WorkspaceSidecarEdits.sidecars(it.document, it.model?.rig?.puppet) }
     override fun projectSettings(): JsonObject {
         val document = capture().document
         return WorkspaceSettingsCodec.encode(WorkspaceSettingsCodec.decode(document.settings).copy(meshOverrides = document.meshOverrides))
     }
     override fun listInteriorEffects() = capture().document.rigEdits.interiorEffects
-    override fun listSwings(): List<RigSwingEdit> = capture().document.rigEdits.swingEdits
+    override fun listSwings(): List<RigSwingEdit> = SwingCatalog.entries(capture().document.rigEdits)
     override fun hitAreas() = capture().document.rigEdits.hitAreas
     override fun hitAreaModel() = read.runtime.capture?.model
     override fun layoutState(): WorkspaceLayoutState? = read.runtime.capture?.document?.let { document ->
@@ -185,6 +187,8 @@ internal class WorkspaceReadSession(
             document.source.widthPx, document.source.heightPx)
     }
     override fun rigModules(): JsonObject = read.runtime.capture.let { RigModuleCatalog.describe(it?.document, it?.model) }
+    override fun modifierStack(): JsonObject = WorkspaceModifierQueries.describe(capture())
+    override fun modifierPlan(request: JsonObject): JsonObject = WorkspaceModifierPlan.prepare(capture(), request)
     override fun generatedOverrideIssues(): List<GeneratedOverrideIssue> = read.runtime.capture?.model?.rig?.overrideIssues.orEmpty()
     override fun supersededEntryNotes(): List<SupersededEntryNote> = read.runtime.capture?.model?.rig?.supersededEntryNotes.orEmpty()
     override fun seeThroughNotes(): List<Pair<String, String>> =
@@ -198,7 +202,7 @@ internal class WorkspaceReadSession(
         val captured = read.runtime.capture ?: return emptyList()
         return io.github.psd2live.core.quality.SkeletonBindingQuality.issues(captured.model.rig.puppet, captured.document.rigEdits.skeleton)
     }
-    override fun listSimulations(): List<io.github.psd2live.core.sim.RigSimEdit> = capture().document.rigEdits.simEdits
+    override fun listSimulations(): List<io.github.psd2live.core.sim.RigSimEdit> = io.github.psd2live.core.sim.SimulationCatalog.entries(capture().document.rigEdits)
     override fun physicsFps(): Int = capture().document.rigEdits.physicsFps
     override fun previewSession(): JsonObject = PreviewSessions.encode(pose)
     override fun sampleSourceColor(layerId: String, x: Int, y: Int): List<Int> = capture().document.sampleSourceColor(layerId, x, y)
@@ -489,14 +493,13 @@ internal class WorkspaceReadSession(
     override fun reportSimulation(id: String, hold: Float, release: Float, wind: Pair<Float, Float>?,
                                   progress: (Float) -> Unit, cancelled: () -> Boolean): JsonObject {
         val captured = capture()
-        val edit = requireNotNull(captured.document.rigEdits.simEdits.firstOrNull { it.id == id }) { "Simulation not found: $id" }
+        val edit = requireNotNull(io.github.psd2live.core.sim.SimulationCatalog.entries(captured.document.rigEdits).firstOrNull { it.id == id }) { "Simulation not found: $id" }
         return io.github.psd2live.core.sim.SimAuthoring.report(captured.model.rig.puppet, edit, hold, release, wind, progress, cancelled)
     }
 
     override fun compareSimulation(id: String, motions: List<String>, progress: (Float) -> Unit, cancelled: () -> Boolean): JsonObject {
         val captured = capture()
-        val results = io.github.psd2live.core.sim.SimCompare.compare(captured.document.rigEdits,
-            io.github.psd2live.core.sim.SimAuthoring.AuthoredRigs(captured.model::authoredPuppet), id, motions,
+        val results = io.github.psd2live.core.sim.SimulationCatalog.compare(captured.model, captured.document.rigEdits, id, motions,
             progress = progress, cancelled = cancelled)
         return buildJsonObject {
             put("id", id)
@@ -508,6 +511,6 @@ internal class WorkspaceReadSession(
         val captured = capture()
         val config = captured.document.config()
         return io.github.psd2live.core.PhysicsSimulation.run(WorkspaceDocumentEdits.physicsCatalog(captured.document, captured.model),
-            captured.model.rig.puppet.parameters, arguments, config.generatePhysics, captured.document.rigEdits.physicsFps, progress, cancelled)
+            captured.model.rig.puppet.parameters, arguments, if (config.rigEdits.modifierStack != null) PhysicsCatalog.active(captured.model).isNotEmpty() else config.generatePhysics, captured.document.rigEdits.physicsFps, progress, cancelled)
     }
 }

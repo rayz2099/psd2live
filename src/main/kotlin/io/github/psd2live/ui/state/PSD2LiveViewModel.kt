@@ -29,6 +29,7 @@ import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.key
 import io.github.psd2live.core.MeshSettings
 import io.github.psd2live.core.MotionClip
+import io.github.psd2live.core.MotionCatalog
 import io.github.psd2live.core.MotionClips
 import io.github.psd2live.core.MotionHandle
 import io.github.psd2live.core.MotionKey
@@ -451,6 +452,12 @@ class PSD2LiveViewModel : AutoCloseable {
     internal fun deleteSwing(bake: Boolean) {
         val session = swingSession ?: return
         val id = session.existingId ?: return
+        if (bake && io.github.psd2live.core.SwingCatalog.owner(_state.value.rigEdits, id) != null) {
+            val expected = modifierEditState() ?: return
+            endSwing()
+            editModifier("modifier_apply", kotlinx.serialization.json.buildJsonObject { put("id", id) }, expected)
+            return
+        }
         runSwingMutation(session) { workspace, state -> workspace.deleteSwing(id, bake, state, io.github.psd2live.project.MutationAuthor.USER) }
     }
 
@@ -551,6 +558,10 @@ class PSD2LiveViewModel : AutoCloseable {
      * a failure in [simulationStatus].
      */
     internal fun bakeSimulation(id: String) {
+        if (io.github.psd2live.core.sim.SimulationCatalog.owner(_state.value.rigEdits, id) != null) {
+            editModifier("simulation_bake", kotlinx.serialization.json.buildJsonObject { put("id", id) })
+            return
+        }
         if (_state.value.rigEdits.simEdits.none { it.id == id }) return
         queueSimulationBakes(listOf(id), fresh = true)
     }
@@ -693,8 +704,8 @@ class PSD2LiveViewModel : AutoCloseable {
     /** The enabled simulations a bake would change: unbaked or stale ones, or every one when all are up to date. */
     internal fun simulationsToBake(current: PSD2LiveState = _state.value): List<String> {
         val puppet = current.previewModel?.rig?.puppet ?: return emptyList()
-        val enabled = current.rigEdits.simEdits.filter { it.enabled }
-        val outdated = enabled.filter { it.bake == null || io.github.psd2live.core.sim.SimBake.stale(puppet, it) }
+        val enabled = io.github.psd2live.core.sim.SimulationCatalog.entries(current.rigEdits).filter { it.enabled }
+        val outdated = enabled.filter { it.bake == null || io.github.psd2live.core.sim.SimulationCatalog.stale(current.rigEdits, puppet, it) }
         return (outdated.ifEmpty { enabled }).map { it.id }
     }
 
@@ -702,11 +713,20 @@ class PSD2LiveViewModel : AutoCloseable {
      * Bakes [simulationsToBake] in the background, one after another, each on the rig with the bakes before
      * it, and commits them together as one history node. A simulation that fails keeps its old bake and is reported.
      */
-    internal fun bakeAllSimulations() = queueSimulationBakes(simulationsToBake(), fresh = true)
+    internal fun bakeAllSimulations() {
+        val ids = simulationsToBake()
+        val (generated, ordinary) = ids.partition { io.github.psd2live.core.sim.SimulationCatalog.owner(_state.value.rigEdits, it) != null }
+        if (generated.isNotEmpty()) {
+            val expected = modifierEditState() ?: return
+            saveDocumentEdits(expected, "Bake simulations", generated.map { id ->
+                io.github.psd2live.application.WorkspaceDocumentOperation("simulation_bake", kotlinx.serialization.json.buildJsonObject { put("id", id) })
+            }) { failure -> if (failure != null) setErrorMessage(failure) else queueSimulationBakes(ordinary, fresh = true) }
+        } else queueSimulationBakes(ordinary, fresh = true)
+    }
 
     /** Removes every simulation's bake as one history node. */
     internal fun clearAllSimulationBakes() {
-        val ids = _state.value.rigEdits.simEdits.filter { it.bake != null }.map { it.id }
+        val ids = io.github.psd2live.core.sim.SimulationCatalog.entries(_state.value.rigEdits).filter { it.bake != null }.map { it.id }
         if (ids.isEmpty()) return
         runSimulationMutation("Cleared simulation bakes") { workspace, state -> workspace.putSimulationBakes(ids.associateWith { null }, state) }
     }
@@ -806,8 +826,7 @@ class PSD2LiveViewModel : AutoCloseable {
         simChecking = scope.launch(Dispatchers.Default) {
             val job = coroutineContext[kotlinx.coroutines.Job]
             val result = try {
-                val results = io.github.psd2live.core.sim.SimCompare.compare(overlay,
-                    io.github.psd2live.core.sim.SimAuthoring.AuthoredRigs(model::authoredPuppet), id, motions,
+                val results = io.github.psd2live.core.sim.SimulationCatalog.compare(model, overlay, id, motions,
                     cancelled = { job?.isCancelled == true })
                 SimulationCheck(motions, results.map { io.github.psd2live.core.sim.SimMotionCheck(it.motion, it.check) })
             } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
@@ -888,6 +907,10 @@ class PSD2LiveViewModel : AutoCloseable {
      * bake then follows in the background as its own node.
      */
     internal fun putSimulation(edit: io.github.psd2live.core.sim.RigSimEdit) {
+        if (_state.value.rigEdits.modifierStack != null) {
+            editModifier("simulation_put", edit.toJson())
+            return
+        }
         val autoBake = _simulationAutoBake.value
         runSimulationMutation("Set simulation ${edit.id}", then = { if (autoBake) queueSimulationBakes(listOf(edit.id), fresh = false) }) { workspace, state ->
             workspace.putSimulation(edit.toJson(), state, null, autoBake = false).first
@@ -899,9 +922,12 @@ class PSD2LiveViewModel : AutoCloseable {
      * [defaultName] goes back to the name after the body. One history node, nothing baked again.
      */
     internal fun renameSimulationOutput(simId: String, outputId: String, name: String, defaultName: String) {
-        val sim = _state.value.rigEdits.simEdits.firstOrNull { it.id == simId } ?: return
+        val sim = io.github.psd2live.core.sim.SimulationCatalog.entries(_state.value.rigEdits).firstOrNull { it.id == simId } ?: return
+        val owner = io.github.psd2live.core.sim.SimulationCatalog.owner(_state.value.rigEdits, simId)
+        val index = owner?.localOutputName(outputId)?.removePrefix("physics:")?.toIntOrNull()
+        val key = index?.let { sim.bake?.pendulums?.getOrNull(it)?.id } ?: outputId
         val trimmed = name.trim()
-        val names = if (trimmed.isEmpty() || trimmed == defaultName) sim.outputNames - outputId else sim.outputNames + (outputId to trimmed)
+        val names = if (trimmed.isEmpty() || trimmed == defaultName) sim.outputNames - key else sim.outputNames + (key to trimmed)
         if (names != sim.outputNames) putSimulation(sim.copy(outputNames = names))
     }
 
@@ -910,7 +936,7 @@ class PSD2LiveViewModel : AutoCloseable {
      * One history node, nothing baked again; the default setting clears it.
      */
     internal fun setSimulationOutput(simId: String, baked: String, output: io.github.psd2live.core.sim.SimOutput) {
-        val sim = _state.value.rigEdits.simEdits.firstOrNull { it.id == simId } ?: return
+        val sim = io.github.psd2live.core.sim.SimulationCatalog.entries(_state.value.rigEdits).firstOrNull { it.id == simId } ?: return
         val outputs = if (output.isDefault) sim.outputs - baked else sim.outputs + (baked to output)
         if (outputs != sim.outputs) putSimulation(sim.copy(outputs = outputs))
     }
@@ -1040,7 +1066,7 @@ class PSD2LiveViewModel : AutoCloseable {
     private fun stepSimulationPreview(current: PSD2LiveState, model: RigPreviewModel?, dt: Float) {
         if (_simulationStatus.value is SimulationStatus.Failed) return
         val id = current.simulationPreviewId ?: return
-        if (model == null || current.rigEdits.simEdits.none { it.id == id }) {
+        if (model == null || io.github.psd2live.core.sim.SimulationCatalog.entries(current.rigEdits).none { it.id == id }) {
             _simulationFrames.value = null
             return
         }
@@ -1537,7 +1563,8 @@ class PSD2LiveViewModel : AutoCloseable {
 
     /** Whether the start page's presets can apply to the model open now: one generated from a PSD. */
     internal fun startPresetsApplyToCurrent(state: PSD2LiveState = _state.value): Boolean =
-        state.previewModel != null && !state.meshOnly && state.rigEdits.importedCmo3 == null
+        startChoices.modifiers == null && state.rigEdits.modifierStack == null &&
+            state.previewModel != null && !state.meshOnly && state.rigEdits.importedCmo3 == null
 
     /** Brings the open model to the start page's presets, then shows the edit workspace. */
     fun applyStartChoicesToCurrent() {
@@ -1726,6 +1753,143 @@ class PSD2LiveViewModel : AutoCloseable {
         private set
 
     internal enum class ObjectDialog { FIND_REPLACE, CONVERT_IDS }
+
+    internal var modifierAddition by mutableStateOf<ModifierAddition?>(null)
+        private set
+    private var modifierPreviewJob: kotlinx.coroutines.Job? = null
+    private var modifierPreviewSequence = 0
+
+    internal fun openModifierAddition(group: Boolean = false) {
+        val model = _state.value.previewModel ?: return
+        val expected = currentWorkspaceState() ?: return
+        val objects = selectedObjectTargets()
+        val selected = objects.filter { it.startsWith("mesh:") }.map { it.substringAfter(':') }
+        val warp = if (!group && selected.isEmpty()) objects.firstOrNull { it.startsWith("warp:") }?.substringAfter(':') else null
+        val authoredIds = model.authored.rig.puppet.drawables.mapTo(HashSet()) { it.id }
+        val ids = selected.ifEmpty { model.rig.puppet.drawables.filter { it.mesh != null && it.id in authoredIds }.map { it.id.raw } }
+        if (ids.isEmpty()) return
+        modifierAddition = ModifierAddition(expected, if (warp != null) listOf(io.github.psd2live.core.modifier.ModifierTarget("deformer", warp))
+            else ids.map { io.github.psd2live.core.modifier.ModifierTarget("mesh", it) })
+        val dialog = requireNotNull(modifierAddition)
+        val first = io.github.psd2live.core.modifier.RigLegacyBindings.specs
+            .sortedBy { it.type.endsWith("/legacy") && it.type != "body/legacy" }
+            .firstOrNull { it.type != "face.depth-turn" && !dialog.availability(model, it.type).hidden }?.type
+        modifierAddition = modifierAddition?.copy(type = if (group) null else if (warp != null) "swing" else first,
+            group = if (group) io.github.psd2live.application.WorkspaceModifierPlan.RECOMMENDED_GROUP else null)
+    }
+
+    internal fun dismissModifierAddition() { modifierPreviewSequence++; modifierPreviewJob?.cancel(); modifierAddition = null }
+
+    internal fun previewModifierAddition(type: String?, group: String?, configuration: kotlinx.serialization.json.JsonObject? = null, preset: String? = null) {
+        val dialog = modifierAddition ?: return
+        val workspace = workspaceBackend ?: return
+        modifierPreviewJob?.cancel()
+        val sequence = ++modifierPreviewSequence
+        modifierAddition = dialog.copy(type = type, group = group, configuration = configuration, plan = null, preview = null, loading = true, error = null)
+        modifierPreviewJob = scope.launch {
+            try {
+                val (plan, preview) = withContext(Dispatchers.Default) {
+                    val editedPlan = if (configuration != null && preset == null && group == null && type == dialog.type) {
+                        dialog.plan?.let { previous ->
+                            val entries = previous.getValue("entries").jsonArray
+                            val entry = entries.lastOrNull()?.jsonObject
+                            if (entry == null || entry["type"]?.jsonPrimitive?.content != type) null
+                            else kotlinx.serialization.json.JsonObject(previous + ("entries" to kotlinx.serialization.json.JsonArray(
+                                entries.dropLast(1) + kotlinx.serialization.json.JsonObject(entry + ("config" to configuration)))))
+                        }
+                    } else null
+                    val plan = editedPlan ?: workspace.captureQueries().modifierPlan(kotlinx.serialization.json.buildJsonObject {
+                        type?.let { put("type", it) }; group?.let { put("group", it) }; configuration?.let { put("config", it) }; preset?.let { put("preset", it) }
+                        put("targets", kotlinx.serialization.json.JsonArray(dialog.targets.map { target -> kotlinx.serialization.json.buildJsonObject {
+                            put("kind", target.kind); put("id", target.id)
+                        } }))
+                    })
+                    if (plan.getValue("state").jsonPrimitive.content != dialog.state) throw io.github.psd2live.application.WorkspaceConflict(dialog.state, plan.getValue("state").jsonPrimitive.content)
+                    withContext(Dispatchers.Main) {
+                        if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(plan = plan)
+                    }
+                    val preview: kotlinx.serialization.json.JsonObject? = null
+                    plan to preview
+                }
+                if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(plan = plan, preview = preview, loading = false)
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(loading = false, error = failure.message)
+            }
+        }
+    }
+
+    internal fun switchModifierPreset(group: String) {
+        val dialog = modifierAddition ?: return
+        if (dialog.committing) return
+        modifierAddition = dialog.copy(loading = true, committing = true)
+        saveDocumentEdits(dialog.state, tr("modifier.switch"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(
+            "modifier_switch", kotlinx.serialization.json.buildJsonObject { put("group", group) }))) { failure ->
+            if (failure == null) dismissModifierAddition()
+            else modifierAddition = modifierAddition?.copy(loading = false, committing = false, error = failure)
+        }
+    }
+
+    internal fun confirmModifierAddition() {
+        val dialog = modifierAddition ?: return
+        val plan = dialog.plan ?: return
+        if (dialog.loading || plan.getValue("entries").jsonArray.isEmpty()) return
+        modifierAddition = dialog.copy(loading = true, committing = true)
+        saveDocumentEdits(dialog.state, tr("modifier.history.add"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation("modifier_add_group",
+            kotlinx.serialization.json.buildJsonObject { put("group", plan.getValue("group")); put("entries", plan.getValue("entries")) }))) { failure ->
+            if (failure == null) dismissModifierAddition() else modifierAddition = modifierAddition?.copy(loading = false, committing = false, error = failure)
+        }
+    }
+
+    /** Reject a field captured from a projection that has not caught up with the authoritative stack. */
+    internal fun modifierEditState(): String? {
+        val shown = _state.value.rigEdits.modifierStack?.let(io.github.psd2live.core.modifier.RigModifierStack::fromJson)
+        val observed = workspaceBackend?.captureQueries()?.modifierStack() ?: return null
+        val rows = observed.getValue("entries").jsonArray
+        val entries = shown?.instances.orEmpty()
+        val matches = _state.value.historySnapshot?.headNodeId == observed.getValue("history_node_id").jsonPrimitive.content &&
+            observed.getValue("legacy").jsonPrimitive.boolean == (shown == null) &&
+            rows.size == entries.size && entries.zip(rows).all { (instance, raw) ->
+            val row = raw.jsonObject
+            row.getValue("id").jsonPrimitive.content == instance.id && row.getValue("config") ==
+                (if (instance.type == "simulation") kotlinx.serialization.json.JsonObject(instance.config - "bake") else instance.config) &&
+                row.getValue("enabled").jsonPrimitive.boolean == instance.enabled
+        }
+        if (!matches) { setErrorMessage(tr("modifier.stale")); return null }
+        return observed.getValue("state").jsonPrimitive.content
+    }
+
+    internal fun editModifier(operation: String, request: kotlinx.serialization.json.JsonObject, expectedState: String? = modifierEditState(),
+                              onComplete: (String?) -> Unit = {}) {
+        val expected = expectedState ?: run { onComplete(tr("modifier.stale")); return }
+        saveDocumentEdits(expected, tr("modifier.history.edit"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(operation, request))) { failure ->
+            if (failure != null) setErrorMessage(failure)
+            onComplete(failure)
+        }
+    }
+
+    internal fun locateModifierContent(kind: String, id: String) {
+        val model = _state.value.previewModel ?: return
+        when (kind) {
+            "mesh" -> selectLayer(model.rig.ownLayerIdByDrawableId[id] ?: model.rig.layerIdByDrawableId[id] ?: id)
+            "deformer", "warp" -> selectDeformer(id)
+            "layer" -> selectLayer(id)
+            "parameter" -> { setParameterSearchQuery(id); requestSelectDockModule("parameters") }
+            "part" -> {
+                val parts = model.rig.puppet.parts.associateBy { it.id.raw }
+                val meshes = linkedSetOf<String>()
+                val seen = hashSetOf<String>()
+                fun collect(part: String) {
+                    if (!seen.add(part)) return
+                    parts[part]?.children.orEmpty().forEach { child -> when (child) {
+                        is org.umamo.runtime.model.OrgChild.Part -> collect(child.id.raw)
+                        is org.umamo.runtime.model.OrgChild.Drawable -> meshes += model.rig.ownLayerIdByDrawableId[child.id.raw] ?: child.id.raw
+                    } }
+                }
+                collect(id); if (meshes.isNotEmpty()) selectLayers(meshes)
+            }
+        }
+    }
 
     internal var objectDialog by mutableStateOf<ObjectDialog?>(null)
         private set
@@ -3972,6 +4136,7 @@ class PSD2LiveViewModel : AutoCloseable {
 	/** Every physics group of the current model, as export sees it; see [PhysicsCatalog.groups]. */
 	fun physicsGroups(state: PSD2LiveState = _state.value): List<PhysicsGroup> {
 		val model = state.previewModel ?: return emptyList()
+		if (state.rigEdits.modifierStack != null) return PhysicsCatalog.groups(model, model.config.copy(rigEdits = state.rigEdits))
 		val key = listOf(model.analysis, model.rig.puppet, state.rigEdits.interiorEffects, state.rigEdits.physicsEdits, state.rigEdits.disabledPhysicsIds, state.rigEdits.physicsOrder,
 			state.rigEdits.skeleton, state.rigEdits.swingEdits, state.physicsFrontHair, state.physicsBackHair, state.physicsEyeJelly,
 			state.hairSimulationFront, state.hairSimulationBack, state.rigEdits.importedCmo3, model.config.recipe)
@@ -4079,7 +4244,7 @@ class PSD2LiveViewModel : AutoCloseable {
 
 	// region Authored motions
 
-	val motionClips: List<MotionClip> get() = _state.value.rigEdits.motionClips
+	val motionClips: List<MotionClip> get() = MotionCatalog.entries(_state.value.rigEdits)
 
 	/**
 	 * The clip the editor has open, if it still exists (an undo can remove it). A generated motion opens as
@@ -4088,7 +4253,7 @@ class PSD2LiveViewModel : AutoCloseable {
 	fun editingMotionClip(state: PSD2LiveState = _state.value): MotionClip? {
 		val id = motionEditor.clipId ?: return null
 		MotionEditorState.presetOf(id)?.let { return presetMotionClip(state, it) }
-		return state.rigEdits.motionClips.firstOrNull { it.id == id }
+		return MotionCatalog.entries(state.rigEdits).firstOrNull { it.id == id }
 	}
 
 	private class PresetClip(val name: String, val skeleton: io.github.psd2live.core.SkeletonSpec?, val settings: MotionPresetSettings, val clip: MotionClip,
@@ -4163,10 +4328,10 @@ class PSD2LiveViewModel : AutoCloseable {
 	/** A transient drag projection; completed edits use the application timeline commands. */
 	private fun previewMotionClips(transform: (List<MotionClip>) -> List<MotionClip>) {
 		val current = _state.value
-		val before = current.rigEdits.motionClips
+		val before = MotionCatalog.entries(current.rigEdits)
 		val next = transform(before)
 		if (next == before) return
-		updateState { it.copy(rigEdits = it.rigEdits.copy(motionClips = next)) }
+		updateState { it.copy(rigEdits = MotionCatalog.replacing(it.rigEdits, next)) }
 	}
 
 	/**
@@ -4449,7 +4614,7 @@ class PSD2LiveViewModel : AutoCloseable {
 		motionEditor.dragOrigin = editingMotionClip() ?: return
 		motionEditor.dragSelection = motionEditor.selection
 		motionEditor.dragState = currentWorkspaceState()
-		motionEditor.dragClips = _state.value.rigEdits.motionClips
+		motionEditor.dragClips = MotionCatalog.entries(_state.value.rigEdits)
 		motionEditor.dragRequest = null
 	}
 
@@ -4486,8 +4651,8 @@ class PSD2LiveViewModel : AutoCloseable {
 		motionEditor.dragClips = emptyList()
 		// The drag only previewed; the committed clips come back whatever landed meanwhile.
 		updateState { state ->
-			val committed = shownDocument?.takeIf { it.first == state.projectOpenGeneration }?.second?.rigEdits?.motionClips ?: before
-			state.copy(rigEdits = state.rigEdits.copy(motionClips = committed))
+			val committed = shownDocument?.takeIf { it.first == state.projectOpenGeneration }?.second?.rigEdits?.let(MotionCatalog::entries) ?: before
+			state.copy(rigEdits = MotionCatalog.replacing(state.rigEdits, committed))
 		}
 		// Whether the preview still shows the drag does not matter: a commit shown meanwhile may have replaced it.
 		if (expected == null || request == null) return
@@ -7715,11 +7880,12 @@ class PSD2LiveViewModel : AutoCloseable {
             updateState { it.copy(errorMessage = tr("dialog.inputInvalid", input)) }; return
         }
         val path = input.toAbsolutePath().normalize().toString()
+        val choices = startChoices
         startWorkspaceImport(discardUnsaved, tr("status.analyzing"), afterImport = {
-            if (!layout) applyStartPresets(startChoices)
             leaveStartPage()
             openWorkspacePreset(if (layout) WorkspacePreset.LAYOUT else WorkspacePreset.EDIT)
-        }) { if (layout) it.importLayout(path, discardUnsaved) else it.importPsd(path, discardUnsaved) }
+        }) { if (layout) it.importLayout(path, discardUnsaved) else it.importPsd(path, discardUnsaved, choices.initialMode(),
+            if (choices.initialMode() == io.github.psd2live.application.WorkspaceInitialModifiers.CUSTOM) choices.initialPreset() else null) }
     }
 
     /** Both adapters invoke the same application source capability; only this entry owns GUI confirmation. */

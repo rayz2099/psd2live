@@ -130,9 +130,9 @@ internal fun AnimationPanelView(
 	var newMenuOpen by remember { mutableStateOf(false) }
 
 	val presets = state.rigEdits.motionPresets
-	val clips = state.rigEdits.motionClips
-	val basic = state.motionBasic
-	val skeletonPresets = state.motionSkeleton
+	val clips = io.github.psd2live.core.MotionCatalog.entries(state.rigEdits)
+	val basic = state.rigEdits.modifierStack == null && state.motionBasic
+	val skeletonPresets = state.rigEdits.modifierStack == null && state.motionSkeleton
 	// Generating the idle expands its poses onto the bones: only when what it is made from changes. A group
 	// the model presets switch off is not in the model, so it is not listed.
 	val renames = state.rigEdits.idRenames.parameters
@@ -305,7 +305,7 @@ private fun builtinEntries(viewModel: PSD2LiveViewModel, state: PSD2LiveState, g
 	}
 
 private fun customEntries(viewModel: PSD2LiveViewModel, state: PSD2LiveState): List<MotionEntry> =
-	state.rigEdits.motionClips.filter { it.builtin == null }.map { clip ->
+	io.github.psd2live.core.MotionCatalog.entries(state.rigEdits).filter { it.builtin == null }.map { clip ->
 		MotionEntry(
 			key = "clip:${clip.id}",
 			editorId = clip.id,
@@ -547,10 +547,10 @@ private fun PresetSettings(viewModel: PSD2LiveViewModel, name: String, settings:
 private fun ClipSettings(viewModel: PSD2LiveViewModel, clip: MotionClip) {
 	Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
 		SettingField(tr("animation.fadeInTime"), clip.fadeIn, 0f, 5f, 0.1, 1, "", true, Modifier.weight(1f), viewModel) { value ->
-			viewModel.updateMotionClipProperties(clip.id) { it.copy(fadeIn = value) }
+			viewModel.updateMotionClipProperties(clip.id) { it.copy(fadeIn = value, runtimeDefaultFades = false) }
 		}
 		SettingField(tr("animation.fadeOutTime"), clip.fadeOut, 0f, 5f, 0.1, 1, "", true, Modifier.weight(1f), viewModel) { value ->
-			viewModel.updateMotionClipProperties(clip.id) { it.copy(fadeOut = value) }
+			viewModel.updateMotionClipProperties(clip.id) { it.copy(fadeOut = value, runtimeDefaultFades = false) }
 		}
 	}
 	MotionEventSettings(viewModel, clip)

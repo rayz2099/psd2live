@@ -60,6 +60,10 @@ data class MotionEvent(val time: Float, val value: String) {
 	}
 }
 
+data class MotionParameterRange(val min: Float, val max: Float, val repeat: Boolean = false) {
+    init { require(min.isFinite() && max.isFinite() && min < max) { "Invalid captured motion parameter range" } }
+}
+
 /**
  * An authored motion. A [builtin] clip overrides the generated motion of that name (see
  * [MotionClips.BUILTIN_NAMES]); without it the clip is the user's own and exports under [name].
@@ -77,8 +81,20 @@ data class MotionClip(
 	val curves: List<MotionCurve> = emptyList(),
 	/** Events in time order, one per time. */
 	val events: List<MotionEvent> = emptyList(),
+    /** Stable asset name retained when a generated clip becomes ordinary authored content. */
+    val fileStem: String? = null,
+    val exportGroup: String? = null,
+    val runtimeDefaultFades: Boolean = false,
+    /** Runtime parameter groups contributed by this clip, independent of its display name. */
+    val parameterRoles: Map<String, List<String>> = emptyMap(),
+    /** Applied curves retain their exact controls until the corresponding parameter range changes. */
+    val capturedRanges: Map<String, MotionParameterRange> = emptyMap(),
 ) {
 	init {
+        require(capturedRanges.keys.all { it.isNotBlank() }) { "Captured motion ranges need parameter IDs" }
+        require(parameterRoles.all { (role, parameters) -> role.isNotBlank() && parameters.isNotEmpty() &&
+            parameters.all { it.isNotBlank() } && parameters.distinct().size == parameters.size }) { "Invalid motion parameter role" }
+        require(fileStem == null || fileStem.matches(Regex("[A-Za-z0-9_-]+"))) { "Invalid motion file stem" }
 		require(id.isNotBlank() && name.isNotBlank() && name.none(Char::isISOControl)) { "Motion needs an id and a name" }
 		require(duration.isFinite() && duration > 0f) { "Motion duration must be positive" }
 		require(fps.isFinite() && fps in 1f..120f) { "Motion FPS must be within 1..120" }
@@ -100,9 +116,14 @@ object MotionClips {
 		val definitions = parameters.associateBy { it.id.raw }
 		return clips.map { clip -> clip.copy(curves = clip.curves.mapNotNull { curve ->
 			val parameter = definitions[curve.parameterId] ?: return@mapNotNull null
-			val limits = MotionLoops.keyLimits(parameter)
-			clamped(curve, limits.start, limits.endInclusive)
-		}) }
+            if (clip.capturedRanges[curve.parameterId] == MotionParameterRange(parameter.min, parameter.max, parameter.repeat)) curve
+            else {
+                val limits = MotionLoops.keyLimits(parameter)
+                clamped(curve, limits.start, limits.endInclusive)
+            }
+		}, capturedRanges = clip.capturedRanges.filterKeys { it in definitions }.mapValues { (id, _) ->
+            definitions.getValue(id).let { MotionParameterRange(it.min, it.max, it.repeat) }
+        }, parameterRoles = clip.parameterRoles.mapValues { (_, ids) -> ids.filter { it in definitions } }.filterValues { it.isNotEmpty() }) }
 	}
 
 	/**
@@ -112,13 +133,15 @@ object MotionClips {
 	fun withParameterRange(clips: List<MotionClip>, parameterId: String, min: Float, max: Float, repeat: Boolean = false): List<MotionClip> {
 		val limits = MotionLoops.keyLimits(min, max, repeat)
 		return clips.map { clip -> clip.copy(curves = clip.curves.map {
-			if (it.parameterId == parameterId) clamped(it, limits.start, limits.endInclusive) else it
-		}) }
+			if (it.parameterId == parameterId && clip.capturedRanges[parameterId] != MotionParameterRange(min, max, repeat))
+                clamped(it, limits.start, limits.endInclusive) else it
+		}, capturedRanges = if (parameterId in clip.capturedRanges) clip.capturedRanges + (parameterId to MotionParameterRange(min, max, repeat)) else clip.capturedRanges) }
 	}
 
 	/** [clips] without the curves of parameter [parameterId], once it is deleted. */
 	fun withoutParameter(clips: List<MotionClip>, parameterId: String): List<MotionClip> =
-		clips.map { clip -> clip.copy(curves = clip.curves.filterNot { it.parameterId == parameterId }) }
+		clips.map { clip -> clip.copy(curves = clip.curves.filterNot { it.parameterId == parameterId }, capturedRanges = clip.capturedRanges - parameterId,
+            parameterRoles = clip.parameterRoles.mapValues { (_, ids) -> ids.filterNot { it == parameterId } }.filterValues { it.isNotEmpty() }) }
 
 	private fun clamped(curve: MotionCurve, min: Float, max: Float): MotionCurve = curve.copy(keys = curve.keys.map { key ->
 		val value = key.value.coerceIn(min, max)
@@ -273,9 +296,14 @@ object MotionClips {
 	 * The file stem each user clip exports under, by clip id: its name's [slug], numbered past the generated
 	 * motions' stems and the clips before it. The preview plays a motion by this stem.
 	 */
-	fun exportStems(clips: List<MotionClip>): Map<String, String> {
+	fun exportStems(clips: List<MotionClip>, generatedFiles: Set<String> = emptySet()): Map<String, String> {
 		val used = BUILTIN_NAMES.mapTo(HashSet()) { it.lowercase() }
+        val fixed = clips.filter { it.builtin == null }.mapNotNull { it.fileStem }
+        val occupied = generatedFiles.mapTo(HashSet()) { it.lowercase() }
+        require(fixed.all { occupied.add(it.lowercase()) }) { "Motion file stems must be unique and must not replace generated files" }
+        used += occupied
 		return clips.filter { it.builtin == null }.associate { clip ->
+			if (clip.fileStem != null) return@associate clip.id to clip.fileStem
 			val slug = slug(clip.name)
 			var stem = slug
 			var index = 2
@@ -287,6 +315,17 @@ object MotionClips {
 
 	fun toJson(clip: MotionClip): JsonObject = buildJsonObject {
 		put("id", clip.id)
+        clip.fileStem?.let { put("file", it) }
+        clip.exportGroup?.let { put("export_group", it) }
+        if (clip.runtimeDefaultFades) put("runtime_default_fades", true)
+        if (clip.capturedRanges.isNotEmpty()) putJsonObject("captured_ranges") {
+            clip.capturedRanges.forEach { (id, range) -> putJsonObject(id) {
+                put("min", range.min); put("max", range.max); put("repeat", range.repeat)
+            } }
+        }
+        if (clip.parameterRoles.isNotEmpty()) putJsonObject("parameter_roles") {
+            clip.parameterRoles.forEach { (role, parameters) -> put(role, JsonArray(parameters.map(::JsonPrimitive))) }
+        }
 		put("name", clip.name)
 		clip.builtin?.let { put("builtin", it) }
 		put("loop", clip.loop)
@@ -329,6 +368,14 @@ object MotionClips {
 		id = o.getValue("id").jsonPrimitive.content,
 		name = o.getValue("name").jsonPrimitive.content,
 		builtin = o["builtin"]?.jsonPrimitive?.contentOrNull,
+        fileStem = o["file"]?.jsonPrimitive?.contentOrNull,
+        exportGroup = o["export_group"]?.jsonPrimitive?.contentOrNull,
+        runtimeDefaultFades = o["runtime_default_fades"]?.jsonPrimitive?.booleanOrNull ?: false,
+        capturedRanges = o["captured_ranges"]?.jsonObject?.mapValues { (_, value) -> value.jsonObject.let {
+            MotionParameterRange(it.getValue("min").jsonPrimitive.float, it.getValue("max").jsonPrimitive.float,
+                it["repeat"]?.jsonPrimitive?.boolean ?: false)
+        } }.orEmpty(),
+        parameterRoles = o["parameter_roles"]?.jsonObject?.mapValues { (_, ids) -> ids.jsonArray.map { it.jsonPrimitive.content } }.orEmpty(),
 		loop = o["loop"]?.jsonPrimitive?.booleanOrNull ?: false,
 		duration = o["duration"]?.jsonPrimitive?.floatOrNull ?: 2f,
 		fps = o["fps"]?.jsonPrimitive?.floatOrNull ?: 30f,
@@ -339,7 +386,7 @@ object MotionClips {
 			val curve = element.jsonObject
 			MotionCurve(
 				parameterId = curve.getValue("parameter").jsonPrimitive.content,
-				keys = normalized(curve["keys"]?.jsonArray.orEmpty().map { keyElement ->
+				keys = curve["keys"]?.jsonArray.orEmpty().map { keyElement ->
 					val key = keyElement.jsonObject
 					fun handle(name: String) = key[name]?.jsonArray?.let {
 						MotionHandle(it[0].jsonPrimitive.float, it[1].jsonPrimitive.float)
@@ -353,7 +400,11 @@ object MotionClips {
 						outHandle = handle("out"),
 						inHandle = handle("in"),
 					)
-				}),
+                }.let { keys ->
+                    // Captured generated curves can contain an intentional jump at the same timestamp.
+                    if (curve.getValue("parameter").jsonPrimitive.content in o["captured_ranges"]?.jsonObject.orEmpty()) keys.sortedBy { it.time }
+                    else normalized(keys)
+                },
 			)
 		},
 		events = normalizedEvents(o["events"]?.jsonArray.orEmpty().map { element ->

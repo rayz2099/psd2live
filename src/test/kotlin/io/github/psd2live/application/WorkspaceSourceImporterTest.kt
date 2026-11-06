@@ -5,6 +5,7 @@ import io.github.psd2live.project.WorkspaceRevisions
 import io.github.psd2live.project.rawConfig
 import io.github.psd2live.scenario.Characters
 import kotlinx.coroutines.*
+import kotlinx.serialization.json.*
 import org.junit.jupiter.api.io.TempDir
 import org.umamo.format.art.SourceArt
 import org.umamo.format.art.SourceLayer
@@ -18,6 +19,64 @@ import kotlin.test.*
 
 class WorkspaceSourceImporterTest {
     @TempDir lateinit var directory: Path
+
+    @Test fun aPsdInstallsTheSelectedStackInItsInitialHistoryNode() = runBlocking<Unit> {
+        val original = Characters.head(physics = false)
+        val path = Files.createFile(directory.resolve("modifier-input.psd")).toAbsolutePath()
+        val builder = WorkspacePreviewBuilder()
+        for (mode in listOf(WorkspaceInitialModifiers.RECOMMENDED, WorkspaceInitialModifiers.EMPTY)) {
+            val runtime = WorkspaceRuntime<RigPreviewModel>({ builder.build(it) })
+            val importer = WorkspaceSourceImporter(runtime, readPsd = { original.source })
+            val result = importer.importPsd(path, null, runtime.state.value.state, initialConfig = original.rawConfig(), modifiers = mode)
+            val installed = result.capture
+            val stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(installed.document.rigEdits.modifierStack!!)
+            assertEquals(1, runtime.history().selections.size)
+            if (mode == WorkspaceInitialModifiers.EMPTY) {
+                assertTrue(stack.instances.isEmpty())
+                assertTrue(installed.model.rig.puppet.deformers.isEmpty())
+            } else {
+                assertTrue(stack.instances.all { it.presetGroup == "fitted" })
+                assertEquals(listOf("rig.scaffold") + WorkspaceModifierPlan.groups.getValue("fitted"), stack.instances.map { it.type })
+                assertTrue(installed.model.rig.puppet.deformers.isNotEmpty())
+            }
+            val rebuilt = builder.build(installed.document)
+            assertEquals(io.github.psd2live.core.RigIrCompiler.compile(installed.model),
+                io.github.psd2live.core.RigIrCompiler.compile(rebuilt))
+        }
+    }
+
+    @Test fun shortcutChoicesInstallIndependentModifiersAndReplayInOneHistoryNode() = runBlocking<Unit> {
+        val original = Characters.head(physics = true)
+        val path = Files.createFile(directory.resolve("shortcut.psd")).toAbsolutePath()
+        val builder = WorkspacePreviewBuilder()
+        for (mode in listOf(WorkspaceInitialModifiers.MINIMAL, WorkspaceInitialModifiers.DEFAULT, WorkspaceInitialModifiers.FULL, WorkspaceInitialModifiers.CUSTOM)) {
+            val runtime = WorkspaceRuntime<RigPreviewModel>({ builder.build(it) })
+            val importer = WorkspaceSourceImporter(runtime, readPsd = { original.source })
+            val choices = WorkspaceInitialPreset(headStrength = 0.7f, bodyStrength = 3.2f, clothing = false)
+            val installed = importer.importPsd(path, null, runtime.state.value.state, initialConfig = original.rawConfig(),
+                modifiers = mode, preset = choices.takeIf { mode == WorkspaceInitialModifiers.CUSTOM }).capture
+            val stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(installed.document.rigEdits.modifierStack!!)
+            assertEquals(1, runtime.history().selections.size)
+            assertTrue(stack.instances.isNotEmpty())
+            assertTrue(stack.instances.all { it.presetGroup == mode.name.lowercase() })
+            assertTrue(installed.document.rigEdits.simEdits.isEmpty())
+            if (mode == WorkspaceInitialModifiers.FULL) assertTrue(stack.instances.any { it.type == "simulation" })
+            if (mode == WorkspaceInitialModifiers.MINIMAL) assertTrue(stack.instances.none { it.type == "motion" || it.type == "simulation" })
+            val rebuilt = builder.build(installed.document)
+            assertEquals(io.github.psd2live.core.RigIrCompiler.compile(installed.model, simulations = true),
+                io.github.psd2live.core.RigIrCompiler.compile(rebuilt, simulations = true))
+            if (mode == WorkspaceInitialModifiers.FULL) {
+                val simulation = stack.instances.first { it.type == "simulation" }
+                val provider = simulation.parameterProviders.values.first()
+                WorkspaceDocumentCommands(runtime).execute(installed.projectId, installed.state, "Disable simulation input", listOf(
+                    WorkspaceDocumentOperation("modifier_enable", buildJsonObject { put("id", provider); put("enabled", false) })
+                ), io.github.psd2live.project.MutationAuthor.USER)
+                val report = runtime.capture().model.rig.modifierReport!!.getValue("entries").jsonArray
+                    .single { it.jsonObject.getValue("id").jsonPrimitive.content == simulation.id }.jsonObject
+                assertEquals("missing_dependency", report.getValue("status").jsonPrimitive.content)
+            }
+        }
+    }
 
     @Test fun materialAndRevisionPreparationLeaveTheCallerThreadButProjectionReturnsToIt() = runBlocking {
         val original = Characters.head(physics = false)

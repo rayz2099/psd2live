@@ -10,6 +10,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
 
+enum class WorkspaceInitialModifiers { RECOMMENDED, EMPTY, MINIMAL, DEFAULT, FULL, CUSTOM }
+
 /** New source projects use one isolated read/rebuild/install boundary in both adapters. */
 internal class WorkspaceSourceImporter(
     private val runtime: WorkspaceRuntime<RigPreviewModel>,
@@ -33,12 +35,14 @@ internal class WorkspaceSourceImporter(
                          sourceAuxiliary: JsonObject = JsonObject(emptyMap()),
                          /** The file name the user chose, when [path] is a captured copy under another name. */
                          displayName: String = path.fileName.toString(),
+                         modifiers: WorkspaceInitialModifiers? = null,
+                         preset: WorkspaceInitialPreset? = null,
                          project: (WorkspaceDocument, RigPreviewModel, String) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> {
         return install(projectId, state, discardUnsaved, initialConfig, "Imported PSD $displayName",
             prepare = {
                 require(path.isAbsolute && Files.isRegularFile(path) && path.fileName.toString().endsWith(".psd", true)) { "Provide an absolute local PSD path" }
                 Prepared(readPsd(path), emptyMap(), materials = displayName)
-            }, project = project, sourceAuxiliary = sourceAuxiliary)
+            }, project = project, sourceAuxiliary = sourceAuxiliary, modifiers = modifiers, preset = preset)
     }
 
     /**
@@ -55,12 +59,12 @@ internal class WorkspaceSourceImporter(
             val source = LayoutManifest.source(layout)
             Prepared(source.art, source.overrides, source.userTags, materials = path.fileName.toString(), materialFolder = layout.name,
                 references = source.references)
-        }, project, layout = true)
+        }, project, layout = true, modifiers = WorkspaceInitialModifiers.EMPTY)
 
     suspend fun createArtwork(arguments: JsonObject, projectId: String?, state: String, discardUnsaved: Boolean = false,
                               initialConfig: PipelineConfig = PipelineConfig(),
                               project: (WorkspaceDocument, RigPreviewModel, String) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> =
-        install(projectId, state, discardUnsaved, initialConfig, "Created source artwork", { readArtwork(arguments).let { Prepared(it.first, it.second) } }, project)
+        install(projectId, state, discardUnsaved, initialConfig, "Created source artwork", { readArtwork(arguments).let { Prepared(it.first, it.second) } }, project, modifiers = WorkspaceInitialModifiers.RECOMMENDED)
 
     /** A new empty canvas of [width] x [height], not generated: materials are placed first and the rig generated later. */
     suspend fun createLayout(width: Int, height: Int, projectId: String?, state: String, discardUnsaved: Boolean = false,
@@ -68,7 +72,7 @@ internal class WorkspaceSourceImporter(
                              project: (WorkspaceDocument, RigPreviewModel, String) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> {
         require(width in 1..8192 && height in 1..8192 && width.toLong() * height <= 16_777_216) { "Canvas must be 1..8192 per side and at most 16 megapixels" }
         return install(projectId, state, discardUnsaved, initialConfig, "Created layout project",
-            { Prepared(WorkspaceSourceArt(width, height, emptyList(), emptyList()), emptyMap()) }, project, layout = true)
+            { Prepared(WorkspaceSourceArt(width, height, emptyList(), emptyList()), emptyMap()) }, project, layout = true, modifiers = WorkspaceInitialModifiers.EMPTY)
     }
 
     /**
@@ -82,7 +86,15 @@ internal class WorkspaceSourceImporter(
     private suspend fun install(projectId: String?, state: String, discardUnsaved: Boolean, initialConfig: PipelineConfig,
                                 summary: String, prepare: suspend () -> Prepared,
                                 project: (WorkspaceDocument, RigPreviewModel, String) -> Unit,
-                                sourceAuxiliary: JsonObject = JsonObject(emptyMap()), layout: Boolean = false): WorkspaceCommit<RigPreviewModel> {
+                                sourceAuxiliary: JsonObject = JsonObject(emptyMap()), layout: Boolean = false,
+                                modifiers: WorkspaceInitialModifiers? = null, preset: WorkspaceInitialPreset? = null): WorkspaceCommit<RigPreviewModel> {
+        require(preset == null || modifiers == WorkspaceInitialModifiers.CUSTOM) { "Custom choices require the custom modifier mode" }
+        val choices = when (modifiers) {
+            WorkspaceInitialModifiers.RECOMMENDED -> WorkspaceModelPresetLibrary.shared.get("modern").choices
+            WorkspaceInitialModifiers.CUSTOM -> requireNotNull(preset) { "Custom modifier choices are required" }
+            WorkspaceInitialModifiers.MINIMAL, WorkspaceInitialModifiers.DEFAULT, WorkspaceInitialModifiers.FULL -> WorkspaceInitialPreset.forMode(modifiers)
+            else -> null
+        }
         val before = runtime.state.value
         currentCoroutineContext().ensureActive()
         // Capture before source I/O. Another edit or reload cannot be hidden by taking a newer token.
@@ -96,10 +108,16 @@ internal class WorkspaceSourceImporter(
         val input = prepare()
         val source = input.source; val overrides = input.overrides
         progress(0.4f, "Preparing new source document")
-        val config = initialConfig.copy(layerVisibility = emptyMap(), deletedLayerIds = emptySet(),
+        val baseline = if (modifiers == WorkspaceInitialModifiers.RECOMMENDED)
+            WorkspacePresetBaseline.configure(initialConfig, "modern") else initialConfig
+        val config = (choices?.configure(baseline) ?: baseline).copy(layerVisibility = emptyMap(), deletedLayerIds = emptySet(),
             layerOverrides = overrides, parentOverrides = emptyMap(), drawOrderOverrides = emptyMap(), meshOverrides = emptyMap(),
-            rigEdits = RigEditOverlay.Empty, generationSource = null, meshSource = null, hairSimulationFront = false, hairSimulationBack = false)
-        val created = WorkspaceDocument(source, emptyMap(), emptySet(), overrides, emptyMap(), RigEditOverlay.Empty,
+            rigEdits = RigEditOverlay.Empty, generationSource = null, meshSource = null,
+            hairSimulationFront = choices?.frontHair == WorkspaceInitialHair.SIMULATION,
+            hairSimulationBack = choices?.backHair == WorkspaceInitialHair.SIMULATION)
+        val overlay = if (modifiers == null) RigEditOverlay.Empty else RigEditOverlay(
+            modifierStack = io.github.psd2live.core.modifier.RigModifierStack().toJson())
+        val created = WorkspaceDocument(source, emptyMap(), emptySet(), overrides, emptyMap(), overlay,
             WorkspaceSettingsCodec.encode(config),
             layout = if (layout) WorkspaceLayout(generation = WorkspaceGeneration.NotGenerated, layerTags = input.userTags,
                 referenceLayerIds = input.references) else WorkspaceLayout.Empty)
@@ -115,7 +133,15 @@ internal class WorkspaceSourceImporter(
             }
         }
         progress(0.6f, "Rebuilding new source project")
-        var built = RigBuildProfile.stage("source import: preview build (wall time)") { build(document) }
+        var built = RigBuildProfile.stage("source import: preview build (wall time)") {
+            if (choices == null) build(document) else {
+                val prepared = runInterruptible(Dispatchers.Default) {
+                    WorkspacePresetInitialization.prepare(document, WorkspaceRasterWork.Direct.cancellable(context), choices)
+                }
+                document = prepared.first
+                prepared.second
+            }
+        }
         if (input.references.isNotEmpty()) {
             document = runInterruptible(Dispatchers.Default) { WorkspaceReferenceMeshes.ensure(document, built, context::ensureActive) }
             built = build(document)
@@ -135,7 +161,7 @@ internal class WorkspaceSourceImporter(
         }
         // A new project keeps its first layout: the atlas is arranged on request, not on every edit. The stored
         // arrangement is that layout exactly, so the model it builds is this one.
-        val arrangement = AtlasLayout.frozen(built.atlas)
+        val arrangement = AtlasLayout.frozen(built.modifierAuthorAtlas ?: built.atlas)
         val preview = built.copy(config = built.config.copy(atlasArrangement = arrangement), atlas = built.atlas.copy(arranged = true))
         // The preview was generated from effective settings; the document keeps the raw ones it was given.
         val prepared = document.copy(rigEdits = preview.config.rigEdits,

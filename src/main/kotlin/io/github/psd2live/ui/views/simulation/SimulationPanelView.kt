@@ -122,7 +122,7 @@ internal fun SimulationPanelView(
 ) {
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
-	val sims = state.rigEdits.simEdits
+	val sims = io.github.psd2live.core.sim.SimulationCatalog.entries(state.rigEdits)
 	var selectedId by remember { mutableStateOf<String?>(null) }
 	val selected = sims.firstOrNull { it.id == selectedId } ?: sims.firstOrNull()
 	val status by viewModel.simulationStatus.collectAsState()
@@ -136,7 +136,7 @@ internal fun SimulationPanelView(
 			sim.id to when {
 				!sim.enabled -> BakeState.DISABLED
 				sim.bake == null -> BakeState.UNBAKED
-				puppet != null && SimBake.stale(puppet, sim) -> BakeState.STALE
+				puppet != null && io.github.psd2live.core.sim.SimulationCatalog.stale(state.rigEdits, puppet, sim) -> BakeState.STALE
 				else -> BakeState.BAKED
 			}
 		}
@@ -723,8 +723,8 @@ private fun BakeEditor(
  * user's own clips by ID - with the label each shows under.
  */
 private fun motionChoices(state: PSD2LiveState): Map<String, String> =
-	(listOf("Idle", "Nod", "Shake") + if (state.rigEdits.skeleton != null) io.github.psd2live.core.SkeletonMotions.presets.map { it.name } else emptyList())
-		.associateWith { it } + state.rigEdits.motionClips.filter { it.enabled && it.builtin == null }.associate { it.id to it.name }
+	(if (state.rigEdits.modifierStack != null) emptyList() else listOf("Idle", "Nod", "Shake") + if (state.rigEdits.skeleton != null) io.github.psd2live.core.SkeletonMotions.presets.map { it.name } else emptyList())
+		.associateWith { it } + io.github.psd2live.core.MotionCatalog.entries(state.rigEdits).filter { it.enabled && it.builtin == null }.associate { it.id to it.name }
 
 /**
  * One motion's check: how far the baked body swings against the simulated one, how late, how it settles and how

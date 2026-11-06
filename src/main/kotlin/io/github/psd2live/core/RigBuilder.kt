@@ -151,6 +151,15 @@ data class BuiltRig(
 	 * maps any mesh, but the layer is not theirs: what looks a layer's mesh up ([ownLayerIdByDrawableId]) never finds one.
 	 */
 	val copiedDrawableIds: Set<String> = emptySet(),
+    /** Independent source pixels materialized with an applied modifier. Tile metadata lives in the puppet. */
+    internal val modifierRasterAssets: List<io.github.psd2live.format.model.TileArt> = emptyList(),
+    internal val authoredRestPose: Map<String, Float> = emptyMap(),
+    internal val authoredParameterRoles: List<io.github.psd2live.format.model.ParameterRole> = emptyList(),
+    /** Derived modifier sidecars and contributions; the document stores instances, never this result. */
+    val modifierOutput: io.github.psd2live.format.model.RigIR? = null,
+    val modifierReport: kotlinx.serialization.json.JsonObject? = null,
+    /** Native chain inventory for adapters that must keep the public identity independent of temporary numbering. */
+    internal val generatedChains: List<io.github.psd2live.core.fit.HairChain> = emptyList(),
 ) {
 	/** The source layer whose art [drawableId] shows: its own, or for a copy over the bangs its original's. */
 	fun layerOf(drawableId: String): String? =
@@ -323,12 +332,14 @@ object RigBuilder {
 			val values = io.github.psd2live.core.recipe.RigModules.EYE_FITTED.knobs.map { config.recipe.baseValue("eye", it.id) }
 			val options = eyeOptions(config)
 			val moved = listOf(config.recipe.moves("eye.L"), config.recipe.moves("eye.R"))
-			return fittedEyes.getOrPut(listOf(values, options, config.parentOverrides, deformersEnabled, moved)) {
+			return fittedEyes.getOrPut(listOf(values, options, config.parentOverrides, deformersEnabled, moved, config.recipe.eyeParts)) {
 				val space = analysis.layers.firstOrNull { it.semantic.tag == SemanticTag.EYEWHITE && it.opaquePixels > 0 }?.let { headSpaceFor(it, config) }
 				val toRig = { x: Float, y: Float -> space?.toAligned(x, y) ?: (x to y) }
 				val result = io.github.psd2live.core.fit.EyeFitting.fit(analysis.layers, faceRig.centerX, toRig)
-				io.github.psd2live.core.fit.FittedEyes(result, result.fits.mapValues { (side, drawn) ->
-					val fit = drawn.moved(rigMoves(config, if (side == Side.LEFT) "eye.L" else "eye.R", toRig))
+				val fits = result.fits.mapValues { (side, drawn) -> drawn.moved(rigMoves(config, if (side == Side.LEFT) "eye.L" else "eye.R", toRig)) }
+				val artwork = io.github.psd2live.core.fit.EyeArtworkFitting.fit(analysis.layers, fits, config.recipe.eyeParts, toRig)
+				io.github.psd2live.core.fit.FittedEyes(result, fits.mapValues { (side, drawn) ->
+					val fit = drawn.copy(artwork = artwork[side])
 					io.github.psd2live.core.fit.EyeRig(fit, values[0] / 100f, values[1] / 100f, values[2] / 100f,
 						smileArc = options.smileArc, smilePush = options.smilePush, wideLift = options.wideLift)
 				}, options)
@@ -418,9 +429,11 @@ object RigBuilder {
 		}
 
 		/** The head's feature points read off the art ([io.github.psd2live.core.fit.FaceLandmarking]), in the rig's space. */
-		fun faceLandmarks(config: PipelineConfig): io.github.psd2live.core.fit.FaceLandmarks =
+		private val landmarks = java.util.concurrent.ConcurrentHashMap<PipelineConfig, io.github.psd2live.core.fit.FaceLandmarks>()
+		fun faceLandmarks(config: PipelineConfig): io.github.psd2live.core.fit.FaceLandmarks = landmarks.getOrPut(config) {
 			io.github.psd2live.core.fit.FaceLandmarking.read(analysis.layers, fittedEyes(config)?.fitting, fittedBrows(config).mapValues { it.value.fit },
 				fittedMouth(config)?.rig?.fit, faceRig.centerX) { x, y -> faceRig.coordinateSpace.toAligned(x, y) }
+		}
 
 		private val fittedMouths = java.util.concurrent.ConcurrentHashMap<List<Any?>, io.github.psd2live.core.fit.FittedMouth>()
 
@@ -1302,7 +1315,7 @@ object RigBuilder {
 		val baseLayers = if (!v2) analysis.layers
 			else analysis.layers.filterNot { resolution.isPartLayer(it.source.id.raw) } + passengers.filterNot { resolution.isPartLayer(it.source.id.raw) }
 		// The face lean rewrites each warp's own grid and nothing else, so it commutes with the re-parenting below.
-		val turned = withFaceTurn(rawDeformers, context, config)
+		val turned = faceTurnStage(rawDeformers, context, config, stages)
 		val leaned = stages?.get(RigStageCache.LEAN, 8, Identity(turned, config.rigTuning)) { withFaceLean(turned, config.rigTuning) }
 			?: withFaceLean(turned, config.rigTuning)
 
@@ -1396,7 +1409,9 @@ object RigBuilder {
 		val orderedLayers = orderMouthLayers(baseLayers.sortedBy { it.source.order })
 		val orderStep = generatedOrderStep(config.drawOrderStep, orderedLayers.size)
 		// A passenger keys a toggle or switch only while the resolved layers still need its parameter.
-		val moduleParams = moduleParameters(context, config)
+		val generatedChains = hairChains(context.analysis, context.faceRig, config)
+			.filter { chain -> context.deformers.any { it.id.raw == chain.warpId } }
+		val moduleParams = moduleParameters(context, config, generatedChains)
 		val knownParameters = if (!v2) emptySet() else (standardParameters(context, config) + moduleParams + customParams).mapTo(HashSet()) { it.id }
 		val ghostIds = LinkedHashSet<DrawableId>()
 		for ((drawIndex, layer) in orderedLayers.withIndex()) {
@@ -1561,10 +1576,11 @@ object RigBuilder {
 				faceMasks.isNotEmpty() && drawable.maskedBy.isEmpty() && drawable.id !in lipOwnerById &&
 					(semantic.tag == SemanticTag.FACE_DETAIL || semantic.tag == SemanticTag.FRONT_HAIR && semantic.role == PartRole.SHADOW) &&
 					onSkin(classifiedByDrawable.getValue(drawable.id)) -> drawable.copy(maskedBy = faceMasks.map { it.id })
-				semantic.tag == SemanticTag.IRIDES -> {
-					val exact = drawableByTagSide[SemanticTag.EYEWHITE to semantic.side].orEmpty()
-					val fallback = drawableByTagSide[SemanticTag.EYEWHITE to Side.NONE].orEmpty()
-					drawable.copy(maskedBy = (exact.ifEmpty { fallback }).map { it.id })
+				semantic.tag == SemanticTag.IRIDES && drawable.maskedBy.isEmpty() -> {
+					val whites = maskSources.filter { classifiedByDrawable.getValue(it.id).semantic.tag == SemanticTag.EYEWHITE }
+					val selected = io.github.psd2live.core.fit.EyeOpeningAssociation.select(classifiedByDrawable.getValue(drawable.id),
+						whites.map { classifiedByDrawable.getValue(it.id) }).mapTo(HashSet()) { it.source.id }
+					drawable.copy(maskedBy = whites.filter { classifiedByDrawable.getValue(it.id).source.id in selected }.map { it.id })
 				}
 				inMouth(classifiedByDrawable.getValue(drawable.id)) -> {
 					val layer = classifiedByDrawable.getValue(drawable.id)
@@ -1772,7 +1788,7 @@ object RigBuilder {
 				}
 				return BuiltRig(skeletonPuppet, pageByDrawable, sourceBoundsByDrawable, layerIdByDrawable, faceCenterCanvas.first,
 					faceCenterCanvas.second, faceRig.radiusX, faceRig.radiusY, warnings, faceRig.initialAngleZ, unbound, primitiveSkins = skins,
-					seeThrough = seeThrough(skeletonPuppet), copiedDrawableIds = generatedCopies.toSet())
+					seeThrough = seeThrough(skeletonPuppet), copiedDrawableIds = generatedCopies.toSet(), generatedChains = generatedChains)
 			}
 			val skeletal = skeleton
 				?.let { RigBuildProfile.stage("skeleton") {
@@ -1799,7 +1815,7 @@ object RigBuilder {
 				faceRig.initialAngleZ,
 				unbound,
 				primitiveSkins = skins,
-				seeThrough = seeThrough(skeletonPuppet), copiedDrawableIds = generatedCopies.toSet(),
+				seeThrough = seeThrough(skeletonPuppet), copiedDrawableIds = generatedCopies.toSet(), generatedChains = generatedChains,
 			)
 		}
 		if (stages == null) return finish()
@@ -2274,7 +2290,7 @@ object RigBuilder {
 			MeshResolution.input(layer.source, config.meshTrace, MeshResolution.unitScale(config, context.analysis.source)).key,
 			rigLayer.bounds, rigLayer.centroidX, rigLayer.centroidY, parentId, parentFrame, headSpace,
 			listOf(if (eyes) listOf(faceSignature(context.faceRig), context.fittedEyes(config)?.let { it.rigs[rigLayer.semantic.side]?.fit to it.options },
-				rigLayer.semantic.role, context.fittedBrows(config)[rigLayer.semantic.side]?.let { it.fit to it.hashCode() },
+				rigLayer.semantic.role, context.fittedBrows(config)[rigLayer.semantic.side]?.cacheKey,
 				context.fittedMouth(config)?.let { listOf(it.rig?.fit, it.rig?.options, it.chin, it.covers(rigLayer)) }) else null, context.headTurn(config)?.let {
 				listOf(faceSignature(context.faceRig), headShell(rigLayer), io.github.psd2live.core.recipe.RigModules.FACE_DEPTH_TURN.let { m ->
 					m.knobs.map { config.recipe.value(m.id, it.id) } }, config.headTurnStrength, context.faceTurn(config) != null && styled(rigLayer))
@@ -3458,9 +3474,11 @@ object RigBuilder {
 			return mouth.rig.faceGrid(data.rigPositions, parentFrame, StandardParameters.MOUTH_FORM, StandardParameters.MOUTH_OPEN, mouth.chin)
 		return when (tag) {
 			SemanticTag.EYEWHITE, SemanticTag.EYELASH ->
-				eyes?.rigs?.get(layer.semantic.side)?.let { eye ->
+				(if (layer.semantic.side == Side.NONE && eyes != null) io.github.psd2live.core.fit.EyeModules.pairedLidGrid(
+					io.github.psd2live.core.fit.EyeModules.meshOf(tag, layer.semantic.role)!!, layer.source.id.raw, data.rigPositions, parentFrame, eyes) else null)
+				?: eyes?.rigs?.get(layer.semantic.side)?.let { eye ->
 					io.github.psd2live.core.fit.EyeModules.lidGrid(io.github.psd2live.core.fit.EyeModules.meshOf(tag, layer.semantic.role)!!,
-						layer.semantic.side, data.rigPositions, parentFrame, eye, eyes.options)
+						layer.semantic.side, data.rigPositions, parentFrame, eye, eyes.options, layer.source.id.raw)
 				} ?: eyeClosureGrid(layer, data, parentFrame, faceRig, eyeWhiteBounds, config.rigTuning)
 			SemanticTag.EYE_CLOSE -> eyes?.rigs?.get(layer.semantic.side)?.let { eye ->
 				io.github.psd2live.core.fit.EyeModules.closedLineGrid(layer.semantic.side, data.rigPositions, parentFrame, eye, eyes.options)
@@ -3579,9 +3597,11 @@ object RigBuilder {
 			// Turning toward +x carries the face's middle that way: the lock on the +x side is the far one.
 			val far = if (layer.centroidX >= context.faceRig.coordinateSpace.toCanvas(context.faceRig.centerX, context.faceRig.centerY).first) 1f else -1f
 			val behind = (face - 1f).coerceAtLeast(0f)
-			val keys = if (far > 0f) floatArrayOf(0f, 40f, 45f) else floatArrayOf(-45f, -40f, 0f)
+			// The editor format bundles this channel with geometry on the same angle axis.
+			// Extend the unchanged side across the full span so the mesh can be exported.
+			val keys = if (far > 0f) floatArrayOf(-45f, 0f, 40f, 45f) else floatArrayOf(-45f, -40f, 0f, 45f)
 			drawable.copy(channelGrids = ChannelGrids(drawable.channelGrids.gridsByChannel + (FormChannel.DRAW_ORDER to
-				scalarGrid(StandardParameters.ANGLE_X, keys) { angle -> if (kotlin.math.abs(angle) >= 45f) behind else drawable.drawOrder })))
+				scalarGrid(StandardParameters.ANGLE_X, keys) { angle -> if (angle * far >= 45f) behind else drawable.drawOrder })))
 		}
 	}
 
@@ -3733,10 +3753,18 @@ object RigBuilder {
 				if (eyes?.options?.smile == true && eyes.rigs[layer.semantic.side] != null) io.github.psd2live.core.fit.EyeModules.smile(layer.semantic.side) else null,
 				ParameterId(if (left) "ParamBrowLSpring" else "ParamBrowRSpring"))
 		}
+		if (layer.semantic.side == Side.NONE && eyes != null && (tag == SemanticTag.EYEWHITE || tag == SemanticTag.EYELASH)) {
+			val owner = List(data.rigPositions.size / 2) { i -> eyes.sideAt(layer.source.id.raw, data.rigPositions[i * 2], data.rigPositions[i * 2 + 1]) }
+			return eyes.rigs.flatMap { (side, eye) -> io.github.psd2live.core.fit.EyeModules.lidShapes(
+				io.github.psd2live.core.fit.EyeModules.meshOf(tag, layer.semantic.role)!!, side, data.rigPositions, frame, eye, eyes.options, layer.source.id.raw)
+				.map { shape -> shape.copy(forms = shape.forms.map { form -> form?.let { org.umamo.runtime.model.MeshForm(it.positionDeltas.mapIndexed { i, delta ->
+					if (owner[i / 2] == side) delta else 0f }.toFloatArray()) } }) }
+			}
+		}
 		val eye = eyes?.rigs?.get(layer.semantic.side) ?: return emptyList()
 		return when {
 			tag == SemanticTag.EYEWHITE || tag == SemanticTag.EYELASH -> io.github.psd2live.core.fit.EyeModules.lidShapes(
-				io.github.psd2live.core.fit.EyeModules.meshOf(tag, layer.semantic.role)!!, layer.semantic.side, data.rigPositions, frame, eye, eyes.options)
+				io.github.psd2live.core.fit.EyeModules.meshOf(tag, layer.semantic.role)!!, layer.semantic.side, data.rigPositions, frame, eye, eyes.options, layer.source.id.raw)
 			tag == SemanticTag.IRIDES && layer.semantic.role == PartRole.HIGHLIGHT ->
 				io.github.psd2live.core.fit.EyeModules.highlightShapes(data.rigPositions, frame, eye.fit.iris ?: layer.bounds, eyes.options)
 			tag == SemanticTag.IRIDES -> io.github.psd2live.core.fit.EyeModules.pupilShapes(layer.semantic.side, data.rigPositions, frame,
@@ -4316,12 +4344,12 @@ object RigBuilder {
 	}
 
 	/** The parameters the rig modules [config] builds add ([io.github.psd2live.core.recipe.RigModules.parameters]). */
-	private fun moduleParameters(context: RigContext, config: PipelineConfig): List<Parameter> {
+	private fun moduleParameters(context: RigContext, config: PipelineConfig, chains: List<io.github.psd2live.core.fit.HairChain>): List<Parameter> {
 		val eyesFitted = context.fittedEyes(config)?.rigs?.isNotEmpty() == true
 		return io.github.psd2live.core.recipe.RigModules.parameters(config, io.github.psd2live.core.recipe.RecipeSubject.of(context.analysis))
 			.filter { eyesFitted || !it.id.startsWith("ParamEye") }
 			.map { Parameter(ParameterId(it.id), tr(it.nameKey), it.min, it.max, it.default) } +
-			hairChains(context.analysis, context.faceRig, config).filter { chain -> context.deformers.any { it.id.raw == chain.warpId } }.flatMap { chain ->
+			chains.flatMap { chain ->
 				val name = context.analysis.layers.firstOrNull { it.source.id.raw == chain.layerId }?.source?.name ?: chain.layerId
 				chain.parameters.map { p -> Parameter(p, tr("model.parameter.hairChain", name, p.raw.removePrefix(chain.kind.prefix)), -1f, 1f, 0f) }
 			}
@@ -4600,6 +4628,21 @@ object RigBuilder {
 	 * face's lattice is too coarse for - the outline straightening, folding and swinging. Each lattice point is put where,
 	 * through the warps above it at that key, it lands where the field sends it. Without a field, [deformers] as they are.
 	 */
+	private fun faceTurnStage(deformers: List<Deformer>, context: RigContext, config: PipelineConfig, stages: RigStageCache?): List<Deformer> {
+		if (stages == null) return withFaceTurn(deformers, context, config)
+		if (context.faceTurn(config) == null) return deformers
+		val marks = context.faceLandmarks(config)
+		// Content keys: unrelated recipe modules must not solve the same facial lattices again.
+		val key = listOf(deformers.map(io.github.psd2live.targets.cubism.PuppetIr::deformerToIr),
+			context.head, context.face, faceSignature(context.faceRig), config.rigTuning, config.headTurnStrength,
+			io.github.psd2live.core.recipe.RigModules.turnStyle(config), marks.points, marks.contour, marks.measures,
+			context.fittedEyes(config)?.fitting?.fits.orEmpty().keys, context.fittedBrows(config).keys,
+			deformers.map { it.parent?.let { parent -> context.resolveFrame(parent, config) } }, context.underFace)
+		return stages.get("face-turn", 64, key) {
+			RigBuildProfile.stage("scaffold: face turn (built)") { withFaceTurn(deformers, context, config) }
+		}
+	}
+
 	private fun withFaceTurn(deformers: List<Deformer>, context: RigContext, config: PipelineConfig): List<Deformer> {
 		val turn = context.faceTurn(config) ?: return deformers
 		val face = deformers.firstOrNull { it.id == faceWarpId } as? Deformer.Warp ?: return deformers

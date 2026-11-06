@@ -290,7 +290,7 @@ internal class WorkspaceHost<V>(
         playbackSessions.restart(projectId, state, current.facts().activeWorkspaceId, initialTracking = current.facts().mouseTracking, initialSmoothTracking = current.facts().smoothTracking)
 
     override fun layerMeshSettings(layerId: String): kotlinx.serialization.json.JsonObject = captureQueries().layerMeshSettings(layerId)
-    override suspend fun importPsd(path: String, discardUnsaved: Boolean): WorkspaceMutationResult = editMutex.withLock {
+    override suspend fun importPsd(path: String, discardUnsaved: Boolean, modifiers: WorkspaceInitialModifiers?, preset: WorkspaceInitialPreset?): WorkspaceMutationResult = editMutex.withLock {
         val (state, current) = captureSourceImport(discardUnsaved)
         val input = Path.of(path)
         val owned = runInterruptible(Dispatchers.IO) {
@@ -300,7 +300,7 @@ internal class WorkspaceHost<V>(
         }
         val result = sourceImporter.importPsd(owned.path, state.capture?.projectId, state.state, discardUnsaved,
             sourceConfig(state, current), sourceAuxiliary = owned.auxiliary,
-            displayName = input.fileName.toString()) { document, preview, id ->
+            displayName = input.fileName.toString(), modifiers = modifiers, preset = preset) { document, preview, id ->
             presentation.sourceInstalled(current, document, preview, input, id)
         }
         finishSourceImport(result)
@@ -1333,6 +1333,8 @@ internal class WorkspaceHost<V>(
     override fun hitAreaModel() = captureQueries().hitAreaModel()
     override fun layoutState() = captureQueries().layoutState()
     override fun rigModules() = captureQueries().rigModules()
+    override fun modifierStack() = captureQueries().modifierStack()
+    override fun modifierPlan(request: JsonObject) = captureQueries().modifierPlan(request)
 
     override fun generatedOverrideIssues() = captureQueries().generatedOverrideIssues()
     override fun supersededEntryNotes() = captureQueries().supersededEntryNotes()
@@ -1500,7 +1502,7 @@ internal class WorkspaceHost<V>(
 
     override suspend fun deleteSwing(id: String, bake: Boolean, expectedState: String, author: MutationAuthor) =
         mutateModel(expectedState, null, if (bake) "Baked swing $id" else "Deleted swing $id", id, author) { document, model ->
-            WorkspaceDocumentEdits.removeSwing(document, model.rig.puppet, id, bake, model.authored.rig.puppet)
+            WorkspaceDocumentEdits.removeSwing(document, model, id, bake)
         }
 
     override suspend fun createIndependentWarp(request: JsonObject, expectedState: String) = independentWarp(request, expectedState)

@@ -41,6 +41,7 @@ internal data class StartPresetChoices(
 	val backHair: HairMode = HairMode.CLASSIC,
 	val clothing: Boolean = true,
 	val eyeJelly: Boolean = true,
+    val modifiers: io.github.psd2live.application.WorkspaceInitialModifiers? = null,
 ) {
 	/** The choices as far as [parts] lets them matter, so two that differ only on a missing part compare equal. */
 	fun within(parts: PresetParts) = copy(
@@ -49,6 +50,19 @@ internal data class StartPresetChoices(
 		clothing = clothing && parts.clothing,
 		eyeJelly = eyeJelly && parts.eyeJelly,
 	)
+
+    fun initialMode(): io.github.psd2live.application.WorkspaceInitialModifiers = modifiers ?: when (this) {
+        StartQuickPreset.MINIMAL.choices -> io.github.psd2live.application.WorkspaceInitialModifiers.MINIMAL
+        StartQuickPreset.DEFAULT.choices -> io.github.psd2live.application.WorkspaceInitialModifiers.DEFAULT
+        StartQuickPreset.FULL.choices -> io.github.psd2live.application.WorkspaceInitialModifiers.FULL
+        else -> io.github.psd2live.application.WorkspaceInitialModifiers.CUSTOM
+    }
+
+    fun initialPreset() = io.github.psd2live.application.WorkspaceInitialPreset(
+        headStrength, bodyStrength, featureDisplacement, mouthOutline, motionBasic, motionSkeleton,
+        io.github.psd2live.application.WorkspaceInitialHair.valueOf(frontHair.name),
+        io.github.psd2live.application.WorkspaceInitialHair.valueOf(backHair.name), clothing, eyeJelly,
+    )
 
 	fun encode(): String = choicesJson.encodeToString(serializer(), this)
 
@@ -83,6 +97,8 @@ internal data class StartPresetChoices(
 
 /** One-click sets of [StartPresetChoices] on the start page. */
 internal enum class StartQuickPreset(val key: String, val choices: StartPresetChoices) {
+    RECOMMENDED("modifier.start.recommended", StartPresetChoices(modifiers = io.github.psd2live.application.WorkspaceInitialModifiers.RECOMMENDED)),
+    EMPTY("modifier.start.empty", StartPresetChoices(modifiers = io.github.psd2live.application.WorkspaceInitialModifiers.EMPTY)),
 	/** The rig alone: no generated motions, physics or simulation, no mouth outline. */
 	MINIMAL("start.quick.minimal", StartPresetChoices(
 		mouthOutline = false, motionBasic = false, motionSkeleton = false,

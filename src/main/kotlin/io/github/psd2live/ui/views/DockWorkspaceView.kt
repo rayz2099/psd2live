@@ -408,6 +408,7 @@ internal fun DockWorkspaceView(
                 onConfirm = viewModel::confirmDepthSplit, onDismiss = viewModel::dismissDepthSplit)
         }
         io.github.psd2live.ui.components.KeyformDialogHost()
+
         if (state.activeWorkspace.id == workspace.id) when (viewModel.objectDialog) {
             PSD2LiveViewModel.ObjectDialog.FIND_REPLACE -> io.github.psd2live.ui.components.FindReplaceDialog(state, viewModel)
             PSD2LiveViewModel.ObjectDialog.CONVERT_IDS -> io.github.psd2live.ui.components.ConvertIdsDialog(state, viewModel)
@@ -550,29 +551,8 @@ private fun DockTree(node: DockNode, session: DockSession, modifier: Modifier, w
     val density = LocalDensity.current
     if (node.first != null && node.second != null) {
         BoxWithConstraints(modifier) {
-            val extent = with(density) { (if (node.horizontal) maxWidth else maxHeight).toPx() }
-            val interaction = remember(node.id) { MutableInteractionSource() }
-            val hovered by interaction.collectIsHoveredAsState()
-            var resizing by remember(node.id) { mutableStateOf(false) }
-            val splitter = Modifier.background(colors.windowBackground).hoverable(interaction)
-                .pointerHoverIcon(PointerIcon(Cursor.getPredefinedCursor(
-                    if (node.horizontal) Cursor.E_RESIZE_CURSOR else Cursor.N_RESIZE_CURSOR)))
-                .drawBehind {
-                    val color = if (hovered || resizing || node.id in session.junctionHighlights) colors.accent else colors.windowBackground
-                    if (node.horizontal) drawLine(color, Offset(size.width / 2, 0f),
-                        Offset(size.width / 2, size.height), 1.dp.toPx())
-                    else drawLine(color, Offset(0f, size.height / 2),
-                        Offset(size.width, size.height / 2), 1.dp.toPx())
-                }.pointerInput(node.id, extent) {
-                detectDragGestures(
-                    onDragStart = { resizing = true },
-                    onDragEnd = { resizing = false },
-                    onDragCancel = { resizing = false },
-                ) { change, delta ->
-                    change.consume()
-                    val movement = if (node.horizontal) delta.x else delta.y
-                    session.resizeDividers(mapOf(node.id to movement), window, with(density) { Spacing.Gap.toPx() })
-                }
+            val splitter = Modifier.panelDivider(node.horizontal, node.id in session.junctionHighlights) { movement ->
+                session.resizeDividers(mapOf(node.id to movement), window, with(density) { Spacing.Gap.toPx() })
             }
             if (node.horizontal) Row(Modifier.fillMaxSize()) {
                 DockTree(node.first, session, Modifier.weight(node.ratio).fillMaxHeight(), window, state, viewModel, content)
@@ -968,7 +948,7 @@ private fun DockHeader(id: String, session: DockSession, modifier: Modifier,
     var backgroundMenu by remember { mutableStateOf(false) }
     val workspace = state.activeWorkspace
     val canvas = session.canvases.firstOrNull { it.id == id }
-    val title = canvas?.let { canvasHeaderTitle(it, workspace) } ?: session.titleOf(id)
+    val title = canvas?.let { canvasHeaderTitle(it, workspace) } ?: if (id == "settings" && state.rigEdits.modifierStack != null) tr("modifier.title") else session.titleOf(id)
     val showCanvasTools = canvas != null && (standalone || floating || selected)
     // Closing (menu or middle-click) hides a panel, which the window menu brings back; it removes a
     // canvas, never the last.
@@ -1265,9 +1245,10 @@ private fun DockModuleContent(
 		"log" -> BottomLogDock(poseless, vm, Modifier.fillMaxSize(), fillDock = true)
 		"animationEditor" -> AnimationEditorView(state, vm)
 		"settings" -> {
-			Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-				ModelPresetsSection(poseless, vm)
-			}
+            if (poseless.rigEdits.modifierStack != null) ModelPresetsSection(poseless, vm)
+            else Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                ModelPresetsSection(poseless, vm)
+            }
 		}
 		"layers" -> LayersTableView(poseless, vm)
 		"parameters" -> ParametersListView(state, vm)

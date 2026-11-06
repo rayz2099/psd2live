@@ -123,6 +123,8 @@ interface WorkspaceQueries : WorkspaceStatePort {
     fun layoutState(): WorkspaceLayoutState?
     /** `module_catalog`: the rig's areas and modules, and with a project open how its recipe uses them ([RigModuleCatalog]). */
     fun rigModules(): kotlinx.serialization.json.JsonObject
+    fun modifierStack(): kotlinx.serialization.json.JsonObject
+    fun modifierPlan(request: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 }
 
 /** A captured document's Layout state ([io.github.psd2live.project.WorkspaceLayout]) and the layers it applies to. */
@@ -156,7 +158,7 @@ data class ImageLayerInsertion(
 interface WorkspaceSourcePort {
     /** Import a complete file batch as editable artwork in one history node, where [insertion] puts it. */
     suspend fun importImages(state: String, paths: List<java.nio.file.Path>, insertion: ImageLayerInsertion): WorkspaceMutationResult
-    suspend fun importPsd(path: String, discardUnsaved: Boolean = false): WorkspaceMutationResult
+    suspend fun importPsd(path: String, discardUnsaved: Boolean = false, modifiers: WorkspaceInitialModifiers? = null, preset: WorkspaceInitialPreset? = null): WorkspaceMutationResult
     /** A new Layout project, not generated yet, from a layout manifest or a zip holding one ([LayoutManifest]). */
     suspend fun importLayout(path: String, discardUnsaved: Boolean = false): WorkspaceMutationResult
     suspend fun importCmo3(path: java.nio.file.Path, mode: Cmo3ImportMode,

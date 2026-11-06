@@ -3,6 +3,7 @@ package io.github.psd2live.ui.tutorial
 import io.github.psd2live.ui.EditHierarchyMode
 import io.github.psd2live.ui.state.PSD2LiveState
 import io.github.psd2live.ui.state.CanvasMode
+import kotlinx.serialization.json.*
 
 enum class TutorialId {
 	BASIC,
@@ -140,6 +141,12 @@ data class TutorialStep(
 	val openWorkspace: io.github.psd2live.ui.state.WorkspacePreset? = null,
 ) {
 	fun titleKey(tutorialId: TutorialId): String = "tutorial.${i18nScope ?: tutorialId.i18nKey}.step.$key.title"
+
+    fun forModifierStack(tutorialId: TutorialId, enabled: Boolean): TutorialStep {
+        if (!enabled || tutorialId != TutorialId.SIMULATION || targetId != TutorialTargetId.SIMULATION_DOCK) return this
+        return if (key == "preview") copy(targetId = TutorialTargetId.PREVIEW_TAB, selectDock = null)
+        else copy(targetId = TutorialTargetId.MODEL_SETTINGS, selectDock = "settings", expandModelSettings = true)
+    }
 	fun bodyKey(tutorialId: TutorialId): String = "tutorial.${i18nScope ?: tutorialId.i18nKey}.step.$key.body"
 	fun actionKey(tutorialId: TutorialId): String = "tutorial.${i18nScope ?: tutorialId.i18nKey}.step.$key.action"
 
@@ -238,7 +245,11 @@ fun TutorialStep.isComplete(
 	TutorialCompletion.EDIT_TAB -> appState.activeCanvas.mode == CanvasMode.EDIT
 	TutorialCompletion.HISTORY_TAB -> appState.historyPanelShown
 	TutorialCompletion.EXPORT_DIALOG -> appState.showExportDialog
-	TutorialCompletion.HAS_SIMULATION -> appState.rigEdits.simEdits.isNotEmpty()
+	TutorialCompletion.HAS_SIMULATION -> appState.rigEdits.simEdits.isNotEmpty() ||
+        appState.previewModel?.rig?.modifierReport?.get("entries")?.jsonArray.orEmpty().any {
+            val entry = it.jsonObject
+            entry["type"]?.jsonPrimitive?.content == "simulation" && entry["status"]?.jsonPrimitive?.content == "active"
+        }
 }
 
 fun TutorialStep.prerequisiteMet(appState: PSD2LiveState): Boolean = when {

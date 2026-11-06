@@ -972,6 +972,11 @@ private fun formatBytes(bytes: Long): String = when {
 @Composable
 private fun PresetInspector(choices: StartPresetChoices, selection: StartSelection, enabled: Boolean, onChange: (StartPresetChoices) -> Unit) {
 	PresetPicker(choices, enabled, onChange)
+    choices.modifiers?.let { mode ->
+        InspectorNote(tr(if (mode == io.github.psd2live.application.WorkspaceInitialModifiers.EMPTY)
+            "modifier.start.empty.detail" else "modifier.start.recommended.detail"))
+        return
+    }
 	fun group(key: String, title: String, summary: String, content: @Composable ColumnScope.() -> Unit): @Composable () -> Unit = {
 		val open = selection.open[key] ?: true
 		PanelSectionRow(title, open, { selection.open[key] = !open }, icon = null, trailing = {
@@ -995,7 +1000,7 @@ private fun PresetInspector(choices: StartPresetChoices, selection: StartSelecti
 		CheckRow(tr("presets.clothing"), choices.clothing, enabled) { onChange(choices.copy(clothing = it)) }
 		CheckRow(tr("export.physics.eyeJelly"), choices.eyeJelly, enabled) { onChange(choices.copy(eyeJelly = it)) }
 	}()
-	InspectorNote(tr("start.presets.note"))
+	InspectorNote(tr("modifier.start.shortcut.detail"))
 }
 
 /** The quick sets as a list to pick from, on the one the values match, or on "Custom" while none does. */

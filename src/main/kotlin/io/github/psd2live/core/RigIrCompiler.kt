@@ -10,6 +10,11 @@ import io.github.psd2live.format.model.RigIR
 import io.github.psd2live.format.model.TexturePage
 import io.github.psd2live.format.model.TileArt
 import io.github.psd2live.targets.cubism.PuppetIr
+import io.github.psd2live.core.modifier.RigModifierAlgorithms
+import io.github.psd2live.core.modifier.RigModifierStack
+import io.github.psd2live.core.sim.RigSimEdit
+import io.github.psd2live.core.sim.SimExport
+import kotlinx.serialization.json.*
 
 /**
  * Compiles an evaluated rig into the neutral [RigIR] every exporter reads: the rig itself, its packed
@@ -17,6 +22,12 @@ import io.github.psd2live.targets.cubism.PuppetIr
  * their presets into curves.
  */
 internal object RigIrCompiler {
+    /** Keep standard runtime groups in the same order before and after materializing a stack prefix. */
+    internal fun orderedParameterRoles(roles: List<ParameterRole>): List<ParameterRole> {
+        val order = listOf("EyeBlink", "LipSync", "Breath", "AngleX", "AngleY", "AngleZ", "BodyAngleX", "EyeBallX", "EyeBallY")
+        return roles.distinct().sortedBy { order.indexOf(it.role).takeIf { index -> index >= 0 } ?: order.size }
+    }
+
 	fun compile(preview: RigPreviewModel, tileArt: Boolean = false, simulations: Boolean = false): RigIR =
 		compile(preview.analysis, preview.atlas, preview.rig, preview.config, tileArt, simulations)
 
@@ -27,6 +38,13 @@ internal object RigIrCompiler {
 	 */
 	fun compile(analysis: PipelineAnalysis, atlas: PackedAtlas, rig: BuiltRig, config: PipelineConfig, tileArt: Boolean = false,
 				simulations: Boolean = false): RigIR {
+        rig.modifierOutput?.let { output ->
+            val ordinary = io.github.psd2live.core.modifier.RigModifierPipeline.compileOrdinary(
+                analysis, atlas, rig, config, tileArt, simulations = false)
+            return ordinary.copy(physics = output.physics, clips = output.clips, restPose = output.restPose,
+                parameterRoles = orderedParameterRoles(ordinary.parameterRoles + output.parameterRoles),
+                advanced = if (simulations) modifierSimulations(rig, config, output, ordinary.advanced) else ordinary.advanced)
+        }
 		val physicsGroups = PhysicsCatalog.active(analysis, config, rig.puppet.parameters.mapTo(linkedSetOf()) { it.id.raw }, rig.puppet)
 		val puppet = io.github.psd2live.core.interior.InteriorLifecycle.exportModel(rig.puppet, config.rigEdits, physicsGroups)
 		val exportedRig = rig.copy(puppet = puppet)
@@ -67,6 +85,24 @@ internal object RigIrCompiler {
 		)
 	}
 
+    private fun modifierSimulations(rig: BuiltRig, config: PipelineConfig, output: RigIR, advanced: AdvancedIR): AdvancedIR {
+        val stack = RigModifierStack.fromJson(requireNotNull(config.rigEdits.modifierStack))
+        val active = rig.modifierReport?.get("entries")?.jsonArray.orEmpty().map { it.jsonObject }
+            .filter { it.getValue("status").jsonPrimitive.content == "active" }
+            .mapTo(HashSet()) { it.getValue("id").jsonPrimitive.content }
+        val parameters = output.parameters.mapTo(HashSet()) { it.id }
+        val groups = output.physics.groups.mapTo(HashSet()) { it.id }
+        val exported = stack.instances.filter { it.type == "simulation" && it.id in active }.map { instance ->
+            val source = RigSimEdit.fromJson(instance.config)
+            val edit = RigModifierAlgorithms.simulationOutputs(instance, source)
+            val aliases = RigModifierAlgorithms.simulationPhysics(instance, edit, parameters)
+                .filterValues { it.id in groups }.mapValues { it.value.id }
+            val scene = SimExport.export(rig.puppet, listOf(edit.copy(id = instance.outputId("simulation"))), parameters, aliases.keys)
+            scene.simulations.map { simulation -> simulation.copy(physicsGroups = simulation.physicsGroups.map(aliases::getValue)) } to scene.colliders
+        }
+        return advanced.copy(simulations = exported.flatMap { it.first }, colliders = exported.flatMap { it.second })
+    }
+
 	/**
 	 * What the runtime's advanced mode plays live that the rig bakes: the skeleton's folded bones and, with
 	 * [simulations], the baked simulations and their colliders.
@@ -96,7 +132,7 @@ internal object RigIrCompiler {
 		val physicsDriven = if (config.exportIncludePhysics) physicsGroups.flatMapTo(HashSet()) { it.outputParameters } else emptySet()
 		val key = ClipsKey(config.rigEdits.motionClips, rig.puppet.parameters, config.rigEdits.skeleton, config.rigEdits.motionPresets,
 			listOf(config.motionBasic, config.motionIdle, config.motionBlink, config.motionNod, config.motionShake, config.motionSkeleton), physicsDriven,
-			config.rigEdits.idRenames.parameters)
+			config.rigEdits.idRenames.parameters, MotionPresetSettings.natural(config))
 		synchronized(clipCache) { clipCache[key] }?.let { return it }
 		return compileClips(rig, config, physicsDriven, parameterIds).also { synchronized(clipCache) { clipCache[key] = it } }
 	}
@@ -105,7 +141,7 @@ internal object RigIrCompiler {
 	private data class ClipsKey(
 		val clips: List<MotionClip>, val parameters: List<org.umamo.runtime.model.Parameter>, val skeleton: SkeletonSpec?,
 		val presets: Map<String, MotionPresetSettings>, val switches: List<Boolean>, val physicsDriven: Set<String>,
-		val renames: Map<String, String>,
+		val renames: Map<String, String>, val natural: Boolean,
 	)
 
 	/**
@@ -117,17 +153,23 @@ internal object RigIrCompiler {
 		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ClipsKey, List<Clip>>?) = size > 4
 	}
 
+    internal fun legacyMotionTracks(config: PipelineConfig, name: String, excluded: Set<String>): List<MotionTrack> {
+        val renames = config.rigEdits.idRenames.parameters
+        val original = renames.entries.associate { it.value to it.key }
+        val native = MotionPresets.tracks(name, config.rigEdits.skeleton, MotionPresetSettings.of(config, name),
+            excluded.mapTo(HashSet()) { original[it] ?: it })
+        return MotionPresets.renamed(native, renames)
+    }
+
 	private fun compileClips(rig: BuiltRig, config: PipelineConfig, physicsDriven: Set<String>, parameterIds: Set<String>): List<Clip> {
 		val clips = MotionClips.reconcileParameters(config.rigEdits.motionClips, rig.puppet.parameters)
-		val skeleton = config.rigEdits.skeleton
-		val renames = config.rigEdits.idRenames.parameters
-		val original = renames.entries.associate { it.value to it.key }
 		val result = ArrayList<Clip>()
 		fun add(clip: Clip?) {
 			if (clip != null && clip.curves.any { it.parameter in parameterIds }) result += clip.copy(curves = clip.curves.filter { it.parameter in parameterIds })
 		}
 		fun authored(group: String, file: String, clip: MotionClip) = Clip(clip.id, clip.name, group, file, clip.duration, clip.fps, clip.loop,
-			clip.fadeIn, clip.fadeOut, clip.curves.map(MotionGenerator::curve), clip.events.map { ClipEvent(it.time, it.value) })
+			clip.fadeIn.takeUnless { clip.runtimeDefaultFades }, clip.fadeOut.takeUnless { clip.runtimeDefaultFades },
+			clip.curves.map(MotionGenerator::curve), clip.events.map { ClipEvent(it.time, it.value) })
 		fun builtin(group: String, name: String, exclude: Set<String> = emptySet()) {
 			val settings = MotionPresetSettings.of(config, name)
 			if (settings.deleted) return
@@ -135,7 +177,7 @@ internal object RigIrCompiler {
 			val override = MotionClips.overrideOf(clips, name)
 			if (override != null) return add(authored(group, file, override))
 			// Generated tracks name the standard parameters by their standard IDs.
-			val tracks = MotionPresets.renamed(MotionPresets.tracks(name, skeleton, settings, exclude.mapTo(HashSet()) { original[it] ?: it }), renames)
+			val tracks = legacyMotionTracks(config, name, exclude)
 			if (tracks.isEmpty()) return
 			add(Clip(name, name, group, file, MotionPresets.duration(name, tracks, settings), 30f, MotionPresets.loops(name),
 				curves = tracks.map(MotionGenerator::curve)))
@@ -157,9 +199,9 @@ internal object RigIrCompiler {
 			}
 		}
 		// The user's own motions: a loop joins the idles, a one-shot is its own group under its name.
-		val stems = MotionClips.exportStems(clips)
+		val stems = MotionClips.exportStems(clips, result.mapTo(HashSet()) { it.file })
 		for (clip in clips.filter { it.builtin == null && it.enabled })
-			add(authored(if (clip.loop) "Idle" else clip.name, stems.getValue(clip.id), clip))
+			add(authored(clip.exportGroup ?: if (clip.loop) "Idle" else clip.name, stems.getValue(clip.id), clip))
 		return result
 	}
 }
