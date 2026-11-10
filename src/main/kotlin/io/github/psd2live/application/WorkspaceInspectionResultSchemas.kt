@@ -97,7 +97,7 @@ internal object WorkspaceSettingsResultTypes {
         "physicsFrontHair", "physicsBackHair", "physicsEyeJelly", "hairSimulationFront", "hairSimulationBack", "exportCmo3", "exportMoc3", "exportJson", "exportCan3",
         "exportHiddenParts", "exportHiddenDrawables", "exportGuideImageParts", "exportIncludePhysics", "exportIncludeUserData", "exportIncludeDisplayInfo")
     private val settingFields = booleanFields.associateWith { s.boolean() } +
-        listOf("atlasSize", "meshSpacing", "texturePadding", "alphaThreshold").associateWith { s.integer() } +
+        listOf("atlasSize", "meshSpacing", "texturePadding", "alphaThreshold", "drawOrderStep").associateWith { s.integer() } +
         listOf("meshOuterMargin", "meshEdgeWidth", "meshMaxEdgeDistance", "meshInteriorDensity", "headStrength", "bodyStrength", "mouthThickness", "seeThroughOpacity").associateWith { s.number() } +
         mapOf("textureUpscale" to upscale, "meshEdgeMode" to meshFields.getValue("edgeMode"), "meshFillAlgorithm" to meshFields.getValue("fillAlgorithm"),
             "meshUnits" to s.choices(*io.github.psd2live.core.MeshUnits.entries.map { it.name }.toTypedArray()),
