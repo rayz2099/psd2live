@@ -90,7 +90,9 @@ object WorkspaceViewRenderer {
 		validateOutput(output)
 		require(annotateDeformerIds.size <= 16) { "Select at most 16 deformers per View" }
 		require(annotatePathIds.size <= 32) { "Select at most 32 deform paths per View" }
-		val knownLayerIds = model.rig.layerIdByDrawableId.values.toSet()
+		// 全透明像素层与参考层也出现在 overview 图层列表中，按全部已知分析层校验可避免前端“全显”误报未知图层。
+		val analysisIds = model.analysis.layers.map { it.source.id.raw }
+		val knownLayerIds = model.rig.layerIdByDrawableId.values.toSet() + analysisIds + model.referenceLayerIds
 		val unknownIncluded = includeLayerIds - knownLayerIds
 		require(unknownIncluded.isEmpty()) { "Unknown included layer IDs: ${unknownIncluded.sorted().joinToString()}" }
 		val unknownAnnotated = annotateLayerIds - knownLayerIds

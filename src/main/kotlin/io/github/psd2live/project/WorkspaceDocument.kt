@@ -200,12 +200,18 @@ internal data class WorkspaceSourceLayer(
 	}
 
 	companion object {
-		fun copyOf(layer: SourceLayer, order: Int): SourceLayer = WorkspaceSourceLayer(
+		// 进入 Live2D 管线时会裁剪保留图层的可见状态，避免原 PSD 组关闭导致成品 Drawable 隐藏。
+		fun copyOf(
+			layer: SourceLayer,
+			order: Int,
+			visible: Boolean = layer.visible,
+			groupPath: String = layer.groupPath,
+		): SourceLayer = WorkspaceSourceLayer(
 			id = layer.id,
 			name = layer.name,
-			groupPath = layer.groupPath,
+			groupPath = groupPath,
 			kind = layer.kind,
-			visible = layer.visible,
+			visible = visible,
 			order = order,
 			bounds = layer.bounds,
 			opacity = layer.opacity,

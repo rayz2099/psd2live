@@ -37,12 +37,39 @@ internal class WorkspaceSourceImporter(
                          displayName: String = path.fileName.toString(),
                          modifiers: WorkspaceInitialModifiers? = null,
                          preset: WorkspaceInitialPreset? = null,
+                         includeLayerIds: Set<String>? = null,
                          project: (WorkspaceDocument, RigPreviewModel, String) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> {
         return install(projectId, state, discardUnsaved, initialConfig, "Imported PSD $displayName",
             prepare = {
                 require(path.isAbsolute && Files.isRegularFile(path) && path.fileName.toString().endsWith(".psd", true)) { "Provide an absolute local PSD path" }
-                Prepared(readPsd(path), emptyMap(), materials = displayName)
+                val rawArt = readPsd(path)
+                val filteredArt = filterIncludedLayers(rawArt, includeLayerIds)
+                Prepared(filteredArt, emptyMap(), materials = displayName)
             }, project = project, sourceAuxiliary = sourceAuxiliary, modifiers = modifiers, preset = preset)
+    }
+
+    /** 按画师在整理阶段选定的图层集合裁剪 PSD 源，并将保留层及其祖先分组统一设为可见，避免父文件夹关闭导致 Drawable 整组隐藏。 */
+    private fun filterIncludedLayers(rawArt: SourceArt, includeLayerIds: Set<String>?): SourceArt {
+        if (includeLayerIds == null) return rawArt
+        require(includeLayerIds.isNotEmpty()) { "include_layer_ids must retain at least one layer" }
+        val knownIds = rawArt.layers.mapTo(HashSet()) { it.id.raw }
+        val unknown = includeLayerIds.filter { it !in knownIds }
+        require(unknown.isEmpty()) { "Unknown layer IDs in include_layer_ids: ${unknown.joinToString()}" }
+        val kept = rawArt.layers.filter { it.id.raw in includeLayerIds }
+        val lastIdx = kept.lastIndex
+        val reordered = kept.mapIndexed { index, layer -> WorkspaceSourceLayer.copyOf(layer, lastIdx - index, visible = true) }
+        val keptGroupPaths = HashSet<String>()
+        for (layer in kept) {
+            if (layer.groupPath.isEmpty()) continue
+            val parts = layer.groupPath.split('/')
+            for (depth in 1..parts.size) {
+                keptGroupPaths += parts.subList(0, depth).joinToString("/")
+            }
+        }
+        val keptGroups = rawArt.groups
+            .filter { it.path in keptGroupPaths }
+            .map { g -> WorkspaceSourceGroup(g.path, g.name, true, g.opacity, g.clipped, g.blend, g.passThrough) }
+        return WorkspaceSourceArt(rawArt.widthPx, rawArt.heightPx, reordered, keptGroups)
     }
 
     /**

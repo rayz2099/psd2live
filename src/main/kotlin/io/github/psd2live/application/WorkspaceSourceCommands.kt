@@ -33,6 +33,13 @@ internal fun registerSourceCommands(catalog: WorkspaceCommands, workspace: Works
             put("path", text)
             putJsonObject("discard_unsaved") { put("type", "boolean") }
             put("modifiers", WorkspaceResultSchema.choices(*WorkspaceInitialModifiers.entries.map { it.name.lowercase() }.toTypedArray()))
+            putJsonObject("include_layer_ids") {
+                put("type", "array")
+                put("minItems", 1)
+                put("maxItems", 4096)
+                put("uniqueItems", true)
+                putJsonObject("items") { put("type", "string"); put("minLength", 1) }
+            }
             putJsonObject("preset") {
                 put("type", "object"); put("additionalProperties", false)
                 putJsonObject("properties") {
@@ -84,10 +91,15 @@ internal fun registerSourceCommands(catalog: WorkspaceCommands, workspace: Works
         hints = WorkspaceCommandHints(readOnlyHint = false, destructiveHint = false, openWorldHint = false)) { request ->
         val arguments = request.arguments
         val result = when (name) {
-            "asset_import_psd" -> workspace.importPsd(arguments.text("path"), arguments["discard_unsaved"]?.jsonPrimitive?.boolean ?: false,
-                arguments["modifiers"]?.jsonPrimitive?.content?.let { WorkspaceInitialModifiers.valueOf(it.uppercase()) }
-                    ?: WorkspaceInitialModifiers.RECOMMENDED,
-                arguments["preset"]?.let { Json.decodeFromJsonElement(WorkspaceInitialPreset.serializer(), it) })
+            "asset_import_psd" -> {
+                val modName = arguments["modifiers"]?.jsonPrimitive?.content?.uppercase()
+                val modVal = if (modName != null) WorkspaceInitialModifiers.valueOf(modName) else WorkspaceInitialModifiers.RECOMMENDED
+                val presetVal = arguments["preset"]?.let { Json.decodeFromJsonElement(WorkspaceInitialPreset.serializer(), it) }
+                val incArr = arguments["include_layer_ids"]?.jsonArray
+                val incIds = incArr?.mapTo(LinkedHashSet()) { it.jsonPrimitive.content }
+                val discard = arguments["discard_unsaved"]?.jsonPrimitive?.boolean ?: false
+                workspace.importPsd(arguments.text("path"), discard, modVal, presetVal, incIds)
+            }
             "asset_create_artwork" -> workspace.createArtwork(arguments)
             "asset_split_components" -> workspace.splitMeshComponents(arguments.text("state"), listOf(JsonObject(arguments - "state")))
             "asset_split_depth" -> workspace.splitDepth(arguments.text("state"), JsonObject(arguments - "state"))

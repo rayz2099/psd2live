@@ -228,7 +228,8 @@ private val overviewSchema: JsonObject by lazy {
         "canvas" to s.array(s.integer(0), 0, 2),
         "parameters" to page(s.obj(mapOf("id" to s.handle(), "name" to s.string(), "min" to s.number(), "max" to s.number(),
             "default" to s.number(), "kind" to s.string(), "repeat" to s.boolean()))),
-        "layers" to page(s.obj(mapOf("id" to s.handle(), "name" to s.string(), "role" to s.string(), "side" to s.string(), "visible" to s.boolean()))),
+        "layers" to page(s.obj(mapOf("id" to s.handle(), "name" to s.string(), "role" to s.string(), "side" to s.string(), "visible" to s.boolean(),
+            "derived" to s.boolean(), "group_path" to s.string(), "bounds" to s.array(s.number(), 4, 4)))),
         "meshes" to s.integer(0),
         "deformers" to page(s.obj(mapOf("target" to s.handle(), "name" to s.string(), "parent" to s.nullable(s.handle()),
             "children" to s.integer(0)))),
@@ -255,6 +256,13 @@ private fun WorkspaceQueries.overview(limit: Int): JsonObject {
         } }))
         put("layers", page(snapshot.layers.filterNot { it.deleted }.map { layer -> buildJsonObject {
             put("id", layer.id); put("name", layer.sourceName); put("role", layer.semanticTag); put("side", layer.side); put("visible", layer.visible)
+            // 暴露 derived 与 PSD 分组/包围盒，方便画师在 PSD 整理阶段剔除衍生层并检视原图层状态。
+            put("derived", layer.derived)
+            put("group_path", layer.groupPath)
+            putJsonArray("bounds") {
+                val rect = listOf(layer.opaqueBounds.left, layer.opaqueBounds.top, layer.opaqueBounds.right, layer.opaqueBounds.bottom)
+                rect.forEach { add(it) }
+            }
         } }))
         put("meshes", objects.count { it.getValue("kind").jsonPrimitive.content == "mesh" })
         put("deformers", page(deformers.map { row ->

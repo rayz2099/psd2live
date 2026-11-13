@@ -46,21 +46,37 @@ import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.Alignment
 import io.github.psd2live.ui.state.AppSettings
 
+private val CLI_SUBCOMMANDS = setOf("mcp", "export", "targets", "--clear-user-data")
+
+/** 显式 CLI 子命令与帮助参数必须走无头分支，防止 mcp 携带 --port/--store/--token 时误入桌面 GUI 导致弹窗。 */
+internal fun isGuiLaunch(command: List<String>, filesToOpen: List<String>?): Boolean {
+	val first = command.firstOrNull()
+	if (first in CLI_SUBCOMMANDS) return false
+	if (command.any { it == "--help" || it == "-h" }) return false
+	return filesToOpen != null ||
+		first == "gui" ||
+		(!command.contains("--input") && command.any { it in setOf("--port", "-p", "--store", "--token") }) ||
+		(command.size == 1 && first?.toIntOrNull() != null)
+}
+
 fun main(arguments: Array<String>) {
-	System.setProperty("sun.java2d.uiScale.enabled", "true")
-	// The name macOS shows in the menu bar and Dock instead of the main class; read when AWT starts.
-	System.setProperty("apple.awt.application.name", "PSD2Live")
-	if (io.github.psd2live.ui.utils.MacShell.active) {
-		System.setProperty("apple.laf.useScreenMenuBar", "true")
-		System.setProperty("apple.awt.application.appearance", "system")
-	}
 	configureLanguage(arguments)
 	val command = commandArguments(arguments)
 	val filesToOpen = io.github.psd2live.ui.utils.MacShell.guiFiles(command)
-	val isGui = filesToOpen != null ||
-		command.firstOrNull() == "gui" ||
-		(!command.contains("--input") && command.any { it in setOf("--port", "-p", "--store", "--token") }) ||
-		(command.size == 1 && command.first().toIntOrNull() != null)
+	val isGui = isGuiLaunch(command, filesToOpen)
+	if (isGui) {
+		System.setProperty("sun.java2d.uiScale.enabled", "true")
+		// The name macOS shows in the menu bar and Dock instead of the main class; read when AWT starts.
+		System.setProperty("apple.awt.application.name", "PSD2Live")
+		if (io.github.psd2live.ui.utils.MacShell.active) {
+			System.setProperty("apple.laf.useScreenMenuBar", "true")
+			System.setProperty("apple.awt.application.appearance", "system")
+		}
+	} else {
+		// 无头 CLI/MCP 不需要窗口或 Dock 图标；在首次触碰 AWT/GraphicsSettings 前锁定后台属性。
+		System.setProperty("java.awt.headless", "true")
+		System.setProperty("apple.awt.UIElement", "true")
+	}
 
 	// Canvases draw on the GPU in Skia's own OpenGL context, so Skia must draw the window with OpenGL; the editor
 	// starts with the user's graphics settings (render path, card, vsync, driver threading), before its first window.

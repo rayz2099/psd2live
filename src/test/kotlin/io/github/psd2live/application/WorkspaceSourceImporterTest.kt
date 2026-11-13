@@ -2,13 +2,18 @@ package io.github.psd2live.application
 
 import io.github.psd2live.core.RigPreviewModel
 import io.github.psd2live.project.WorkspaceRevisions
+import io.github.psd2live.project.WorkspaceSourceArt
+import io.github.psd2live.project.WorkspaceSourceGroup
+import io.github.psd2live.project.WorkspaceSourceLayer
 import io.github.psd2live.project.rawConfig
 import io.github.psd2live.scenario.Characters
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import org.junit.jupiter.api.io.TempDir
+import org.umamo.format.art.LayerBlend
 import org.umamo.format.art.SourceArt
 import org.umamo.format.art.SourceLayer
+import org.umamo.runtime.model.visibleDrawableIds
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Collections
@@ -146,5 +151,41 @@ class WorkspaceSourceImporterTest {
         } finally { release.countDown(); job.cancelAndJoin() }
         assertFalse(projected)
         assertSame(before, runtime.read())
+    }
+
+    @Test fun importPsdFiltersToIncludedLayersMarksThemVisibleAndRejectsUnknownIds() = runBlocking<Unit> {
+        val original = Characters.head(physics = false)
+        val path = Files.createFile(directory.resolve("filtered-input.psd")).toAbsolutePath()
+        val builder = WorkspacePreviewBuilder()
+        val rawLayers = original.source.layers
+        assertTrue(rawLayers.size >= 2)
+        val firstRaw = rawLayers.first()
+        val hiddenFirst = WorkspaceSourceLayer.copyOf(firstRaw, firstRaw.order, visible = false, groupPath = "人/脸")
+        val modifiedLayers = listOf(hiddenFirst) + rawLayers.drop(1)
+        val hiddenGroups = listOf(
+            WorkspaceSourceGroup("人", "人", visible = false, opacity = 1f, clipped = false, blend = LayerBlend.Normal, passThrough = true),
+            WorkspaceSourceGroup("人/脸", "脸", visible = false, opacity = 1f, clipped = false, blend = LayerBlend.Normal, passThrough = true),
+            WorkspaceSourceGroup("背景", "背景", visible = true, opacity = 1f, clipped = false, blend = LayerBlend.Normal, passThrough = true),
+        )
+        val artWithHidden = WorkspaceSourceArt(original.source.widthPx, original.source.heightPx, modifiedLayers, hiddenGroups)
+        val runtime = WorkspaceRuntime<RigPreviewModel>({ builder.build(it) })
+        val importer = WorkspaceSourceImporter(runtime, readPsd = { artWithHidden })
+        val keptId = hiddenFirst.id.raw
+        val result = importer.importPsd(path, null, runtime.state.value.state, initialConfig = original.rawConfig(),
+            modifiers = WorkspaceInitialModifiers.RECOMMENDED, includeLayerIds = setOf(keptId))
+        val installed = result.capture
+        assertEquals(listOf(keptId), installed.document.source.layers.map { it.id.raw })
+        assertTrue(installed.document.source.layers.single().visible)
+        assertEquals(listOf("人", "人/脸"), installed.document.source.groups.map { it.path })
+        assertTrue(installed.document.source.groups.all { it.visible })
+        assertTrue(installed.model.rig.puppet.visibleDrawableIds().isNotEmpty())
+        assertFailsWith<IllegalArgumentException> {
+            importer.importPsd(path, installed.projectId, installed.state, discardUnsaved = true, initialConfig = original.rawConfig(),
+                modifiers = WorkspaceInitialModifiers.RECOMMENDED, includeLayerIds = setOf("nonexistent-layer"))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            importer.importPsd(path, installed.projectId, installed.state, discardUnsaved = true, initialConfig = original.rawConfig(),
+                modifiers = WorkspaceInitialModifiers.RECOMMENDED, includeLayerIds = emptySet())
+        }
     }
 }
