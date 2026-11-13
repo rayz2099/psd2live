@@ -369,7 +369,8 @@ internal object Cmo3ModelImport {
         return Bounds(xs.min(), ys.min(), xs.max(), ys.max())
     }
 
-    private fun layers(doc: Document, ids: Map<String, String>): List<SourceLayer> = doc.puppet.drawables.mapIndexed { index, d ->
+    /** 按 CMO3 网格逐三角重建每个 Drawable 的紧致源图栅格，供无图集工程统一重排。 */
+    internal fun layers(doc: Document, ids: Map<String, String>): List<SourceLayer> = doc.puppet.drawables.mapIndexed { index, d ->
         val canvas = d.mesh?.positions?.takeIf { it.isNotEmpty() }
         val b = canvas?.let(::bounds) ?: Bounds(0f, 0f, 1f, 1f)
         val left = floor(b.left).toInt()

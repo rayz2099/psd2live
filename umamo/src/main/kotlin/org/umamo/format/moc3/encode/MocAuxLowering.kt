@@ -121,12 +121,8 @@ internal fun auxiliarySections(context: MocLoweringContext): Map<Int, ByteArray>
 		sink.putInts(Section.RENDER_ORDER_GROUP_MIN_DRAW_ORDER, minDraw)
 	}
 
-	// offscreens: per-object scalar sections + keyform tables
-	if (doc.offscreens.isNotEmpty()) {
-		sink.putInts(Section.OFFSCREEN_OWNER_PART, doc.offscreens.map { it.ownerPartIndex })
-		sink.putBytes(Section.OFFSCREEN_CONSTANT_FLAGS, ByteArray(doc.offscreens.size) { doc.offscreens[it].constantFlags.toByte() })
-		sink.putInts(Section.OFFSCREEN_BLEND_MODE, doc.offscreens.map { it.blendMode })
-		sink.putInts(Section.OFFSCREEN_MASK_COUNT, doc.offscreens.map { it.maskCount })
+	// 152/160 属于 PER_PART 节：即使模型没有 offscreen（doc.offscreens 为空），官方 Core v6 一致性校验仍要求按 partCount 填充 -1，否则 offsets[160] 越界到 EOF。
+	if (doc.parts.isNotEmpty()) {
 		// 152: the per-part inverse of OFFSCREEN_OWNER_PART (-1 for offscreen-less parts).
 		val offscreenByPart = IntArray(doc.parts.size) { -1 }
 		for ((offscreenIndex, offscreen) in doc.offscreens.withIndex()) {
@@ -134,7 +130,8 @@ internal fun auxiliarySections(context: MocLoweringContext): Map<Int, ByteArray>
 				offscreenByPart[offscreen.ownerPartIndex] = offscreenIndex
 			}
 		}
-		sink.putInts(Section.OFFSCREEN_BY_PART, offscreenByPart.toList())
+		val partList = offscreenByPart.toList()
+		sink.putInts(Section.OFFSCREEN_BY_PART, partList)
 		// 160 gets the SAME inverse map, and it must be written: the runtime reads it as a per-part
 		// offscreen index, so leaving it empty makes it read the neighbouring section's bytes as part
 		// indices and take the core down (not a rejected file - a segfault inside it).
@@ -144,7 +141,14 @@ internal fun auxiliarySections(context: MocLoweringContext): Map<Int, ByteArray>
 		// that matches no owner.  Which makes 152 the reconstructible one and 160 an editor-internal
 		// artifact, in the same class as the keyform-binding numbering: we write the consistent
 		// inverse in both rather than reproduce a divergence we cannot derive.
-		sink.putInts(Section.OFFSCREEN_BY_PART_ALIAS, offscreenByPart.toList())
+		sink.putInts(Section.OFFSCREEN_BY_PART_ALIAS, partList)
+	}
+	// offscreens: per-object scalar sections + keyform tables
+	if (doc.offscreens.isNotEmpty()) {
+		sink.putInts(Section.OFFSCREEN_OWNER_PART, doc.offscreens.map { it.ownerPartIndex })
+		sink.putBytes(Section.OFFSCREEN_CONSTANT_FLAGS, ByteArray(doc.offscreens.size) { doc.offscreens[it].constantFlags.toByte() })
+		sink.putInts(Section.OFFSCREEN_BLEND_MODE, doc.offscreens.map { it.blendMode })
+		sink.putInts(Section.OFFSCREEN_MASK_COUNT, doc.offscreens.map { it.maskCount })
 		// 158: cumulative mask base (the scan of 159; MOC3 §5.6, OffscreenKeyformProbeTest).
 		val maskBases = ArrayList<Int>()
 		var maskBaseCursor = 0

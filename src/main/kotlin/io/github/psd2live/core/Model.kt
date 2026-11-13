@@ -557,6 +557,8 @@ data class RigPreviewModel(
 	val referenceLayerIds: Set<String> = emptySet(),
     internal val modifierAuthorAtlas: PackedAtlas? = null,
     internal val modifierAuthorAnalysis: PipelineAnalysis? = null,
+	/** 原工程在编辑器中被关闭眼睛的非草稿 Part ID，供静态结构侧栏与预览初期状态参考。 */
+	val hiddenEditorPartIds: Set<String> = emptySet(),
 ) {
     /** Transient, immutable evaluation snapshot installed before publication; never document state. */
     internal var modifierEvaluation: io.github.psd2live.core.modifier.RigModifierEvaluationCache.Snapshot? = null

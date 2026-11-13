@@ -15,7 +15,7 @@ import java.nio.file.Path
  */
 internal object ExportCli {
 	private const val USAGE = """Usage:
-  psd2live export <input.psd2live|input.psd> --target <id> [--output <dir>] [--name <base>] [--set key=value]...
+  psd2live export <input.psd2live|input.cmo3|input.psd> --target <id> [--output <dir>] [--name <base>] [--set key=value]...
   psd2live targets
 
 Writes the target's files and <base>.<target>.report.json, which lists what the target could not keep."""
@@ -68,7 +68,12 @@ Writes the target's files and <base>.<target>.report.json, which lists what the 
 			val target = ExportService.registry(preview.config)[targetId!!]
 			val baseName = name ?: source.fileName.toString().substringBeforeLast('.').ifBlank { "model" }
 			val directory = output ?: source.parent.resolve("${baseName}-${target.id}")
-			val report = ExportService.export(preview, target, ExportService.options(target, baseName, preview.config, settings), directory)
+			val exportOptions = ExportService.options(target, baseName, preview.config, settings)
+			val report = ExportService.export(preview, target, exportOptions, directory)
+			// 仅导出 moc3 时额外写入静态工程结构快照，供预览侧栏还原变形器/参数分组与原工程 Part 显隐。
+			if (target.id == "moc3") {
+				io.github.psd2live.application.AuthoringSnapshotWriter.write(preview, baseName, directory)
+			}
 			println("Exported ${report.files.size} files to ${directory.toAbsolutePath()} (compiler ${report.compiler})")
 			report.files.forEach { println("  $it") }
 			if (report.losses.isNotEmpty()) {
