@@ -84,15 +84,25 @@ public class RasterTargets(private val renderer: FrameRenderer) {
 				val log = StringBuilder()
 				val reader = Thread { process.inputStream.bufferedReader().forEachLine { log.appendLine(it) } }.apply { isDaemon = true; start() }
 				try {
-					process.outputStream.buffered().use { input ->
-						val row = ByteArray(width * height * 4)
-						for (frame in frames) {
-							for (i in frame.argb.indices) {
-								val argb = frame.argb[i]
-								row[i * 4] = (argb shr 16).toByte(); row[i * 4 + 1] = (argb shr 8).toByte(); row[i * 4 + 2] = argb.toByte(); row[i * 4 + 3] = (argb ushr 24).toByte()
+					try {
+						process.outputStream.buffered().use { input ->
+							val row = ByteArray(width * height * 4)
+							for (frame in frames) {
+								for (i in frame.argb.indices) {
+									val argb = frame.argb[i]
+									row[i * 4] = (argb shr 16).toByte(); row[i * 4 + 1] = (argb shr 8).toByte(); row[i * 4 + 2] = argb.toByte(); row[i * 4 + 3] = (argb ushr 24).toByte()
+								}
+								input.write(row)
 							}
-							input.write(row)
 						}
+					} catch (failure: java.io.IOException) {
+						// ffmpeg 若因动态库或参数报错提前退出，先回收 stderr 日志再抛出可读原因，避免只剩 Broken pipe。
+						val status = process.waitFor(); reader.join(2_000)
+						val detail = log.toString().trim()
+						if (detail.isNotEmpty()) {
+							throw IllegalStateException("ffmpeg failed ($status): ${detail.take(500)}", failure)
+						}
+						throw failure
 					}
 					val status = process.waitFor(); reader.join()
 					check(status == 0) { "ffmpeg failed ($status): ${log.toString().trim().take(500)}" }
