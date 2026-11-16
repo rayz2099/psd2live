@@ -8,19 +8,22 @@ internal object WorkspaceMeshTopology {
     const val ID = "mesh_get_topology"
     const val MAX_LIMIT = 4096
     val SECTIONS = listOf("vertices", "triangles", "outline")
+    val SPACES = listOf("mesh_rest", "canvas")
     private val s = WorkspaceResultSchema
 
     val request = s.obj(mapOf(
         "target" to JsonObject(s.handle() + ("description" to JsonPrimitive("mesh:ID"))),
         "section" to JsonObject(s.choices(*SECTIONS.toTypedArray()) + ("description" to JsonPrimitive(
             "What items holds: vertices as [index, x, y] (default), triangles as [index, a, b, c], or the outline edges as [a, b]."))),
+        "space" to JsonObject(s.choices(*SPACES.toTypedArray()) + ("description" to JsonPrimitive(
+            "Coordinate space for vertices and bounds: mesh_rest (default) or canvas."))),
         "offset" to s.integer(0),
         "limit" to JsonObject(s.integer(1, MAX_LIMIT) + ("description" to JsonPrimitive("Default 1024."))),
     ), setOf("target"))
 
     val result = s.obj(mapOf(
         "project_id" to s.handle(), "state" to s.handle(), "revision_id" to s.handle(), "target" to s.handle(),
-        "coordinate_space" to s.constant("mesh_rest"), "vertex_count" to s.integer(0), "triangle_count" to s.integer(0),
+        "coordinate_space" to s.choices(*SPACES.toTypedArray()), "vertex_count" to s.integer(0), "triangle_count" to s.integer(0),
         "outline_edge_count" to s.integer(0), "bounds" to s.vector(4), "section" to s.choices(*SECTIONS.toTypedArray()),
         "items" to s.array(s.array(s.number(), 2, 4), 0, MAX_LIMIT), "next_offset" to s.integer(1),
     ), setOf("project_id", "state", "revision_id", "target", "coordinate_space", "vertex_count", "triangle_count",
@@ -61,15 +64,27 @@ internal object WorkspaceMeshTopology {
         val outline = MeshTopology.edgeUses(mesh.indices).filterValues { it.size == 1 }.keys
             .sortedWith(compareBy({ it.endpointLow }, { it.endpointHigh }))
         val section = request["section"]?.jsonPrimitive?.content ?: "vertices"
+        val space = request["space"]?.jsonPrimitive?.content ?: "mesh_rest"
+        require(space in SPACES) { "Unsupported space: $space" }
         val total = when (section) { "vertices" -> mesh.vertexCount; "triangles" -> mesh.triangleCount; else -> outline.size }
         val offset = request["offset"]?.jsonPrimitive?.int ?: 0
         val limit = request["limit"]?.jsonPrimitive?.int ?: 1024
         require(offset in 0..total) { "offset must be within 0..$total" }
         val end = minOf(offset + limit, total)
-        val p = mesh.positions
+        // canvas 空间经由引擎完整变形器链（含普通旋转与弯曲变形器）求值到默认姿态画布坐标。
+        val p = if (space == "canvas") {
+            val geometry = io.github.psd2live.core.RigGeometryTools.geometry(puppet, "mesh", id, emptyMap())
+            val mapping = requireNotNull(org.umamo.render.eval.drawableSpaceMapping(puppet, emptyMap(), drawable.id)) {
+                "Mesh $id has no mappable parent space at default pose"
+            }
+            val world = mapping.localToWorld(geometry.points)
+            FloatArray(world.size) { idx -> if (idx % 2 == 1) -world[idx] else world[idx] }
+        } else {
+            mesh.positions
+        }
         return buildJsonObject {
             put("project_id", requireNotNull(snapshot.projectId)); put("state", snapshot.state); put("revision_id", snapshot.revisionId)
-            put("target", target); put("coordinate_space", "mesh_rest")
+            put("target", target); put("coordinate_space", space)
             put("vertex_count", mesh.vertexCount); put("triangle_count", mesh.triangleCount); put("outline_edge_count", outline.size)
             putJsonArray("bounds") {
                 val xs = p.indices.step(2).map { p[it] }; val ys = p.indices.step(2).map { p[it + 1] }
