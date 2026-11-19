@@ -62,10 +62,10 @@ internal data class PsdLayerRecord(
 	val clipped: Boolean,
 	val blend: LayerBlend,
 	val visible: Boolean,
-	// PSD: section-divider kind from the lsct block - 0 = normal layer, 1 = open folder header,
+	// PSD: section-divider kind from the lsct/lsdk block - 0 = normal layer, 1 = open folder header,
 	// 2 = closed folder header, 3 = bounding divider (the hidden "</Layer group>" group end).
 	val dividerType: Int,
-	// PSD: true for a pass-through folder (blend mode key "pass"); only meaningful on folder records.
+	// PSD: true for a pass-through folder (lsct/lsdk blend key "pass" or record blend key "pass"); only meaningful on folder records.
 	val passThrough: Boolean,
 	// PSD: the layer's Photoshop id from the lyid additional-layer-info block - stable across rename
 	// and reorder for the life of the layer; null when the writer omits lyid (some exporters do), in
@@ -198,9 +198,12 @@ internal object PsdLayerRecords {
 			require(extraLength <= buffer.bytes.size.toLong() - buffer.position) { "PSD layer extra data is truncated" }
 			val extraDataStart = buffer.position
 			val extraDataEnd = extraDataStart + extraLength.toInt()
-			// PSD: folder membership is carried by lsct (Section Divider Setting) in the additional
-			// layer info, scanned out of the whole extra region before we consume mask/ranges/name.
-			val dividerType = findAdditionalInfoInt(buffer, extraDataStart, extraDataEnd, "lsct") ?: 0
+			// PSD 分组结构由 lsct 或深层嵌套的 lsdk 携带；Photoshop/ag-psd 的穿透组会把 "pass" 写在分隔块内而记录头保留 "norm"。
+			val divider = findSectionDivider(buffer, extraDataStart, extraDataEnd)
+			val dividerType = divider?.type ?: 0
+			val divBlendKey = divider?.blendKey
+			val isFolder = dividerType == 1 || dividerType == 2
+			val passThrough = isFolder && (divBlendKey == "pass" || blendKey == "pass")
 			// PSD: the lyid block carries Photoshop's stable per-layer id (absent when the writer omits it).
 			val layerId = findAdditionalInfoInt(buffer, extraDataStart, extraDataEnd, "lyid")
 			// PSD: the luni block carries the definitive UTF-16BE Unicode layer name (Photoshop 5.0+).
@@ -223,8 +226,7 @@ internal object PsdLayerRecords {
 					blend = blendKeyToBlend(blendKey),
 					visible = (flags and 0x02) == 0,
 					dividerType = dividerType,
-					// PSD: a folder header's blend mode key is "pass" exactly when the folder is pass-through.
-					passThrough = blendKey == "pass",
+					passThrough = passThrough,
 					layerId = layerId,
 					channels = channelInfos,
 					channelDataOffset = 0, // placeholder; filled in below once the data start is known
@@ -329,10 +331,56 @@ internal object PsdLayerRecords {
 	}
 
 	/**
+	 * PSD 分组标记块（`lsct` 或深层嵌套 `lsdk`）的解析结果。
+	 * Photoshop 与 ag-psd 会将穿透组混合键写入分隔块内，而图层记录头仍保留 `"norm"`，因此需随分隔类型一并提取。
+	 */
+	private data class SectionDivider(
+		val type: Int,
+		val blendKey: String?,
+	)
+
+	/**
+	 * 扫描图层扩展区中的 `lsct` 或 `lsdk` 分组标记块。
+	 * Photoshop 嵌套超过 6 层时会改用 `lsdk` 替代 `lsct`，且穿透组可能仅在块内偏移 +8 处记录 `"pass"`，
+	 * 因此统一解析两种块的类型与可选混合模式键，避免往返导入时丢失分组层级或穿透语义。
+	 */
+	private fun findSectionDivider(buffer: ByteReader, regionStart: Int, regionEnd: Int): SectionDivider? {
+		var scanPos = regionStart
+		// 至少需要 16 字节：签名(4) + 块键(4) + 数据长度(4) + 分隔类型(4)。
+		while (scanPos + 16 <= regionEnd) {
+			val sig = buffer.asciiAt(scanPos, 4)
+			if (sig == "8BIM" || sig == "8B64") {
+				val key = buffer.asciiAt(scanPos + 4, 4)
+				if (key == "lsct" || key == "lsdk") {
+					val dataLen = buffer.u32(scanPos + 8)
+					val dataStart = scanPos + 12
+					if (dataLen >= 4L && dataStart.toLong() + dataLen <= regionEnd.toLong()) {
+						val type = buffer.u32AsInt(dataStart)
+						val blendKey = parseDividerBlendKey(buffer, dataStart, dataLen)
+						return SectionDivider(type = type, blendKey = blendKey)
+					}
+				}
+			}
+			scanPos++
+		}
+		return null
+	}
+
+	/**
+	 * 读取 `lsct`/`lsdk` 块中可选的混合模式键（按 Adobe PSD 规范仅在块长度 >= 12 时存在）。
+	 * 校验偏移 +4 处为 `'8BIM'`，防止将不完整或非标准尾部字节误判为混合模式键。
+	 */
+	private fun parseDividerBlendKey(buffer: ByteReader, dataStart: Int, dataLen: Long): String? {
+		if (dataLen < 12L) return null
+		val blendSig = buffer.asciiAt(dataStart + 4, 4)
+		if (blendSig != "8BIM") return null
+		return buffer.asciiAt(dataStart + 8, 4)
+	}
+
+	/**
 	 * Scans a layer record's extra-data region for an additional-layer-info block with the given
 	 * 4-char [key] and returns the u32 right after the block's length field, or null when the key is
-	 * absent.  Used for both lsct (the Section Divider Setting / folder type) and lyid (the stable
-	 * Photoshop layer id).
+	 * absent.  Used for lyid (the stable Photoshop layer id).
 	 *
 	 * The additional layer info is a run of blocks, each a 4-char signature ('8BIM' or '8B64'), a
 	 * 4-char key, a u32 length, then that many data bytes - but the data padding varies by writer, so
@@ -343,7 +391,7 @@ internal object PsdLayerRecords {
 	 * @param ByteReader buffer      The whole-file reader.
 	 * @param Int        regionStart First byte of the extra-data region.
 	 * @param Int        regionEnd   One past the last byte of the extra-data region.
-	 * @param String     key         The 4-char block key to find (e.g. "lsct", "lyid").
+	 * @param String     key         The 4-char block key to find (e.g. "lyid").
 	 * @return Int the u32 after the matched block's length field, or null when [key] is absent.
 	 */
 	private fun findAdditionalInfoInt(buffer: ByteReader, regionStart: Int, regionEnd: Int, key: String): Int? {
