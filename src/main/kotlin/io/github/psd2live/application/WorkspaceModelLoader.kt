@@ -23,7 +23,7 @@ internal object WorkspaceModelLoader {
 
     /**
      * 加载 CMO3 工程构造只读预览；已有图集时跳过 PSD 栅格重构与二次重排，
-     * 对无图集的未打包原工程则统一打包紧致图集并重绑 UV，同时归一化非草稿 Part 显隐。
+     * 对无图集的未打包原工程则统一打包紧致图集并重绑 UV，同时保留原工程 Part/Drawable 显隐状态（仅保留被蒙版引用的隐藏图层）。
      */
     private fun loadCmo3(path: Path): RigPreviewModel {
         val bytes = Files.readAllBytes(path)
@@ -38,9 +38,6 @@ internal object WorkspaceModelLoader {
         val hiddenPartIds = doc.puppet.parts
             .filter { part -> !part.isSketch && !part.isVisible }
             .mapTo(LinkedHashSet()) { part -> part.id.raw }
-        val normalizedParts = doc.puppet.parts.map { part ->
-            if (part.isSketch || part.isVisible) part else part.copy(isVisible = true)
-        }
         val fps = doc.fps ?: if (doc.physics.isNotEmpty()) RigEditOverlay.UNLIMITED_FPS else RigEditOverlay.DEFAULT_PHYSICS_FPS
         val overlay = RigEditOverlay(
             importedCmo3 = encoded,
@@ -69,12 +66,12 @@ internal object WorkspaceModelLoader {
             motionNod = false,
             motionShake = false,
             motionSkeleton = false,
-            exportHiddenParts = true,
-            exportHiddenDrawables = true,
+            exportHiddenParts = false,
+            exportHiddenDrawables = false,
         )
 
         val (finalAnalysis, finalAtlas, finalPages, finalPuppet) = prepareAtlasAndPuppet(
-            doc, normalizedParts, layerIds, cfg, w, h, anchors, emptyImg,
+            doc, doc.puppet.parts, layerIds, cfg, w, h, anchors, emptyImg,
         )
         val bounds = finalPuppet.drawables.mapNotNull { d ->
             val pts = d.mesh?.positions?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
@@ -109,7 +106,7 @@ internal object WorkspaceModelLoader {
     /** 若 CMO3 未自带图集（CModelTextureAtlas=0），则按网格重建紧致图层并打包图集与重算 UV。 */
     private fun prepareAtlasAndPuppet(
         doc: Cmo3ModelImport.Document,
-        normalizedParts: List<org.umamo.runtime.model.Part>,
+        parts: List<org.umamo.runtime.model.Part>,
         layerIds: Map<String, String>,
         cfg: PipelineConfig,
         w: Int,
@@ -130,7 +127,7 @@ internal object WorkspaceModelLoader {
                 override val groups: List<SourceGroup> = emptyList()
             }
             val analysis = PipelineAnalysis(emptySource, emptyList(), anchors, emptyList(), emptyImg)
-            val puppet = doc.puppet.copy(parts = normalizedParts, drawables = boundDrawables)
+            val puppet = doc.puppet.copy(parts = parts, drawables = boundDrawables)
             return PreparedCmo3(analysis, doc.atlas, doc.pages, puppet)
         }
 
@@ -148,7 +145,7 @@ internal object WorkspaceModelLoader {
         }
         if (classified.isEmpty()) {
             val analysis = PipelineAnalysis(packedSource, emptyList(), anchors, emptyList(), emptyImg)
-            val puppet = doc.puppet.copy(parts = normalizedParts)
+            val puppet = doc.puppet.copy(parts = parts)
             return PreparedCmo3(analysis, doc.atlas, doc.pages, puppet)
         }
 
@@ -171,7 +168,7 @@ internal object WorkspaceModelLoader {
         val analysis = PipelineAnalysis(packedSource, classified, anchors, emptyList(), emptyImg)
         val builtAtlasPair = PuppetSourceAtlas.build(analysis, packedAtlas, sourceIdRaw = Cmo3ModelImport.PAINT_SOURCE_ID)
         val puppet = doc.puppet.copy(
-            parts = normalizedParts,
+            parts = parts,
             drawables = drawables,
             atlas = builtAtlasPair.first,
             sources = builtAtlasPair.second,
