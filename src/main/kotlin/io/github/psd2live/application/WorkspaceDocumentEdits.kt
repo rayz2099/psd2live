@@ -37,10 +37,11 @@ internal object WorkspaceDocumentEdits {
               simulationWork: WorkspaceSimulationWork = WorkspaceSimulationWork.Direct,
               physicsWork: WorkspacePhysicsWork = WorkspacePhysicsWork.Direct,
               rasterWork: WorkspaceRasterWork = WorkspaceRasterWork.Direct,
-              assetResources: WorkspaceAssetWorkflow? = null): WorkspaceDocument =
+              assetResources: WorkspaceAssetWorkflow? = null,
+              draftInputs: WorkspaceModifierDraftInputs? = null): WorkspaceDocument =
         // A layer an edit gave pixels of its own no longer shows its material.
         WorkspaceReferenceMeshes.ensure(WorkspaceMaterialLinks.reconcile(document,
-            applyGenerated(operation, document, model, simulationWork, physicsWork, rasterWork, assetResources)), model)
+            applyGenerated(operation, document, model, simulationWork, physicsWork, rasterWork, assetResources, draftInputs)), model)
 
     /** [layerId] showing [raster] over its unchanged rectangle, as `layer_replace_image` does. */
     fun replaceImage(document: WorkspaceDocument, model: RigPreviewModel, layerId: String, raster: org.umamo.format.art.LayerRaster,
@@ -49,13 +50,13 @@ internal object WorkspaceDocumentEdits {
 
     private fun applyGenerated(operation: WorkspaceDocumentOperation, document: WorkspaceDocument, model: RigPreviewModel,
               simulationWork: WorkspaceSimulationWork, physicsWork: WorkspacePhysicsWork, rasterWork: WorkspaceRasterWork,
-              assetResources: WorkspaceAssetWorkflow?): WorkspaceDocument {
+              assetResources: WorkspaceAssetWorkflow?, draftInputs: WorkspaceModifierDraftInputs?): WorkspaceDocument {
         val request = operation.request
         WorkspaceArtPrimitives.requireCurrentReferences(document.rigEdits, request)
         // Every document operation, not only journal edits: a copy over the bangs is made anew on each build.
         refuseCopies(model, request)
         return when (operation.operation) {
-            in WorkspaceModifierEdits.supported -> WorkspaceModifierEdits.apply(operation, document, model, rasterWork)
+            in WorkspaceModifierEdits.supported, "modifier_rebind" -> WorkspaceModifierEdits.apply(operation, document, model, rasterWork, draftInputs)
             WorkspaceDrawOrderEdits.OP -> WorkspaceDrawOrderEdits.apply(document, model, request)
             WorkspaceLayerTransform.OP -> WorkspaceLayerTransform.apply(document, model, request)
             WorkspaceRasterEdits.REBUILD_MESH -> WorkspaceRasterEdits.rebuildMesh(document, model, request.text("layer_id"), rasterWork)
@@ -290,9 +291,16 @@ internal object WorkspaceDocumentEdits {
 
     fun journal(document: WorkspaceDocument, model: RigPreviewModel, edits: JsonArray): WorkspaceDocument {
         refuseCopies(model, edits)
+        WorkspaceMeshPointEdits.record(document, model, edits)?.let { return it }
+        WorkspaceMeshPointEdits.recordWeights(document, model, edits)?.let { return it }
         // Recorded on the shown rig, they replay on the authored one, before the generators.
-        val recorded = JournalRecording.record(model.rig.puppet, model.authored.rig.puppet, document.rigEdits, edits, model.primitiveSkins,
-            model.rig.modifierReport)
+        val stage = GeometryEditStages.stage(edits)
+        val selected = GeometryEditStages.resolve(model, stage)
+        val clean = GeometryEditStages.clean(edits)
+        if (stage != "auto") GeometryEditStages.validateExplicit(selected.puppet, clean)
+        val recorded = if (stage != "auto" && selected.generator == null) RigAuthoringJournal.compile(selected.puppet, clean).second
+        else JournalRecording.record(selected.puppet, model.authored.rig.puppet, document.rigEdits, clean, model.primitiveSkins,
+            selected.report, selected.generator)
         var overlay = document.rigEdits
         val journal = if (overlay.modifierStack == null) recorded else {
             var stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(overlay.modifierStack)
@@ -405,15 +413,39 @@ internal object WorkspaceDocumentEdits {
         val ranges = parameters.associate { it.id.raw to (it.min..it.max) }
         val clips = WorkspaceSkeletonMotionEdits.motion(
             MotionCatalog.entries(document.rigEdits), request, ranges, document.rigEdits.skeleton, document.rigEdits.motionPresets,
-            MotionLoops.keyLimits(parameters), parameters, document.rigEdits.idRenames.parameters)
+            MotionLoops.keyLimits(parameters), parameters, document.rigEdits.idRenames.parameters,
+            reserveBuiltinNames = document.rigEdits.modifierStack == null)
         if (request["mode"]?.jsonPrimitive?.content == "duplicate") {
             val stack = document.rigEdits.modifierStack?.let(io.github.psd2live.core.modifier.RigModifierStack::fromJson)
-            val owner = stack?.instances?.firstOrNull { it.type == "motion" && it.outputId("motion") == request["id"]?.jsonPrimitive?.content }
+            val owner = stack?.instances?.firstOrNull { it.id !in stack.appliedNodes && it.type == "motion" && it.outputId("motion") == request["id"]?.jsonPrimitive?.content }
             if (owner != null) {
                 val copy = clips.last()
                 val next = stack.add("motion", owner.version, owner.targets, MotionClips.toJson(copy),
                     outputAliases = mapOf("motion" to copy.id))
                 return document.copy(rigEdits = document.rigEdits.copy(modifierStack = next.toJson()))
+            }
+            val sourceId = request.getValue("id").jsonPrimitive.content
+            val record = MotionCatalog.entries(document.rigEdits).single { it.id == sourceId }
+            val appliedOwner = stack?.instances?.asReversed()?.firstOrNull { instance ->
+                stack.appliedNodes[instance.id]?.authoredMotions.orEmpty().any { MotionClips.fromJson(it).id == sourceId }
+            }
+            if (appliedOwner != null) {
+                val copy = clips.last().let { it.copy(fileStem = MotionClips.exportStems(clips).getValue(it.id)) }
+                val node = stack.appliedNodes.getValue(appliedOwner.id).duplicateMotion(sourceId, copy)
+                return document.copy(rigEdits = document.rigEdits.copy(modifierStack =
+                    stack.copy(appliedNodes = stack.appliedNodes + (appliedOwner.id to node)).toJson()))
+            }
+            val materialized = document.rigEdits.motionSources[sourceId]?.let { AppliedMotionRecords.compile(record, it) }
+                ?: stack?.instances?.asReversed()?.firstNotNullOfOrNull { instance ->
+                    stack.appliedNodes[instance.id]?.materializedMotions()?.firstOrNull { it.id == sourceId }
+                }
+            if (materialized != null) {
+                val copy = clips.last()
+                val raw = materialized.copy(id = copy.id, name = copy.name, file = MotionClips.exportStems(clips).getValue(copy.id),
+                    group = copy.exportGroup ?: if (copy.loop) "Idle" else copy.name)
+                val overlay = MotionCatalog.replacing(document.rigEdits, clips.dropLast(1) + copy)
+                return document.copy(rigEdits = overlay.copy(motionSources = overlay.motionSources +
+                    (copy.id to AppliedMotionRecords.source(copy, raw))))
             }
         }
         return document.copy(rigEdits = MotionCatalog.replacing(document.rigEdits, clips))
@@ -424,10 +456,12 @@ internal object WorkspaceDocumentEdits {
             val stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(raw)
             val owner = SwingCatalog.owner(document.rigEdits, edit.id)
             val source = if (estimatePhysics) SwingAuthoring.resized(puppet, edit) else edit
-            val next = if (owner == null) stack.add("swing", 1, source.targets.map { target ->
-                io.github.psd2live.core.modifier.ModifierTarget(if (puppet.deformers.any { it.id.raw == target }) "deformer" else "mesh", target)
-            }, source.toJson(), id = source.id)
-            else stack.update(owner.id) { it.copy(config = JsonObject(it.config + source.toJson())) }
+            val targets = source.targets.map { target ->
+                owner?.targets?.firstOrNull { it.id == target }
+                    ?: io.github.psd2live.core.modifier.ModifierTarget(if (puppet.deformers.any { it.id.raw == target }) "deformer" else "mesh", target)
+            }
+            val next = if (owner == null) stack.add("swing", 1, targets, source.toJson(), id = source.id)
+            else stack.update(owner.id) { it.copy(targets = targets, config = JsonObject(it.config + source.toJson())) }
             return document.copy(rigEdits = document.rigEdits.copy(modifierStack = next.toJson()))
         }
         val overlay = SwingAuthoring.put(document.rigEdits, puppet, edit, estimatePhysics)
@@ -456,7 +490,7 @@ internal object WorkspaceDocumentEdits {
         }
         val request = PhysicsAuthoring.request(physicsCatalog(document, model), arguments,
             model.rig.puppet.parameters.mapTo(HashSet()) { it.id.raw })
-        if (document.rigEdits.modifierStack != null && request.edit != null) {
+        if (document.rigEdits.modifierStack != null && request.edit != null && AppliedPhysics.owner(document.rigEdits, id) == null) {
             val authored = model.authored.rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }
             val generated = model.rig.puppet.parameters.mapTo(HashSet()) { it.id.raw } - authored
             require(request.edit.parameters.none { it in generated }) { "Generated parameter references belong in a physics modifier; use modifier_add or modifier_update" }
@@ -479,7 +513,7 @@ internal object WorkspaceDocumentEdits {
         val group = physicsCatalog(document, model).firstOrNull { it.id == id }
             ?: throw IllegalArgumentException("Physics group not found: $id")
         require(group.origin != PhysicsOrigin.MODIFIER) { "$id belongs to a modifier; use modifier_enable or modifier_remove on its owner" }
-        require(document.rigEdits.physicsEdits.any { it.id == id }) {
+        require(document.rigEdits.physicsEdits.any { it.id == id } || AppliedPhysics.owner(document.rigEdits, id) != null) {
             "$id is generated; physics_put enabled=false turns it off, or edit its source (swing, skeleton, preset setting)"
         }
         return document.copy(rigEdits = PhysicsAuthoring.remove(document.rigEdits, id, group.generated != null))

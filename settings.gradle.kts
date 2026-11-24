@@ -17,7 +17,15 @@ dependencyResolutionManagement {
 rootProject.name = "psd2live"
 
 include(":umamo")
+include(":umamo-ir-bridge")
 include(":format-model")
+include(":algorithm-api")
+include(":algorithm-worker")
+include(":algorithms:physics")
+include(":algorithms:motion")
+include(":algorithms:swing")
+include(":algorithms:simulation")
+include(":algorithms:binding")
 include(":format-compile")
 include(":targets:cubism")
 include(":targets:raster")

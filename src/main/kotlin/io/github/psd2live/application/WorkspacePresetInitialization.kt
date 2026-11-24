@@ -6,42 +6,132 @@ import io.github.psd2live.core.recipe.*
 import io.github.psd2live.core.sim.ModelPresets
 import io.github.psd2live.project.*
 import kotlinx.serialization.json.*
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 
 /** A preset is a recipe for explicit instances, never a second model-generation pipeline. */
 internal object WorkspacePresetInitialization {
+    private class Plan(val document: WorkspaceDocument, val finalPreview: () -> RigPreviewModel)
+
     fun create(document: WorkspaceDocument, work: WorkspaceRasterWork,
-               choices: WorkspaceInitialPreset = WorkspaceInitialPreset()): WorkspaceDocument = prepare(document, work, choices).first
+               choices: WorkspaceInitialPreset = WorkspaceInitialPreset(),
+               richness: String? = null, draftInputs: WorkspaceModifierDraftInputs? = null): WorkspaceDocument {
+        val pipeline = PSD2LivePipeline()
+        try {
+            val planned = plan(document, work, choices, pipeline, richness = richness)
+            // The command builder will evaluate the normalized candidate and materialize its bundle.
+            draftInputs?.pipeline = pipeline
+            return planned.document
+        } finally {
+            if (draftInputs?.pipeline !== pipeline) pipeline.modifierBuildOwner.close()
+        }
+    }
 
     fun prepare(document: WorkspaceDocument, work: WorkspaceRasterWork,
-                choices: WorkspaceInitialPreset = WorkspaceInitialPreset()): Pair<WorkspaceDocument, RigPreviewModel> {
-        val config = document.config()
+                choices: WorkspaceInitialPreset = WorkspaceInitialPreset(),
+                requestedVersions: Map<String, Int> = emptyMap(),
+                cliBindings: CliPresetBindings? = null,
+                restoreSourceRotations: Boolean = false,
+                pluginOverrides: Map<String, Pair<String, ModifierPluginReference>> = emptyMap(),
+                richness: String? = null): Pair<WorkspaceDocument, RigPreviewModel> {
+        val pipeline = PSD2LivePipeline()
+        try {
+            val planned = plan(document, work, choices, pipeline, requestedVersions, cliBindings,
+                restoreSourceRotations, pluginOverrides, richness)
+            return planned.document to planned.finalPreview()
+        } catch (failure: Throwable) {
+            pipeline.modifierBuildOwner.close()
+            throw failure
+        }
+    }
+
+    private fun plan(document: WorkspaceDocument, work: WorkspaceRasterWork, choices: WorkspaceInitialPreset,
+                     pipeline: PSD2LivePipeline, requestedVersions: Map<String, Int> = emptyMap(),
+                     cliBindings: CliPresetBindings? = null, restoreSourceRotations: Boolean = false,
+                     pluginOverrides: Map<String, Pair<String, ModifierPluginReference>> = emptyMap(),
+                     richness: String? = null): Plan {
+        val rawConfig = cliBindings?.config?.takeIf { restoreSourceRotations }
+        fun configOf(candidate: WorkspaceDocument) = rawConfig?.copy(rigEdits = candidate.rigEdits) ?: candidate.config()
+        val config = configOf(document)
         var stack = RigModifierStack.fromJson(requireNotNull(document.rigEdits.modifierStack))
         require(stack.instances.isEmpty()) { "Initialize presets only into an empty stack" }
-        val pipeline = PSD2LivePipeline().apply { deferRuntimeBundles = true }
-        fun current() = document.copy(rigEdits = document.rigEdits.copy(modifierStack = stack.toJson()))
-        fun build(): RigPreviewModel {
-            work.checkpoint()
-            val candidate = current()
-            return pipeline.buildPreview(candidate.source, candidate.config(), ProgressListener { _, _ -> work.checkpoint() })
+        pipeline.deferRuntimeBundles = true
+        pipeline.rawSourceRotations = restoreSourceRotations && cliBindings != null && freshSource(config)
+        val baseDocument = if (document.rigEdits.checkpointIndex < 0) document else {
+            val stripped = document.rigEdits.copy(authoringJournal = document.rigEdits.authoringJournal.filterNot {
+                RigCheckpoint.isRecord(it) || it["op"]?.jsonPrimitive?.contentOrNull == ArtPrimitiveJournal.OP
+            })
+            val ordinaryConfig = RigModifierPipeline.ordinaryConfig(configOf(document)).copy(meshOnly = true, rigEdits = stripped)
+            val ordinary = pipeline.buildOrdinaryPreview(document.source, ordinaryConfig, ProgressListener { _, _ -> work.checkpoint() }, previousAtlas = null)
+            val binding = ordinary.sources.bindingKey ?: pipeline.bindingKey(document.source, ordinaryConfig)
+            val checkpoint = RigCheckpoint.encode(ordinary.authored, binding)
+            document.copy(rigEdits = document.rigEdits.copy(authoringJournal = document.rigEdits.authoringJournal.filterNot(RigCheckpoint::isRecord) + checkpoint))
         }
-        var model = build()
-        val targets = model.rig.puppet.drawables.filter { it.mesh != null && it.id.raw in model.rig.ownLayerIdByDrawableId }
-            .map { ModifierTarget("mesh", it.id.raw) }
+        fun current() = baseDocument.copy(rigEdits = baseDocument.rigEdits.copy(modifierStack = stack.toJson()))
+        fun build(stage: String, candidate: WorkspaceDocument = current()): RigPreviewModel = RigBuildProfile.stage("source preset: $stage") {
+            work.checkpoint()
+            var lastProgress: Pair<String, Double>? = null
+            pipeline.buildPreview(candidate.source, configOf(candidate), ProgressListener { message, fraction ->
+                work.checkpoint()
+                if (lastProgress != (message to fraction)) {
+                    lastProgress = message to fraction
+                    work.progress(fraction.toFloat(), "$stage: $message")
+                }
+            })
+        }
+        // Planning needs the package graph, but making the ordinary source meshes only needs the empty stack.
+        val catalog = FutureTask { RigModifierAlgorithms.registry }.also {
+            Thread.ofVirtual().name("psd2live-preset-catalog").start(it)
+        }
+        var model: RigPreviewModel
+        val targets = try {
+            model = build("author preview")
+            model.rig.puppet.drawables.filter { it.mesh != null && it.id.raw in model.rig.ownLayerIdByDrawableId }
+                .map { ModifierTarget("mesh", it.id.raw) }.also {
+                    if (it.isNotEmpty()) RigBuildProfile.stage("source preset: wait for modifier catalog") {
+                        try { catalog.get() }
+                        catch (failure: ExecutionException) { throw failure.cause ?: failure }
+                    }
+                }
+        } finally {
+            catalog.cancel(true)
+        }
         if (targets.isEmpty()) {
-            model.runtimeBundle.materialize()
-            return document to model
+            require(requestedVersions.isEmpty()) { "Cannot select preset versions without mesh targets" }
+            return Plan(document) {
+                if (rawConfig == null) model.runtimeBundle.materialize()
+                model
+            }
+        }
+        // Import and CLI callers preserve their configured recipe unless a template tier is explicitly selected.
+        val tiers = when (richness) {
+            null -> ModuleTier.entries.toSet()
+            "base" -> emptySet()
+            "minimal" -> setOf(ModuleTier.CORE)
+            "standard" -> setOf(ModuleTier.CORE, ModuleTier.MAJOR)
+            "full" -> ModuleTier.entries.toSet()
+            else -> throw IllegalArgumentException("Unknown preset richness: $richness")
+        }
+        val excludedModules = buildSet {
+            addAll(WorkspaceModifierPlan.PRESET_EXCLUDED_MODULES)
+            if (choices.clothing) add("outfit.ribbons")
         }
         val subject = RecipeSubject.of(model.analysis)
         val fittedFace = RigModules.builds(RigModules.FACE_DEPTH_TURN, config, subject)
         val types = buildList {
-            for (area in listOf("body", "face", "eye", "brow", "mouth", "hair"))
+            // Body and hair bindings may rebase mesh coordinates in the neutral head frame.
+            // Finish base frame changes before mouth source topology is consumed by add-ons.
+            for (area in listOf("eye", "brow", "face", "body", "hair", "mouth"))
                 add(if (area == "face" && fittedFace) RigLegacyBindings.FITTED_FACE else config.recipe.base(area).id)
-            addAll(RigModules.modules.filter { RigModules.builds(it, config, subject) && it != RigModules.FACE_DEPTH_TURN }
-                .map { it.id }.filter { RigLegacyBindings.find(it) != null })
+            addAll(RigModules.modules.filter {
+                RigModules.builds(it, config, subject) &&
+                    it.id !in excludedModules &&
+                    it.tier in tiers
+            }.map { it.id }.filter { RigLegacyBindings.find(it) != null })
         }
         val group = if (config.recipe.modern) "modern" else "legacy"
         stack = WorkspaceModifierPlan.plan(model, stack, buildJsonObject {
-            put("group", "$group-standard")
+            put("group", "$group-${richness ?: "standard"}")
             put("targets", JsonArray(targets.map { buildJsonObject { put("kind", it.kind); put("id", it.id) } }))
         }, types).first
         stack = stack.copy(instances = stack.instances.map { entry ->
@@ -70,13 +160,33 @@ internal object WorkspacePresetInitialization {
             }
             entry.copy(config = settings, presetGroup = group)
         })
-        model = build()
-        val available = model.rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }
+        val lockedVersions = requestedVersions.mapValues { (type, version) ->
+            require(stack.instances.any { it.type == type }) { "Preset has no modifier of type $type" }
+            val reference = requireNotNull(BuiltinModifierPlugins.reference(type, version)) {
+                "Unknown bundled modifier $type@$version"
+            }
+            require(ModifierPluginCatalog.available(type, version, reference)) { "Bundled modifier $type@$version is unavailable" }
+            version to reference
+        }
+        if (lockedVersions.isNotEmpty()) {
+            stack = stack.copy(instances = stack.instances.map { entry ->
+                lockedVersions[entry.type]?.let { (version, plugin) -> entry.copy(version = version, plugin = plugin) } ?: entry
+            })
+        }
+        if (cliBindings == null) {
+            stack = stack.copy(instances = RigPartFolding.foldAll(stack.instances, pluginOverrides.keys + requestedVersions.keys,
+                freshInstanceIds = stack.instances.filter { it.type !in requestedVersions }.mapTo(hashSetOf()) { it.id }))
+        }
+        if (cliBindings != null) stack = cliBindings.bindings(model, stack)
+        model = build("binding preview")
+        val parameters = model.rig.puppet.parameters.associateBy { it.id.raw }
+        val available = parameters.keys
         val claimed = model.rig.modifierOutput!!.physics.groups.flatMapTo(HashSet()) { it.outputs.map { output -> output.parameter } }
         if (config.generatePhysics) for (rule in PhysicsGenerator.presetRules(
             PhysicsGenerator.Presets(config.physicsFrontHair, config.physicsBackHair, config.physicsEyeJelly), available)) {
             if (PhysicsCatalog.issueOf(rule, available) != null || rule.outputs.any { it.parameter in claimed }) continue
-            stack = stack.add("physics", 1, targets, rule.toJson(), group)
+            stack = stack.add("physics", 1, targets, rule.toJson(), group,
+                outputAliases = if (cliBindings == null) emptyMap() else mapOf("physics" to rule.id))
             claimed += rule.outputs.map { it.parameter }
         }
         if (config.exportMotions) for (name in MotionClips.BUILTIN_NAMES) {
@@ -91,14 +201,24 @@ internal object WorkspacePresetInitialization {
             val settings = MotionPresetSettings.of(config, name)
             if (!enabled || settings.deleted || settings.disabled) continue
             val tracks = MotionPresets.tracks(name, config.rigEdits.skeleton, settings,
-                if (name == "Idle" && config.exportIncludePhysics) claimed else emptySet()).filter { it.parameterId in available }
-            if (tracks.isEmpty()) continue
-            val clip = MotionClips.fromTracks("template", name, null, MotionPresets.loops(name), tracks,
-                MotionPresets.duration(name, tracks, settings))
-            stack = stack.add("motion", 1, targets, MotionClips.toJson(clip.copy(parameterRoles =
-                if (name == "Blink") mapOf("EyeBlink" to listOf("ParamEyeLOpen", "ParamEyeROpen").filter { it in available }) else emptyMap())), group)
+                if (name == "Idle" && config.exportIncludePhysics) claimed else emptySet())
+            val curves = tracks.filter { it.parameterId in available }.distinctBy { it.parameterId }
+            if (curves.isEmpty()) continue
+            // Speech uses an intentional jump where two syllables share a timestamp.
+            val ranges = curves.associate { curve ->
+                val parameter = parameters.getValue(curve.parameterId)
+                curve.parameterId to MotionParameterRange(parameter.min, parameter.max, parameter.repeat)
+            }
+            val clip = MotionClip("template", name, loop = MotionPresets.loops(name),
+                duration = MotionPresets.duration(name, tracks, settings).takeIf { it > 0f } ?: 2f,
+                curves = curves, capturedRanges = ranges)
+            val named = cliBindings?.motion(clip) ?: clip
+            val roles = if (name == "Blink") mapOf("EyeBlink" to listOf("ParamEyeLOpen", "ParamEyeROpen").filter { it in available }) else emptyMap()
+            stack = stack.add("motion", 1, targets, MotionClips.toJson(named.copy(parameterRoles = roles)), group,
+                outputAliases = if (cliBindings == null) emptyMap() else mapOf("motion" to name))
         }
-        model = build()
+        // Physics and clips reference the binding parameters without changing the rest geometry.
+        // All simulation presets can therefore plan against the same evaluated binding.
         val selected = buildList {
             val present = PhysicsGenerator.Presets.present(model.analysis)
             if (present.frontHair && choices.frontHair == WorkspaceInitialHair.SIMULATION) add("front_hair")
@@ -108,12 +228,29 @@ internal object WorkspacePresetInitialization {
         for (preset in selected) {
             stack = WorkspaceModifierPlan.simulationPreset(model, stack, targets, preset, allowNoLooseClothing = true).first
         }
-        stack = stack.copy(instances = stack.instances.map { it.copy(presetGroup = group) })
-        stack = WorkspaceModifierSimulation.prepare(current(), stack, work, pipeline = pipeline)
-        model = build()
-        stack = stack.copy(instances = stack.instances.map { WorkspaceModifierEdits.captureParameterProviders(it, model, stopAtConsumer = true) })
+        stack = stack.copy(instances = stack.instances.map {
+            val captured = WorkspaceModifierEdits.captureParameterProviders(it.copy(presetGroup = group), model, stopAtConsumer = true)
+            pluginOverrides[captured.type]?.let { (overrideType, overridePlugin) ->
+                captured.copy(type = overrideType, version = 1, plugin = overridePlugin)
+            } ?: captured
+        })
         RigModifierAlgorithms.evaluator().validateOrder(stack)
-        // Provider metadata is validated against the same cached prefix before publishing the candidate.
-        return current() to build().also { work.checkpoint(); it.runtimeBundle.materialize(); work.checkpoint() }
+        RigBuildProfile.mark("source preset: begin simulation")
+        stack = RigBuildProfile.stage("source preset: simulation preparation") {
+            WorkspaceModifierSimulation.prepare(current(), stack, work, pipeline = pipeline, isolateFailures = true)
+        }
+        val candidate = current()
+        return Plan(candidate) {
+            val finalModel = build("final preview", candidate)
+            work.checkpoint()
+            if (rawConfig == null) finalModel.runtimeBundle.materialize()
+            work.checkpoint()
+            finalModel
+        }
     }
+
+    internal fun freshSource(config: PipelineConfig): Boolean =
+        config.rigEdits.copy(modifierStack = null) == RigEditOverlay.Empty &&
+            config.meshOverrides.isEmpty() && config.parentOverrides.isEmpty() &&
+            !config.deferRig && config.rigPendingLayerIds.isEmpty()
 }

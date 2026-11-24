@@ -1,5 +1,7 @@
 package io.github.psd2live.project
 
+import io.github.psd2live.core.modifier.ModifierPluginReference
+import io.github.psd2live.core.modifier.RigModifierStack
 import kotlinx.serialization.json.*
 import java.nio.file.Files
 import java.nio.file.Path
@@ -61,6 +63,7 @@ internal object ProjectFormatV2 {
     const val NODE_SCHEMA_MODIFIERS = 6
     const val NODE_SCHEMA_MOTION_FILES = 6
     const val NODE_SCHEMA_MOTION_RANGES = 7
+    const val NODE_SCHEMA_MOTION_SOURCES = 8
 	/** Schema of a revision index whose journal names no payload node. */
 	const val REVISION_SCHEMA = 1
 	/** Schema of a revision index whose journal names payload nodes (listed under `payloads`). */
@@ -103,7 +106,7 @@ internal object ProjectFormatV2 {
 	private val layoutV1Keys = setOf("layerTags", "layerMaterials", "generation")
 	private val materialV1Keys = setOf("id", "name", "folderId", "kind", "rasterWidth", "rasterHeight", "rgbaBlob", "placement", "svg", "tags", "origin", "opacity", "visible")
 	private val materialFolderV1Keys = setOf("id", "name", "parentId", "tags")
-	private val clipKeys = listOf("motions", "motionPresets", "expressions", "pose")
+	private val clipKeys = listOf("motions", "motionSources", "motionPresets", "expressions", "pose")
 	private const val JOURNAL = "authoringJournal"
 	private const val SIMULATIONS = "simulations"
 	private const val OVERRIDE = "generated_override"
@@ -165,7 +168,7 @@ internal object ProjectFormatV2 {
 	}
 
 	/** Rebuilds the working-store layout under [root]/workspace/[projectId] from an extracted v2 archive. */
-	fun unpack(root: Path, projectId: String) {
+	fun unpack(root: Path, projectId: String): Set<ModifierPluginReference> {
 		require(projectId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]*"))) { "Invalid project ID" }
 		val history = root.resolve("history")
 		require(Files.isRegularFile(history.resolve("HEAD.json"))) { "Project has no history" }
@@ -178,10 +181,17 @@ internal object ProjectFormatV2 {
 		val written = HashSet<String>()
 		val adopted = LinkedHashMap<String, Pair<JsonObject, Collection<String>>>()
 		val present = HashSet<String>()
+		val scannedRigs = HashSet<JsonElement>()
+		val pluginReferences = LinkedHashSet<ModifierPluginReference>()
 		if (Files.isDirectory(revisions)) Files.list(revisions).use { paths -> paths.sorted().toList() }.forEach { file ->
 			val index = json.parseToJsonElement(Files.readString(file)).jsonObject
 			// Revisions name mostly the same rig objects: each is looked for once.
 			val snapshot = join(root, index, cache) { hash -> hash in present || Files.isRegularFile(root.resolve(RIG_OBJECTS).resolve("$hash.bin")).also { if (it) present.add(hash) } }
+			index.getValue("nodes").jsonObject["rig"]?.takeIf(scannedRigs::add)?.let {
+				((snapshot["rigEdits"] as? JsonObject)?.get("modifierStack") as? JsonObject)?.let { stack ->
+					pluginReferences.addAll(RigModifierStack.pluginReferences(stack))
+				}
+			}
 			val key = file.fileName.toString().removeSuffix(".json")
 			if (key.matches(HASH) && isCurrent(index, snapshot)) adopted[key] = index to WorkspaceStore.rasterFiles(snapshot)
 			// The working store reads an adopted revision from the mirror when it is first used.
@@ -199,6 +209,7 @@ internal object ProjectFormatV2 {
 		// The working store reads these revisions from their nodes, and the next save links them.
 		ArchiveMirror(store.resolve(ArchiveMirror.FOLDER)).adopt(root, adopted)
 		deleteTree(history); deleteTree(root.resolve("document")); deleteTree(root.resolve("auxiliary"))
+		return pluginReferences
 	}
 
 	/**
@@ -340,6 +351,7 @@ internal object ProjectFormatV2 {
 
 	/** The schema of a clips node holding [value]: [NODE_SCHEMA_SIDECARS] with expressions, a pose or motion events. */
 	internal fun clipsSchema(value: JsonObject): Int {
+        if ((value["motionSources"] as? JsonObject)?.isNotEmpty() == true) return NODE_SCHEMA_MOTION_SOURCES
         if ((value["motions"] as? JsonArray).orEmpty().any { (it as? JsonObject)?.containsKey("captured_ranges") == true }) return NODE_SCHEMA_MOTION_RANGES
         if ((value["motions"] as? JsonArray).orEmpty().any { (it as? JsonObject)?.containsKey("file") == true }) return NODE_SCHEMA_MOTION_FILES
 		val events = (value["motions"] as? JsonArray).orEmpty().any { (it as? JsonObject)?.containsKey("events") == true }
@@ -370,7 +382,7 @@ internal object ProjectFormatV2 {
 		}
 		fun load(folder: String, kind: String, hash: String): JsonObject {
 			val value = cache.getOrPut("$folder/$hash") { read(root, folder, hash) }
-			val newest = if (kind == "rig") NODE_SCHEMA_MODIFIERS else if (kind == "settings") NODE_SCHEMA_EYE_PARTS else if (kind == "clips") NODE_SCHEMA_MOTION_RANGES else NODE_SCHEMA_LAYOUT
+			val newest = if (kind == "rig") NODE_SCHEMA_MODIFIERS else if (kind == "settings") NODE_SCHEMA_EYE_PARTS else if (kind == "clips") NODE_SCHEMA_MOTION_SOURCES else NODE_SCHEMA_LAYOUT
 			require(value["schema"]?.jsonPrimitive?.intOrNull in NODE_SCHEMA..newest && value["kind"]?.jsonPrimitive?.contentOrNull == kind) {
 				"Unsupported document node: $kind $hash"
 			}

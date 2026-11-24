@@ -3,6 +3,7 @@ package io.github.psd2live.application
 import io.github.psd2live.core.PipelineConfig
 import io.github.psd2live.project.WorkspaceSettingsCodec
 import kotlin.test.Test
+import kotlin.test.assertEquals
 
 /** 设置查询必须接受真实编码结果，避免新增配置字段被响应校验拒绝。 */
 class WorkspaceSettingsResultTypesTest {
@@ -11,5 +12,14 @@ class WorkspaceSettingsResultTypesTest {
         val config = PipelineConfig(drawOrderStep = 10)
         val settings = WorkspaceSettingsCodec.encode(config)
         validateOperationSchema(settings, WorkspaceSettingsResultTypes.settings, "result.settings")
+    }
+
+    @Test
+    fun settingsInspectionAcceptsBothSavedMeshGenerationVersions() {
+        for (fullCoverage in listOf(false, true)) {
+            val settings = WorkspaceSettingsCodec.encode(PipelineConfig(meshAlphaCoverage = fullCoverage))
+            validateOperationSchema(settings, WorkspaceSettingsResultTypes.settings, "settings")
+            assertEquals(fullCoverage, WorkspaceSettingsCodec.decode(settings).meshAlphaCoverage, "the saved setting reads back")
+        }
     }
 }

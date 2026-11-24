@@ -36,10 +36,10 @@ object RigModules {
 	private val P = io.github.psd2live.core.RigTuning.Unit.PERCENT
 
 	/**
-	 * The eyes fitted from their drawn outline ([io.github.psd2live.core.fit.EyeRig]): the lids close over a pseudo-3D
+	 * The eyes fitted from their drawn outline ([io.github.psd2live.algorithms.binding.EyeRig]): the lids close over a pseudo-3D
 	 * eyeball, keeping their arc, the white, lashes and lid skin each following them their own way.
 	 */
-	val EYE_FITTED = RigBase("eye/fitted", version = 2, knobs = listOf(
+	val EYE_FITTED = RigBase("eye/fitted", knobs = listOf(
 		RecipeKnob("lowerShare", P, 0f..50f, 5f),
 		RecipeKnob("roundness", P, 40f..160f, 100f),
 		RecipeKnob("lashSquash", P, 20f..100f, 60f, advanced = true),
@@ -115,7 +115,7 @@ object RigModules {
 		knobs = listOf(RecipeKnob("dip", P, 0f..200f, 100f)))
 
 	/**
-	 * The mouth fitted from its drawn open outline ([io.github.psd2live.core.fit.MouthRig]): it opens in stages, the
+	 * The mouth fitted from its drawn open outline ([io.github.psd2live.algorithms.binding.MouthRig]): it opens in stages, the
 	 * lower lip first into a crescent, then an oval, then the drawing, and its form runs from a pout (closed a frown, open
 	 * a round "o") to a smile (corners up, open a wide D), with keys between the ends.
 	 */
@@ -264,7 +264,7 @@ object RigModules {
 
 	val areas: List<RigArea> = listOf(
 		RigArea("face", listOf(legacy("face")), listOf(FACE_DEPTH_TURN, FACE_SKIN_CLIP, FACE_NECK)),
-		RigArea("eye", listOf(legacy("eye"), EYE_FITTED), listOf(EYE_SEE_THROUGH, EYE_SMILE, EYE_WIDE, EYE_GAZE_LID, EYE_EMOTION, EYE_LID_FADE,
+		RigArea("eye", listOf(legacy("eye"), EYE_FITTED), listOf(EYE_SEE_THROUGH, EYE_SMILE, EYE_WIDE, EYE_EMOTION, EYE_GAZE_LID, EYE_LID_FADE,
 			EYE_HIGHLIGHT, EYE_JELLY, EYE_AFTERSHOCK, EYE_SQUASH)),
 		RigArea("brow", listOf(legacy("brow"), BROW_FITTED), listOf(BROW_SEE_THROUGH, BROW_SHAPE, BROW_LID, BROW_BLINK, BROW_SPRING)),
 		RigArea("mouth", listOf(legacy("mouth"), MOUTH_FITTED), listOf(MOUTH_OUTLINE, MOUTH_VOWEL, MOUTH_CAPTURE, MOUTH_TONGUE, MOUTH_JAW, MOUTH_CHEEK_LID, MOUTH_DEPTH, MOUTH_SPRING)),

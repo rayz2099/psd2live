@@ -17,7 +17,7 @@ internal object WorkspaceModelLoader {
             WorkspacePreviewBuilder().build(opened.history.head().snapshot)
         }
         path.fileName.toString().endsWith(".cmo3", true) -> loadCmo3(path)
-        path.fileName.toString().endsWith(".psd", true) -> PSD2LivePipeline().buildPreview(path)
+        path.fileName.toString().endsWith(".psd", true) -> PSD2LivePipeline().let { it.buildSourceExport(it.readPsd(path)) }
         else -> throw IllegalArgumentException("Export input must be a .psd2live project, .cmo3 model, or .psd file: $path")
     }
 

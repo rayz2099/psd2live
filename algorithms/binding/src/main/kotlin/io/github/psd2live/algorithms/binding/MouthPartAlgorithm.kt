@@ -1,0 +1,161 @@
+package io.github.psd2live.algorithms.binding
+
+import io.github.psd2live.core.modifier.ModifierPartConfig
+import io.github.psd2live.core.modifier.ModifierAlgorithmStages
+import io.github.psd2live.core.modifier.ChangingModifierAlgorithmPlugin
+import io.github.psd2live.core.modifier.ModifierAlgorithmContext
+import io.github.psd2live.core.modifier.ModifierAlgorithmPlugin
+import io.github.psd2live.core.modifier.ModifierEvaluationInput
+import io.github.psd2live.core.modifier.ModifierModelChanges
+import io.github.psd2live.core.modifier.ModifierRasterOutput
+import io.github.psd2live.core.modifier.ModifierUpstreamCapability
+import io.github.psd2live.core.modifier.ReadingModifierAlgorithmPlugin
+import io.github.psd2live.core.modifier.RigModifierInstance
+import io.github.psd2live.format.model.RigIR
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+
+/**
+ * Unified mouth part plugin (`mode: fitted | legacy`) combining base mouth fitting/binding and
+ * optional mouth sub-features (`outline`, `vowel`, `capture`, `tongue`, `jaw`, `cheekLid`,
+ * `depth`, `spring`) in one single pass.
+ */
+class MouthPartAlgorithm : ChangingModifierAlgorithmPlugin {
+    override fun changes(
+        input: RigIR,
+        instance: RigModifierInstance,
+        context: ModifierAlgorithmContext,
+        checkpoint: () -> Unit,
+    ): ModifierModelChanges {
+        val mode = (context.values["mode"]?.jsonPrimitive?.content
+            ?: instance.config["mode"]?.jsonPrimitive?.content
+            ?: "fitted")
+        require(mode == "fitted" || mode == "legacy") { "Unsupported mouth mode: $mode" }
+
+        val scaffold = instance.config.getValue("scaffold").jsonPrimitive.content
+        val baseType = if (mode == "fitted") "mouth/fitted" else MouthLegacyAlgorithm.TYPE
+        val baseVersion = if (mode == "fitted") 2 else MouthLegacyAlgorithm.VERSION
+        val baseConfig = buildJsonObject {
+            put("scaffold", scaffold)
+            instance.config["tuning"]?.let { put("tuning", it) }
+            instance.config["values"]?.let { put("values", it) }
+        }
+        val baseInstance = RigModifierInstance(
+            id = instance.id,
+            type = baseType,
+            version = baseVersion,
+            targets = instance.targets,
+            config = baseConfig,
+            outputAliases = instance.outputAliases,
+            plugin = instance.plugin,
+        )
+        val baseValues = context.values["base_context"]?.jsonObject ?: context.values
+        val upstream = context.upstream.toMutableList()
+        val baseContext = ModifierAlgorithmContext(baseValues, context.resources.filterKeys { !it.startsWith("sub:") }, upstream)
+
+        var current = ModifierAlgorithmStages.stage("part mouth base: $baseType") {
+            if (mode == "fitted") {
+                MouthFittedSourceAlgorithm().changes(input, baseInstance, baseContext, checkpoint)
+            } else {
+                MouthLegacyAlgorithm().changes(input, baseInstance, baseContext, checkpoint)
+            }
+        }.apply(input, checkpoint)
+
+        upstream += ModifierUpstreamCapability(
+            capability = baseType,
+            type = baseType,
+            version = baseVersion,
+            targets = baseInstance.targets,
+            instanceId = baseInstance.id,
+            config = baseConfig,
+        )
+
+        val subContexts = context.values["sub_contexts"]?.jsonObject
+        val subConfigs = context.values["sub_configs"]?.jsonObject
+        val rasters = mutableListOf<ModifierRasterOutput>()
+        val rasterIds = hashSetOf<String>()
+
+        for (feature in subFeatures) {
+            if (instance.config[feature.configFlag]?.jsonPrimitive?.booleanOrNull != true) continue
+            val subContextObj = requireNotNull(subContexts?.get(feature.type)?.jsonObject) { "${instance.id}: missing enabled sub-context ${feature.type}" }
+            val subInstance = ModifierPartConfig.child(instance.copy(type = TYPE), feature.type, feature.version, upstream, subConfigs?.get(feature.type)?.jsonObject)
+            val subTargets = subInstance.targets
+            val subConfig = subInstance.config
+            val subPrefix = "sub:${feature.type}:"
+            val subResources = context.resources
+                .filterKeys { it.startsWith(subPrefix) }
+                .mapKeys { it.key.removePrefix(subPrefix) }
+            val subCtx = ModifierAlgorithmContext(subContextObj, subResources, upstream)
+            val stepChanges = ModifierAlgorithmStages.stage("part mouth sub: ${feature.type}") {
+                when (val plugin = feature.plugin) {
+                    is ReadingModifierAlgorithmPlugin -> plugin.changes(ModifierEvaluationInput(current, subCtx), subInstance.copy(version = feature.version), checkpoint)
+                    is ChangingModifierAlgorithmPlugin -> plugin.changes(current, subInstance, subCtx, checkpoint)
+                    else -> error("Unsupported mouth sub-feature plugin: ${feature.type}")
+                }
+            }
+            for (added in stepChanges.rasters) {
+                rasters += added
+                rasterIds += added.mesh.id
+            }
+            val updatedById = stepChanges.meshes.updated.filter { it.after.id in rasterIds }.associate { it.after.id to it.after }
+            if (updatedById.isNotEmpty()) {
+                for (i in rasters.indices) {
+                    updatedById[rasters[i].mesh.id]?.let { updatedMesh ->
+                        val prev = rasters[i]
+                        rasters[i] = ModifierRasterOutput(prev.owner, updatedMesh, prev.layer, prev.pixels, prev.paths, prev.uvSpace)
+                    }
+                }
+            }
+            current = stepChanges.copy(rasters = emptyList()).apply(current, checkpoint)
+            if (stepChanges.rasters.isNotEmpty()) {
+                current = current.copy(meshes = current.meshes + stepChanges.rasters.map { it.mesh })
+            }
+            upstream += ModifierUpstreamCapability(
+                capability = feature.type,
+                type = feature.type,
+                version = feature.version,
+                targets = subTargets,
+                instanceId = subInstance.id,
+                config = subConfig,
+            )
+        }
+
+        if (rasterIds.isNotEmpty()) {
+            current = current.copy(meshes = current.meshes.filterNot { it.id in rasterIds })
+        }
+        val resolvedRasters = rasters.map { raster ->
+            val finalOwner = current.meshes.firstOrNull { it.id == raster.owner.id }
+            if (finalOwner != null && finalOwner != raster.owner) {
+                ModifierRasterOutput(finalOwner, raster.mesh, raster.layer, raster.pixels, raster.paths, raster.uvSpace)
+            } else raster
+        }
+        return PartChangeComposer.between(input, current, checkpoint).copy(rasters = resolvedRasters)
+    }
+
+    private data class SubFeature(
+        val configFlag: String,
+        val type: String,
+        val version: Int,
+        val plugin: ModifierAlgorithmPlugin,
+    )
+
+    companion object {
+        const val TYPE = "mouth"
+        const val ENTRYPOINT = "part"
+        const val VERSION = 1
+
+        private val subFeatures: List<SubFeature> = listOf(
+            SubFeature("outline", "mouth.outline", 1, MouthOutlineAlgorithm()),
+            SubFeature("vowel", MouthVowelAlgorithm.TYPE, MouthVowelAlgorithm.VERSION, MouthVowelAlgorithm()),
+            SubFeature("capture", MouthCaptureAlgorithm.TYPE, MouthCaptureAlgorithm.VERSION, MouthCaptureAlgorithm()),
+            SubFeature("tongue", MouthTongueAlgorithm.TYPE, MouthTongueAlgorithm.VERSION, MouthTongueAlgorithm()),
+            SubFeature("jaw", MouthJawAlgorithm.TYPE, MouthJawAlgorithm.VERSION, MouthJawAlgorithm()),
+            SubFeature("cheekLid", MouthCheekLidAlgorithm.TYPE, MouthCheekLidAlgorithm.VERSION, MouthCheekLidAlgorithm()),
+            SubFeature("depth", MouthDepthAlgorithm.TYPE, MouthDepthAlgorithm.VERSION, MouthDepthAlgorithm()),
+            SubFeature("spring", MouthSpringAlgorithm.TYPE, MouthSpringAlgorithm.VERSION, MouthSpringAlgorithm()),
+        )
+    }
+}

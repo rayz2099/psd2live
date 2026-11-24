@@ -31,22 +31,47 @@ import org.umamo.edit.withDrawablesDeleted
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 import io.github.psd2live.core.legacy.RigGenerationMigration
 
 class PSD2LivePipeline {
 	internal var deferRuntimeBundles = false
+	internal var rawSourceRotations = false
 	internal val modifierCache = io.github.psd2live.core.modifier.RigModifierEvaluationCache()
-	internal val meshCache = PreviewMeshCache()
+    internal var modifierBase: io.github.psd2live.core.modifier.ModifierBaseSnapshot? = null
+    internal var modifierBuildOwner = ModifierBuildCacheOwner()
+        set(value) { field = value; value.attach(this) }
+    init { modifierBuildOwner.attach(this) }
+    internal val meshCache: PreviewMeshCache get() = modifierBuildOwner.meshCache()
+    internal fun releaseModifierInputs(owner: ModifierBuildCacheOwner) {
+        if (modifierBuildOwner !== owner) return
+        modifierCache.snapshot = null
+        modifierBase = null
+    }
+    /** Carry content-keyed intermediates between isolated candidates, never a mutable document or worker. */
+    internal fun reuseModifierInputs(current: RigPreviewModel?, shareOwner: Boolean = true) {
+        if (modifierBuildOwner.isClosed) modifierBuildOwner = ModifierBuildCacheOwner()
+        current ?: return
+        if (shareOwner) current.modifierBuildOwner?.takeUnless { it.isClosed }?.let { modifierBuildOwner = it }
+        if (modifierBuildOwner.isClosed) modifierBuildOwner = ModifierBuildCacheOwner()
+        current.modifierEvaluation?.let { modifierCache.snapshot = it }
+        current.modifierBaseSnapshot?.let { modifierBase = it }
+    }
 	private val generatedGeometry = GeneratedGeometryCache()
-	fun inspect(psd: Path, config: PipelineConfig = PipelineConfig()): PipelineAnalysis {
+	fun inspect(psd: Path, config: PipelineConfig = PipelineConfig()): PipelineAnalysis =
+		RigGenerationSource.analyze(readPsd(psd), config)
+
+	internal fun readPsd(psd: Path): SourceArt {
 		require(Files.isRegularFile(psd)) { tr("error.psdMissing", psd) }
 		val bytes = Files.readAllBytes(psd)
 		require(PsdReader.matches(bytes)) { tr("error.invalidPsd", psd) }
-		return RigGenerationSource.analyze(PsdReader.read(bytes), config)
+		return PsdReader.read(bytes)
 	}
 
-	fun buildPreview(psd: Path, config: PipelineConfig = PipelineConfig()): RigPreviewModel =
-		buildPreview(inspect(psd, config), config)
+	fun buildPreview(psd: Path, config: PipelineConfig = PipelineConfig(),
+	                 progress: ProgressListener = ProgressListener { _, _ -> }): RigPreviewModel =
+		buildPreview(readPsd(psd), config, progress)
 
 	/**
 	 * The preview of [source] under [config]. [previousAtlas] - the atlas of the model a commit starts from - only
@@ -57,8 +82,26 @@ class PSD2LivePipeline {
 		config: PipelineConfig = PipelineConfig(),
 		progress: ProgressListener = ProgressListener { _, _ -> },
 		previousAtlas: PackedAtlas? = null,
-	): RigPreviewModel = buildPreview(if (config.rigEdits.importedCmo3 != null) Cmo3ModelImport.analysis(source, config)
-		else RigBuildProfile.stage("pipeline: analyze") { RigGenerationSource.analyze(source, config) }, config, progress, previousAtlas)
+	): RigPreviewModel {
+        if (modifierBuildOwner.isClosed) modifierBuildOwner = ModifierBuildCacheOwner()
+		if (config.rigEdits.modifierStack != null) {
+			return try {
+                io.github.psd2live.core.modifier.RigModifierPipeline.build(this, source, config, progress, previousAtlas).also {
+                    if (modifierBuildOwner.isClosed) {
+                        releaseModifierInputs(modifierBuildOwner)
+                        throw java.util.concurrent.CancellationException("Workspace build owner was closed")
+                    }
+                }
+            }
+            catch (failure: Throwable) {
+                if (!modifierBuildOwner.published) runCatching { modifierBuildOwner.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
+		}
+		val analysis = if (config.rigEdits.importedCmo3 != null) Cmo3ModelImport.analysis(source, config)
+			else RigBuildProfile.stage("pipeline: analyze") { RigGenerationSource.analyze(source, config) }
+		return buildPreviewInputs(analysis, config, progress, previousAtlas, ordinaryMaterials = false)
+	}
 
 	fun buildPreview(
 		analysis: PipelineAnalysis,
@@ -74,10 +117,40 @@ class PSD2LivePipeline {
         return buildPreviewInputs(analysis, config, progress, previousAtlas, ordinaryMaterials = true)
     }
 
+    /** The standalone mesh export has historical static metadata and an empty modifier stack. */
+    internal fun buildRawMeshExport(source: SourceArt, config: PipelineConfig,
+                                    progress: ProgressListener = ProgressListener { _, _ -> }): RigPreviewModel {
+        require(config.meshOnly && config.rigEdits == RigEditOverlay.Empty)
+        val material = buildOrdinaryPreview(source, config.copy(generateDeformers = false), progress, previousAtlas = null)
+        val rig = RigBuilder.meshExportLayout(material.rig, material.analysis, config, meshCache)
+        val overlay = config.rigEdits.copy(modifierStack = io.github.psd2live.core.modifier.RigModifierStack().toJson())
+        val explicit = config.copy(rigEdits = overlay)
+        val built = rig.copy(modifierOutput = RigIrCompiler.compileAuthored(material.analysis, material.atlas, rig, explicit))
+        return material.copy(rig = built, config = explicit, runtimeBundle = previewBundle(material.analysis, material.atlas, built, explicit))
+    }
+
+    /** Assemble standalone mesh motion directly from source when no structural deformers are requested. */
+    internal fun buildRawWithoutDeformers(source: SourceArt, config: PipelineConfig,
+                                          progress: ProgressListener): RigPreviewModel {
+        require(!config.meshOnly && !config.generateDeformers && standaloneSource(config))
+        val analysis = RigGenerationSource.analyze(source, config)
+        val inputs = generationInputs(analysis, config, progress)
+        val base = RigBuilder.buildSourceWithoutDeformers(inputs.analyses.geometry, inputs.atlas, inputs.generationConfig, meshCache)
+        val finished = base.withDrawOrderOverrides(config.drawOrderOverrides).withSeeThrough(SeeThroughLayers.Settings.of(config))
+        val (atlas, rig) = RigLayerDeletion.compact(inputs.atlas, inputs.visible, inputs.visible, finished, config)
+        return RigPreviewModel(inputs.visible, atlas, rig, config,
+            previewBundle(inputs.visible, atlas, rig, config), PreviewRigSources.of(base, inputs.bindingKey),
+            generationAtlas = inputs.atlas.takeIf { it !== atlas })
+    }
+
+    private fun standaloneSource(config: PipelineConfig): Boolean =
+        config.rigEdits == RigEditOverlay.Empty && config.generationSource == null && config.meshSource == null &&
+            !config.deferRig && config.rigPendingLayerIds.isEmpty()
+
     private fun buildPreviewInputs(analysis: PipelineAnalysis, config: PipelineConfig, progress: ProgressListener,
                                    previousAtlas: PackedAtlas?, ordinaryMaterials: Boolean): RigPreviewModel {
         if (config.rigEdits.modifierStack != null) {
-            return io.github.psd2live.core.modifier.RigModifierPipeline.build(this, analysis, config, progress, previousAtlas)
+            return io.github.psd2live.core.modifier.RigModifierPipeline.build(this, analysis.source, config, progress, previousAtlas)
         }
         if (RigLayerDeletion.deferred(config)) {
             val generation = RigLayerDeletion.generationConfig(config)
@@ -93,8 +166,11 @@ class PSD2LivePipeline {
             return RigPreviewModel(importedAnalysis, atlas, rig, config, bundle, PreviewRigSources.of(baseRig))
         }
         val inputs = generationInputs(analysis, config, progress, previousAtlas)
-        val (effectiveAnalysis, fullAtlas, generated) = generatedBase(inputs, config, progress)
-        val baseRig = if (ordinaryMaterials) io.github.psd2live.core.modifier.RigOrdinaryMaterials.of(generated, effectiveAnalysis) else generated
+        val (effectiveAnalysis, fullAtlas, generated) = if (ordinaryMaterials && config.rigEdits == RigEditOverlay.Empty)
+            generateWithAtlasEncoding(inputs, config, progress)
+        else generatedBase(inputs, config, progress, materialsOnly = ordinaryMaterials)
+        val baseRig = if (ordinaryMaterials)
+            io.github.psd2live.core.modifier.RigOrdinaryMaterials.of(generated, effectiveAnalysis, config.layerVisibility) else generated
 		// The base packs superseded layers (the originals of a split) too; once no mesh samples them the model
 		// packs only the layers it shows, as exports do.
 		val (atlas, rig) = RigLayerDeletion.compact(fullAtlas, effectiveAnalysis, effectiveAnalysis,
@@ -181,10 +257,16 @@ class PSD2LivePipeline {
 		val base = RigBuildProfile.stage("pipeline: analysis prepare") { RigGenerationSource.prepare(input, baselineConfig, config) }
 		val generationConfig = baselineConfig.copy(parentOverrides = generatedParentOverrides(config))
 		val assets = io.github.psd2live.core.modifier.RigModifierRasterAssets.restored(config)
-		val analyses = if (assets.isEmpty()) base else base.copy(textures = base.textures.copy(layers = base.textures.layers + assets))
+		val arrangedAssets = io.github.psd2live.core.modifier.RigModifierRasterAssets.arranged(assets, config)
+		val analyses = if (assets.isEmpty()) base else base.copy(textures = base.textures.copy(layers =
+			if (arrangedAssets) io.github.psd2live.core.modifier.RigModifierRasterAssets.sourceOrder(base.textures.layers, assets)
+			else base.textures.layers + assets))
 		val atlas = RigBuildProfile.stage("pipeline: atlas layout") {
-			val packed = AtlasLayout.pack(base.textures.layers, config, progress, previousAtlas)
-			io.github.psd2live.core.modifier.RigModifierRasterAssets.append(packed, assets, config)
+			if (arrangedAssets) AtlasLayout.pack(analyses.textures.layers, config, progress, previousAtlas)
+			else {
+				val packed = AtlasLayout.pack(base.textures.layers, config, progress, previousAtlas)
+				io.github.psd2live.core.modifier.RigModifierRasterAssets.append(packed, assets, config)
+			}
 		}
 		val visible = ArtPrimitiveJournal.visibleAnalysis(analyses.textures, config.rigEdits)
 		return GenerationInputs(baselineConfig, analyses, generationConfig, atlas, visible)
@@ -207,14 +289,41 @@ class PSD2LivePipeline {
 	                          previousAtlas: PackedAtlas? = null): GeneratedBase =
 		generatedBase(generationInputs(input, config, progress, previousAtlas), config, progress)
 
-	private fun generatedBase(inputs: GenerationInputs, config: PipelineConfig, progress: ProgressListener): GeneratedBase {
+	private fun generateWithAtlasEncoding(inputs: GenerationInputs, config: PipelineConfig,
+	                                      progress: ProgressListener): GeneratedBase {
+		val pages = inputs.atlas.pages.filterNot { it.hasCanonicalPng }
+		if (pages.isEmpty()) return generatedBase(inputs, config, progress, materialsOnly = true)
+		// A fresh ordinary source uses this same atlas for the modifier IR. Mesh generation only needs its layout.
+		val encoding = FutureTask {
+			RigBuildProfile.stage("modifier author: encode atlas pages") {
+				pages.parallelStream().forEach { it.png }
+			}
+		}
+		Thread.ofVirtual().name("psd2live-author-atlas").start(encoding)
+		try {
+			val base = generatedBase(inputs, config, progress, materialsOnly = true)
+			RigBuildProfile.stage("modifier author: wait for atlas pages") {
+				try { encoding.get() }
+				catch (failure: ExecutionException) { throw failure.cause ?: failure }
+			}
+			return base
+		} finally {
+			encoding.cancel(true)
+		}
+	}
+
+	private fun generatedBase(inputs: GenerationInputs, config: PipelineConfig, progress: ProgressListener,
+	                          materialsOnly: Boolean = false): GeneratedBase {
 		val baselineConfig = inputs.baselineConfig
 		val analyses = inputs.analyses
 		val generationConfig = inputs.generationConfig
 		val atlas = inputs.atlas
 		val visible = inputs.visible
 		if (config.generationSource == null) {
-			val generated = withoutCreatedMeshes(RigBuilder.build(analyses.geometry, atlas, generationConfig, meshCache), config)
+			val base = if (materialsOnly && RigBuilder.canBuildMaterials(generationConfig))
+				RigBuilder.buildMaterials(analyses.geometry, atlas, generationConfig, meshCache)
+			else RigBuilder.build(analyses.geometry, atlas, generationConfig, meshCache)
+			val generated = withoutCreatedMeshes(base, config)
 			if (analyses.geometry === analyses.textures) return GeneratedBase(visible, atlas, generated)
 			// Creation records replace their geometry with transparent stand-ins. Their texture inventory must
 			// still describe the current rasters, or replay binds the new meshes to a transparent 1 x 1 tile.
@@ -491,7 +600,8 @@ class PSD2LivePipeline {
 		before.meshMaxEdgeDistance != config.meshMaxEdgeDistance || before.meshInteriorDensity != config.meshInteriorDensity ||
 		before.meshFillAlgorithm != config.meshFillAlgorithm || before.meshSuppressBoundaryDiagonals != config.meshSuppressBoundaryDiagonals ||
 		before.meshFillParameters != config.meshFillParameters || before.meshUnits != config.meshUnits ||
-		before.meshTrace != config.meshTrace || before.meshWrap != config.meshWrap || before.alphaThreshold != config.alphaThreshold
+		before.meshTrace != config.meshTrace || before.meshWrap != config.meshWrap ||
+		before.meshAlphaCoverage != config.meshAlphaCoverage || before.alphaThreshold != config.alphaThreshold
 
 	private fun meshControlsChanged(before: PipelineConfig, config: PipelineConfig) =
 		globalMeshControlsChanged(before, config) || before.meshOverrides != config.meshOverrides
@@ -571,7 +681,7 @@ class PSD2LivePipeline {
 
 	/**
 	 * Whether [a] and [b] are the same art for generation and texturing: equal, or different only in where layers were
-	 * moved as a whole ([io.github.psd2live.project.LayerTransform]), which neither generation nor the atlas reads.
+	 * moved as a whole ([io.github.psd2live.document.LayerTransform]), which neither generation nor the atlas reads.
 	 * Layers in [ignoredOpacity] - reference layers, which generators leave out - may also differ in opacity alone.
 	 */
 	fun sameArt(a: SourceArt, b: SourceArt, ignoredOpacity: Set<String> = emptySet()): Boolean {
@@ -579,7 +689,7 @@ class PSD2LivePipeline {
 		if (a.widthPx != b.widthPx || a.heightPx != b.heightPx || a.groups != b.groups || a.layers.size != b.layers.size) return false
 		return a.layers.indices.all { i ->
 			val x = a.layers[i]; val y = b.layers[i]
-			x === y || x == y || (x is io.github.psd2live.project.WorkspaceSourceLayer && y is io.github.psd2live.project.WorkspaceSourceLayer &&
+			x === y || x == y || (x is io.github.psd2live.document.WorkspaceSourceLayer && y is io.github.psd2live.document.WorkspaceSourceLayer &&
 				(x.copy(layerTransform = null) == y.copy(layerTransform = null) ||
 					(x.id.raw in ignoredOpacity && x.copy(layerTransform = null, opacity = y.opacity) == y.copy(layerTransform = null))))
 		}
@@ -600,31 +710,6 @@ class PSD2LivePipeline {
 		return current.config.copy(rigEdits = config.rigEdits) == config
 	}
 
-	fun run(
-		psd: Path,
-		outputDirectory: Path,
-		config: PipelineConfig = PipelineConfig(),
-		progress: ProgressListener = ProgressListener { _, _ -> },
-	): PipelineResult {
-		progress.update(tr("progress.readPsd"), 0.04)
-		val model = buildPreview(inspect(psd, config), config, building(progress))
-		return export(model, psd.fileName.toString(), outputDirectory, progress)
-	}
-
-	/** Export the current authoritative source, including Agent-created layers, without rereading the PSD. */
-	fun run(
-		source: SourceArt,
-		sourceName: String,
-		outputDirectory: Path,
-		config: PipelineConfig = PipelineConfig(),
-		progress: ProgressListener = ProgressListener { _, _ -> },
-	): PipelineResult {
-		progress.update(tr("progress.readPsd"), 0.04)
-		return export(buildPreview(source, config, building(progress)), sourceName, outputDirectory, progress)
-	}
-
-	/** The build's own progress, in the part of an export before the model is written. */
-	private fun building(progress: ProgressListener) = ProgressListener { stage, fraction -> progress.update(stage, 0.04 + fraction * 0.54) }
 
 	/**
 	 * Writes [model] - the rig the editor shows, as built - as the formats its config enables, each read back and
@@ -632,6 +717,7 @@ class PSD2LivePipeline {
 	 */
 	fun export(model: RigPreviewModel, sourceName: String, outputDirectory: Path,
 	           progress: ProgressListener = ProgressListener { _, _ -> }): PipelineResult {
+		model.config.rigEdits.modifierStack?.let { io.github.psd2live.core.modifier.ModifierPluginCatalog.requireAvailable(io.github.psd2live.core.modifier.RigModifierStack.fromJson(it)) }
 		val (analysis, atlas, rig, config) = model
 		val baseName = safeBaseName(sourceName.substringBeforeLast('.'))
 		val imported = config.rigEdits.importedCmo3 != null
@@ -644,8 +730,8 @@ class PSD2LivePipeline {
 		// Umamo's conversion preserves that mixed-space invariant exactly.
 		// Evaluating the mouth at MOUTH_OPEN=1.0f keeps the base mesh in its initial open state matching
 		// the authored PSD layer artwork and atlas UV coordinates, avoiding singular affine transforms in CMO3.
-		val cleaned = io.github.psd2live.core.interior.InteriorLifecycle.exportModel(rig.puppet, config.rigEdits,
-			PhysicsCatalog.active(analysis, config, rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }, rig.puppet))
+		val physics = PhysicsCatalog.active(model)
+		val cleaned = io.github.psd2live.core.interior.InteriorLifecycle.exportModel(rig.puppet, config.rigEdits, physics)
 		val idWarnings = RigIdCheck.checked(generatedLabel, cleaned)
 		val restPose = rig.modifierOutput?.restPose?.mapKeys { org.umamo.runtime.model.ParameterId(it.key) }
             ?: if (imported) emptyMap() else mapOf(StandardParameters.MOUTH_OPEN to 1.0f)
@@ -695,7 +781,7 @@ class PSD2LivePipeline {
 		progress.update(tr("progress.exportCmo3"), 0.91)
 
 		if (config.exportJson) {
-			val report = projectReport(baseName, analysis, rig.copy(puppet = cleaned), atlas, config, warnings)
+			val report = projectReport(baseName, analysis, rig.copy(puppet = cleaned), atlas, config, physics.map { it.id }, warnings)
 			Json.parseToJsonElement(report)
 			files += writeContained(outputRoot, "$baseName.psd2live.json", report.encodeToByteArray())
 		}
@@ -706,9 +792,9 @@ class PSD2LivePipeline {
 	/**
 	 * The moc3 runtime bundle of [rig]. [validate] reads the manifest and every sidecar back: files written for
 	 * the user always are, while the editor's preview bundles - the same compile, rebuilt on every edit and only
-	 * loaded by the preview - skip it unless [validatesPreviewBundles]. A [preview] bundle carries the pages'
-	 * strip-encoded PNGs ([AtlasPage.previewPng]), which re-encode only changed rows; files written for the user
-	 * carry the canonical encoding, and no pose3.
+	 * loaded by the preview - skip it unless [validatesPreviewBundles]. Legacy previews use strip-encoded PNGs
+	 * ([AtlasPage.previewPng]) to re-encode only changed rows. Modifier evaluation already needs canonical pages,
+	 * so its preview reuses those bytes. Written bundles also carry canonical pages.
 	 */
 	internal fun previewBundle(analysis: PipelineAnalysis, atlas: PackedAtlas, rig: BuiltRig, config: PipelineConfig,
 	                           defer: Boolean = deferRuntimeBundles): CubismRuntimeBundle {
@@ -725,7 +811,8 @@ class PSD2LivePipeline {
 		validate: Boolean = validatesPreviewBundles(),
 		preview: Boolean = true,
 	): Pair<CubismRuntimeBundle, org.umamo.interop.ExportReport> {
-		val compiled = RigIrCompiler.compile(analysis, if (preview) atlas.forPreview() else atlas, rig, config)
+		val textures = if (preview && rig.modifierOutput == null) atlas.forPreview() else atlas
+		val compiled = RigIrCompiler.compile(analysis, textures, rig, config)
 		// The Cubism SDK applies a pose3 as it loads, hiding every part of a group but the first; the editor shows and
 		// edits all of them, so only written bundles carry the pose.
 		val ir = if (preview) compiled.copy(advanced = compiled.advanced.copy(pose = null)) else compiled
@@ -815,6 +902,7 @@ class PSD2LivePipeline {
 		rig: BuiltRig,
 		atlas: PackedAtlas,
 		config: PipelineConfig,
+		physicsIds: List<String>,
 		warnings: List<String>,
 	): String {
 		fun quote(value: String): String = buildString {
@@ -832,7 +920,7 @@ class PSD2LivePipeline {
 		val layers = analysis.layers.joinToString(",\n") { layer ->
 			"    {\"source\":${quote(layer.source.name)},\"type\":${quote(layer.semantic.type.name.lowercase())},\"tag\":${quote(layer.semantic.tag.canonicalName)},\"side\":${quote(layer.semantic.side.name)},\"parameter\":${quote(layer.semantic.parameter)},\"switchId\":${layer.semantic.switchId},\"drawable\":${quote(rig.puppet.drawables.firstOrNull { it.name == layer.source.name }?.id?.raw ?: "")}}"
 		}
-		val physicsIds = PhysicsCatalog.active(analysis, config, rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }, rig.puppet).map { it.id }
+		val physicsEnabled = if (config.rigEdits.modifierStack == null) config.generatePhysics && !config.meshOnly else physicsIds.isNotEmpty()
 		val useFrontHair = PhysicsGenerator.FRONT_HAIR_ID in physicsIds
 		val useBackHair = PhysicsGenerator.BACK_HAIR_ID in physicsIds
 		val useEyeJelly = PhysicsGenerator.EYE_JELLY_ID in physicsIds
@@ -849,7 +937,7 @@ class PSD2LivePipeline {
 		  "config": {"atlasSize":${config.atlasSize},"meshSpacing":${config.meshSpacing},"headTurnStrength":${config.headTurnStrength},"bodyStrength":${config.bodyStrength},"meshOnly":${config.meshOnly},"generateDeformers":${config.generateDeformers},"exportMotions":${config.exportMotions}},
 		  "faceRig": {"algorithm":"perspective-parallelogram-nine-pose-v2","angleX":[-45,0,45],"angleY":[-30,0,30],"initialAngleZ":${rig.initialHeadAngleZ},"centerX":${rig.faceCenterX},"centerY":${rig.faceCenterY},"radiusX":${rig.faceRadiusX},"radiusY":${rig.faceRadiusY}},
 		  "deformerHierarchy": {"head":"DeformHeadContainer","face":"DeformFaceNinePose","frontHair":["DeformHairFrontFollow","DeformHairFrontPhysics"],"backHair":["DeformHairBackFollow","DeformHairBackPhysics"]},
-		  "physics": {"enabled":${config.generatePhysics && !config.meshOnly},"frontHair":$useFrontHair,"backHair":$useBackHair,"eyeJelly":$useEyeJelly,"groups":[${physicsIds.joinToString(",") { quote(it) }}]},
+		  "physics": {"enabled":$physicsEnabled,"frontHair":$useFrontHair,"backHair":$useBackHair,"eyeJelly":$useEyeJelly,"groups":[${physicsIds.joinToString(",") { quote(it) }}]},
 		  "summary": {"layers":${analysis.layers.size},"drawables":${rig.puppet.drawables.size},"deformers":${rig.puppet.deformers.size},"parameters":${rig.puppet.parameters.size},"atlasPages":${atlas.pages.size}},
 		  "layers": [
 		$layers

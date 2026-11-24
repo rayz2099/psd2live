@@ -1,12 +1,12 @@
 # 开发与命令行
 
-[文档目录](../../README.md) · [English](../../en/guide/DEVELOPMENT.md) · [日本語](../../ja/guide/DEVELOPMENT.md)
+[文档目录](../../README.md)
 
 本页面向从源码运行、使用命令行或参与开发的用户。发布包自带运行时，普通使用不需要本页内容。
 
 ## 环境
 
-- JDK 21，推荐 JetBrains Runtime（JBR）21：Windows 发布包用它，主窗口在它上面保留系统窗口框架（最大化、贴靠、拖边调整大小由系统处理），标题栏由程序绘制；其他 JDK 也能构建、测试和运行，主窗口改为无边框、整条标题栏由程序绘制。Windows 打包（`createDistributable`、`packageExe`）要求 JBR 21 SDK（带 jpackage），用其他 JDK 打包需加 `-Ppsd2live.allowNonJbr=true`。macOS 的 DMG（`packageDmg`）用运行 Gradle 的 JDK 构建，不需要 JBR，因为 Swift 外壳保留系统窗口框架。Gradle 使用仓库自带的 Wrapper，无需单独安装。
+- JDK 21，Windows 推荐 JetBrains Runtime（JBR）21：Windows 发布包用它，主窗口在它上面保留系统窗口框架（最大化、贴靠、拖边调整大小由系统处理），标题栏由程序绘制；其他 JDK 也能构建、测试和运行。Linux 的不透明窗口在所有 JDK 上都保留系统标题栏，透明窗口仍用程序标题栏；Windows 在其他 JDK 上使用无边框窗口。Windows 打包（`createDistributable`、`packageExe`）要求 JBR 21 SDK（带 jpackage），用其他 JDK 打包需加 `-Ppsd2live.allowNonJbr=true`。macOS 的 DMG（`packageDmg`）用运行 Gradle 的 JDK 构建，不需要 JBR，因为 Swift 外壳保留系统窗口框架。Gradle 使用仓库自带的 Wrapper，无需单独安装。
 - Windows 用 `.\gradlew.bat`，Linux / macOS 用 `./gradlew`。下文示例统一写作 `./gradlew`。
 - 官方 Cubism SDK 不是构建前提。源码构建默认使用内置渲染；原生预览见 [Cubism Native 预览](CUBISM_SDK_SETUP.md)。
 
@@ -62,7 +62,7 @@ Windows 也可以直接运行根目录的 `run-gui.bat`。不带参数启动 GUI
 
 ### 无界面 MCP 服务
 
-`./gradlew run --args="mcp [--port N] [--token T] [--store DIR] [--profile core|full]"` 不开窗口，只启动 MCP 端点，供智能体单独工作：工作区由应用层宿主承载，不创建 ViewModel 与 Compose 状态（见[无窗口宿主](../spec/HEADLESS_HOST.md)）；启动后打印 `endpoint`、`token`、`profile`、`store` 与 `capabilities`（`view_sample_motion=yes|no`，构建是否带 Cubism Core），直到进程结束。脚本用 `python mcp_proxy.py call <操作> [JSON] --edit` 或 Python 的 `mcp_proxy.Client` 调用，设 `PSD2LIVE_MCP_ENDPOINT` 与 `PSD2LIVE_MCP_TOKEN` 指向它。工作区存储默认在用户目录的 `psd2live-mcp` 下，与编辑器分开（不共用历史与实例锁）。`--token` 须为 32–256 个 URL 安全 Base64 字符，省略时随机生成。
+`./gradlew run --args="mcp [--port N] [--token T] [--store DIR] [--profile core|full]"` 不开窗口，只启动 MCP 端点，供智能体单独工作：工作区由应用层宿主承载，不创建 ViewModel 与 Compose 状态；启动后打印 `endpoint`、`token`、`profile`、`store` 与 `capabilities`（`view_sample_motion=yes|no`，构建是否带 Cubism Core），直到进程结束。脚本用 `python tools/mcp_proxy.py call <操作> [JSON] --edit` 或 Python 的 `mcp_proxy.Client` 调用，设 `PSD2LIVE_MCP_ENDPOINT` 与 `PSD2LIVE_MCP_TOKEN` 指向它。工作区存储默认在用户目录的 `psd2live-mcp` 下，与编辑器分开（不共用历史与实例锁）。`--token` 须为 32–256 个 URL 安全 Base64 字符，省略时随机生成。
 
 ## 导出到其他格式
 
@@ -81,21 +81,70 @@ Windows 也可以直接运行根目录的 `run-gui.bat`。不带参数启动 GUI
 ## 测试与打包
 
 ```bash
-./gradlew test                                   # 全部测试（CI 在 Ubuntu 与 Windows 上运行）
+./gradlew unitTest                               # 本地快速单元与契约测试（不含 scenario 与外部 worker/plugin 测试）
+./gradlew integrationTest                        # 场景与外部 worker/plugin 集成测试
+./gradlew test                                   # 各模块日常 JVM 回归
+./gradlew test pluginBuildTest                   # 完整 JVM 回归，含插件实际编译、热替换、撤销和重开
 ./gradlew test --tests "io.github.psd2live.scenario.CatalogContractsTest"   # 单个测试类
 ./gradlew createDistributable                    # 带运行时的应用目录
 ./gradlew packageDistributionForCurrentOS        # 当前平台的安装包
 ./gradlew packageDmg                             # 仅 macOS：带 Swift 外壳的 DMG
 ```
 
+Linux 应用目录使用清单 `Class-Path` JAR 保留依赖顺序，缩短原生启动器参数，避免
+[JDK-8380085](https://github.com/openjdk/jdk/commit/54c5e41cbaabcd21d7bbf8f5667b2e35cfe12dd7)
+在长类路径下于 JVM 启动前崩溃。更换 JDK 或打包配置后，运行以下检查；它使用临时用户设置，
+并检查包含空格、引号及非英文字符的迁移路径：
+
+```bash
+python3 packaging/linux/smoke-test.py build/compose/binaries/main/app/PSD2Live
+```
+
 - `packageDmg` 只在 macOS 上可用。它使用 `createDistributable` 打进包里的运行时，并把启动程序换成 `packaging/macos` 里的 Swift 外壳，因此 Dock 名称、文档类型和窗口按钮都是系统的。菜单出现在屏幕顶部菜单栏；窗口里的菜单仍保留，因为那里列出了全部命令。DMG 的架构与构建它的 Mac 相同（Apple 芯片或 Intel），需要 macOS 13 或更新。包没有公证：从网络下载后，在访达里用辅助点按打开，再把 `PSD2Live` 拖进“应用程序”。
-- `CI` 工作流在 PR 和推送时运行 Ubuntu、Windows 与 macOS 测试，其中 macOS 任务分别测试并打包 Apple 芯片和 Intel 版本；也可手动运行，从产物中下载 DMG。它验证原生启动器的错误处理，并用包内运行时启动挂载后的应用。共享的 `.github/actions/package-macos` 也为发行工作流提供两种架构的 DMG，不包含 Cubism SDK。
+- `CI` 在 Linux、Windows、macOS 的 x64 和 ARM64 上构建原生运行时和算法插件，运行 JVM 回归并检查包内 worker。Linux 从解包后的 Deb 启动 CLI，Windows 使用应用镜像，macOS 还验证挂载后的 DMG。会启动嵌套 Gradle 的 `pluginBuildTest` 在 Linux x64、Windows x64 和 macOS ARM64 各运行一次，也包含在本地 `check` 中。它验证原生启动器的错误处理，并用包内运行时启动挂载后的应用。共享的 `.github/actions/package-macos` 也为发行工作流提供两种架构的 DMG，不包含 Cubism SDK。
 - 两种打包都只包含当前构建平台的原生库，并在应用资源目录附带 `LICENSE`、`THIRD_PARTY_NOTICES.md` 与 `licenses/`。
 - 官方 SDK 资源（`src/main/resources/cubism/`）默认不打包，只有传入 `-Ppsd2live.includeCubism=true` 或设置 `PSD2LIVE_INCLUDE_CUBISM=true` 时才包含。含 SDK 的包不得公开分发，发行流程见 [CI 与发行](CUBISM_CI_RELEASE.md)。
 - Linux 也可用 `./native/package_linux.sh` 生成需要系统 JDK 21 的本地启动包（输出到 `dist/linux-<时间戳>/`），详见 [native/README.md](../../../native/README.md)。
 - 项目没有独立的 lint 任务，代码风格为 `kotlin.code.style=official`。
 - Rust 运行时在 `runtime/` 中用 `cargo test`、`cargo build --release` 构建，见[运行时](../spec/RUNTIME.md)。`./gradlew run` 和打包在没有可用 cargo 时，Linux 上会下载 CI（`runtime-prebuilt.yml`）按同一份源码构建的库，按 `runtime/src`、`Cargo.toml`、`Cargo.lock` 的哈希匹配（`./gradlew printRuntimeHash`）并校验 sha256；找不到或离线则回退到内置求值器。`-Ppsd2live.prebuiltRuntime=false` 关闭下载。改 `runtime/` 反复运行时可加 `-Ppsd2live.fastRuntime=true`，关闭 LTO 以大幅缩短编译，生成的库更慢，不要用于打包。
 - 测试套件只保留快速的单元与契约测试，全量 `./gradlew test` 应在 1 分钟内完成。不要加入在示例 PSD（tml、ds）上跑完整流水线、逐步对比冷重放或渲染整幅画面的测试；这类检查写成下面的开发工具，需要时手动运行。
+
+### 算法插件运行时检查
+
+Windows 构建应用镜像时需要 Windows SDK 的 `mt.exe`。打包任务为应用和包内 Java 启动器合并 UTF-8 清单，以便从跨系统代码页的安装路径加载运行时 DLL。
+
+应用内的算法插件通过 `java.home/bin/java`（Windows 为 `java.exe`）启动独立 JVM，因此打包运行时必须保留 Java 启动程序。
+以下检查使用包内真实的算法 worker，在无系统 JDK、临时用户设置及包含空格和非英文字符的迁移路径下验证启动：
+
+```bash
+python3 packaging/smoke-test-workers.py build/compose/binaries/main/app/PSD2Live
+# macOS 使用 build/PSD2Live.app；Windows 使用对应的 PSD2Live 应用目录。
+```
+
+### Linux 窗口回归检查
+
+需要真实的图形会话；JDK 21 的 AWT 在 Wayland 会话中通过 XWayland 运行。
+不透明窗口的移动、调整大小与最大化交给窗口管理器，避免把整个桌面的工作区误当成单个显示器的工作区。
+
+```bash
+./gradlew :test --tests '*NativeTitleBarTest' --tests '*BugListRegressionTest'
+PSD2LIVE_TOOLS=1 ./gradlew :test --tests '*LinuxWindowModesTool'
+```
+
+图形工具检查最大化工作区、还原尺寸、外部窗口状态和单轴最大化；普通测试运行会跳过它。
+人工检查系统标题栏拖动、边角调整大小、最大化按钮与桌面快捷键，以及不同尺寸/缩放的显示器之间移动、
+拔掉显示器后重开、F11 全屏切换、透明窗口拖动还原。Windows/macOS 也应做窗口操作的冒烟测试。
+
+使用独立设置运行源码构建，避免与已安装的程序共用工作区（先把 `JAVA_HOME` 指向 JDK 21）：
+
+```bash
+./gradlew writeRunArgs
+mkdir -p build/gui-check/home
+"$JAVA_HOME/bin/java" \
+  "-Duser.home=$PWD/build/gui-check/home" \
+  "-Djava.util.prefs.userRoot=$PWD/build/gui-check/home/prefs" \
+  @build/run/jvm.args
+```
 
 ## 外部示例与验收
 
@@ -107,15 +156,23 @@ Windows 也可以直接运行根目录的 `run-gui.bat`。不带参数启动 GUI
 
 ## 开发工具
 
-`src/test/kotlin/io/github/psd2live/tools/` 中是用于目视检查和测量的开发工具。它们写成测试，以便调用流水线内部接口；只有设置 `PSD2LIVE_TOOLS=1` 时才运行，平时的 `./gradlew test` 会跳过。输出写到 `build/tools/`。
+`src/test/kotlin/io/github/psd2live/tools/` 中是用于目视检查和测量的开发工具。它们写成测试，以便调用流水线内部接口；只有设置 `PSD2LIVE_TOOLS=1` 时才运行，平时的 `./gradlew test` 会跳过。输出写到 `build/tools/`。开启开发工具时，测试任务禁用 Gradle 结果缓存与跳过判定，保证每次测量实际执行。
 
 ```bash
 python tools/examples/fetch.py --case ds
 PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.tools.MotionSheetTool.body"
 ```
 
+首帧工具的测量范围不同：离屏工具包含 GPU 同步和读回，不包含模型生成、GL context 创建、Compose 合成或窗口呈现；`renderer_cold` 仅指新建 renderer，不是进程冷启动。窗口工具经真实应用、视口和 Skiko 回放取得 GPU 完成回执，当前限定 P2LRT；模型生成已完成，JVM 与窗口已热，不覆盖窗口交换、系统桌面合成或显示器扫描。两项指标均不是完整编辑延迟，也不能直接与算法生成耗时拼接。
+
+`verifyReadback`、`smoke` 和 `verifyWindowPixels` 用于功能检查，不输出性能分位数；`measure` 每种场景／模式采集至少 30 个有效样本，预热样本不纳入统计。超时或校验失败不记作零延迟，不输出成功统计。窗口工具须在图形初始化前配置 `PSD2LIVE_COMPOSITOR=1` 或 `0`，分别运行并核对实际模式，切换前保存报告。窗口像素读回及 PNG 编码会扰动耗时，该入口不作为性能样本，也不测量窗口交换或显示器扫描。GPU／性能采样应独占运行，避免与构建或其他性能任务并行。入口参数与完整边界见首个正确画面的测量边界。
+
 | 工具 | 内容 | 输出 |
 | --- | --- | --- |
+| `FirstCorrectFrameTool.verifyReadback` / `.measure` | 三档合成网格的已知像素检查与捕获修订至离屏编辑画布 GPU 读回完成的测量，分别覆盖新建和预热后的 renderer | `first-correct-frame-check/report.json`、`first-correct-frame/report.json` |
+| `WindowActivationTool.smoke` / `.measure` | 真实应用窗口中，P2LRT 模型激活捕获至窗口 GPU 完成的回执检查与测量；分别运行两种 compositor 模式 | `window-activation-smoke/report.json`、`window-activation/report.json` |
+| `WindowActivationTool.verifyWindowPixels` | 读回实际 Skiko 窗口 Surface，核对四块图案的修订颜色、视口位置及首个 GPU 回执身份；两种 compositor 模式分别执行，仅作功能验收 | `window-activation-pixels/report.json`、`window-activation-pixels/window-*.png` |
+| `WindowActivationTool.verifyDocumentEdits` / `.measureDocumentEdits` | 真实公开编辑请求，经候选构建与 CAS 到窗口正确帧；匹配编辑、构建、修订和实际像素，两种 compositor 模式分别执行 | `window-document-edits/report.json`、`window-document-edits-measure/report.json` |
 | `DeformerDeletionVisualTool` | 合成非对称网格在删除父变形器前后及 MOC3 导出读回后的剪影对照 | `deformer-deletion/comparison.png` |
 | `MotionSheetTool.motions` | 每个预设动作按时间展开的拼图、待机循环、呼吸前后与差分图、身体 Z | `motion-sheet/<示例>-*.png` |
 | `MotionSheetTool.body` | 身体 X × 身体 Y、腿部和上半身特写、前后倾、大小变、腿部姿势，分别为无骨架和自动骨架 | `motion-sheet/<示例>-{stance,lean,size,legposes}*.png` |
@@ -128,6 +185,7 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `ModelProfileTool.sample` | 生成模型（无骨架和自动骨架）的分段运动剖面、身体图层与自动骨骼 | `model-profile/<示例>.txt` |
 | `SkeletonAutoViewTool.view` | 把自动骨架叠画在示例上并打印每根骨骼，检查关节位置与分叉；`PSD2LIVE_SAMPLES` 逗号分隔多个示例或 PSD 路径，`PSD2LIVE_ZOOM=左,上,右,下`（画布像素）裁出局部 | `skeleton-auto/<示例>.png` |
 | `SimBakeSuite` | 按模型预设生成后发、前发、服装等物理体（另加顶部 10% 固定的后发），用旧方法和逐输入方法烘焙，在没参与拟合的动作（类面捕跟随、歪头、内置动作、逐输入阶跃、转头、拖动、摇晃）上对比参考模拟与导出模型的视觉指标，见[模拟与烘焙](SIMULATION.md) | `build/tools/sim-bake/<样例>/`：`summary.md`、每个设置的 JSON、尖端轨迹图 |
+| `DirectSimulationReviewTool.exportedAnimations` | 同一输入播放完整 XPBD 或 MOC3 与物理文件导出读回。默认使用真实预设和 5 个关键形。设置 `PSD2LIVE_DIRECT_REVIEW_TRACK=xpbd` 记录 60 Hz 完整模拟，读回时用 `PSD2LIVE_DIRECT_REVIEW_REFERENCE_OUT` 指向参考输出以逐顶点比较。用 `PSD2LIVE_DIRECT_REVIEW_FIXTURE=controlled` 单独测强腰部旋转，或用 `PSD2LIVE_DIRECT_REVIEW_KEYS=9` 检查关键形密度。设置 `PSD2LIVE_DIRECT_REVIEW_MIX_ANALYSIS=1` 记录混合段的逐轴位移叠加、限重和三阶帧差。用 `PSD2LIVE_DIRECT_REVIEW_MIX_ONLY=1` 只运行混合段 | `build/tools/direct-simulation/` 中的 25 fps 图像序列、逐帧 CSV、导出模型与参考轨迹 |
 | `SimRootDofExperiment` | 检验物体是否只响应根部的平移与旋转：每个输入带动根部多少、额外改变多少形状，真实驱动与刚体驱动、不同幅度、同样根部运动的不同输入之间的差别 | `build/tools/sim-root-dof/<样例>.md` |
 | `SimBakeProfileTool` | `tml` 后发单线程与多线程烘焙各一次，按进度标记分段计时并对所有线程采样 | 标准输出 |
 | `PendulumKernelTool` | 摆锤数组内核（精确与快速模式）与 `PhysicsEngine` 每帧耗时及偏差 | 标准输出 |
@@ -159,7 +217,9 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `ExportDialogTool` | “文件”菜单展开“导入”与“导出为”子菜单、每个目标的“导出为”对话框、Live2D 与 PSD 导出对话框，以及“导出成功”窗口（中英文；成功窗口另有浅色主题），用于检查菜单分组、标签与控件布局 | `export-dialog/<语言>-<目标或菜单>.png` |
 | `ModalDialogTool.renderDialogs` / `.depthSplit` | 共用弹窗外框上的弹窗（中文），用于检查标题栏、正文与底部操作栏是否一致：`renderDialogs` 为设置、帮助、纹理高清化与绘制顺序弹窗（深色主题），`depthSplit` 为前后分层弹窗（深色、浅色与大字号） | `modal-dialog/<弹窗>.png`、`depth-split-{dark,light,large-text}.png` |
 | `CanvasLookSheetTool.meshLook` / `.toolIcons` | 画布绘制样式的拼图：`meshLook` 为可编辑几何（`MeshLook`）在暗、中、亮与饱和底图上的各种状态（结构、选中、悬停、笔刷影响范围）；`toolIcons` 为全部画布工具图标与预览侧栏开关，深浅两种主题 | `canvas-look/mesh-look.png`、`tool-icons-{dark,light}.png` |
-| `ModifierPerfTool.profile` | 经应用层完整导入 PSD，含推荐预设、模拟烘焙、最终预览包及初始历史；分别记录同一 JVM 首次与再次导入（每次新建工程）。`PSD2LIVE_SAMPLE` 选择输入；`PSD2LIVE_VERIFY=1` 额外核对关闭阶段缓存后的完整 IR 重建结果；`PSD2LIVE_JFR=1` 记录采样。不包含窗口绘制和原生预览加载 | `modifier-perf/report.txt`、`profile.jfr` |
+| `CliPresetMigrationTool.compareRawPreset` | 对照同一 PSD 的历史绑定和显式预设栈。用 `PSD2LIVE_SAMPLE` 选择样例，`PSD2LIVE_CLI_PHYSICS=0` 或 `PSD2LIVE_CLI_MOTIONS=0` 关闭相应输出。`PSD2LIVE_CLI_VERIFY=1` 通过实际 CLI 入口导出并核对完整 IR 和读回结果。再设 `PSD2LIVE_CLI_TARGET_LOADER=1` 可核对 `export` 子命令的默认 PSD 加载路径 | `cli-preset-migration/report.txt`、`report-target-loader.txt` |
+| `CliPresetMigrationTool.compareMeshOnly`、`compareWithoutDeformers` | 分别核对仅网格与无变形器模式。用同一个样例和严格验证开关记录这些选项的独立差异 | `cli-preset-migration/report-mesh-only.txt`、`report-no-deformers.txt` |
+| `ModifierPerfTool.profile` | 经应用层完整导入 PSD，含推荐预设、模拟烘焙、最终预览包及初始历史；分别记录同一 JVM 首次与再次导入（每次新建工程）。记录完整耗时、同步烘焙耗时和扣除烘焙后的耗时，以及眼部调整和重烘焙次数。`PSD2LIVE_SAMPLE` 选择输入；`PSD2LIVE_IMPORT_MODIFIER_VERSIONS=类型@版本` 在预设求值、烘焙和历史初始化前锁定随附的绑定版本；`PSD2LIVE_VERIFY=1` 核对调整后关闭阶段缓存的完整 IR 重建结果；`PSD2LIVE_VERIFY_INDEPENDENT=1` 检查导入、调整及冷重放没有请求旧模板或构建旧绑定；`PSD2LIVE_BASELINE_MODIFIER=类型@版本` 将调整后的栈与锁定指定内置版本的结果做完整 IR 对照，多个版本用逗号分隔以比较组合效果；`PSD2LIVE_JFR=1` 记录采样。不包含窗口绘制和原生预览加载 | `modifier-perf/report.txt`、`profile.jfr` |
 | `CommitPerfTool.profile` / `.desktop` | 单次作者提交的耗时：`profile` 走应用层命令边界并按阶段拆分（修订号、配置解码、重建、几何检查）；`desktop` 走桌面视图模型与适配器，连续提交网格顶点编辑和画笔笔触，报告提交耗时与界面线程最长停顿。可配合 `JAVA_TOOL_OPTIONS=-XX:StartFlightRecording=...` 采样 | `commit-perf/report.txt`、`desktop.txt` |
 | `CommitPerfTool.baseline` | 提交路径的逐阶段基线：在带自动骨架、两个摆动和一个已烘焙模拟的工程上，分别测量完整重建（不读取进程内已存的作者 Rig，生成基础 Rig 并重放日志）的各阶段（分析、纹理集打包与 PNG 编码、基础 Rig、骨架缓存命中/未命中、日志重放、摆动/模拟写回、覆盖、IR、moc3 打包、`validateBundle`、修订号哈希、运行时文件写出），以及几何提交、小图层绘画、换图（同形/重建网格）、无关拓扑编辑后的骨架缓存命中和日志追加到 50/200 条时的提交耗时与增长；每次提交后写入历史存储。不测原生预览重载（需要 GL 上下文） | `commit-perf/baseline.json`、`baseline.md` |
 | `CommitPerfTool.rigStages` | 只做 `baseline` 的准备与生成类提交（图层分类、图层网格），记录每次提交中 Rig 构建的各阶段，再完整重建结果；`PSD2LIVE_RIG_MODES` 取 `staged` 或 `unstaged` 时只测阶段缓存的一种模式，默认两种都测 | `commit-perf/rig-stages.json`、`rig-stages.md` |
@@ -171,8 +231,10 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `RigSourcePerfTool.profile` | 大图（示例放大 `PSD2LIVE_SCALE` 倍，默认 3）带生成输入时重建中按像素计的阶段：每第 3 层裁小几像素（需补齐到固定矩形）、每第 5 层为 2 倍密度；冷构建、热重建、绘制后重建的分阶段耗时，以及冷合成图集页与预览 PNG 编码 | `rig-source-perf/report.txt` |
 | `MeshTraceTool.compare` / `.wrap` | `compare` 把合成图层（1024² 贴图上带睫毛的眼睛、头发细束、画布分辨率图层、6000 与 2048 文档中的图层）分别以画布描轮廓与贴图描轮廓生成网格，并排渲染（灰为贴图 alpha、蓝为网格、红为网格外的不透明贴图像素），报告顶点数、耗时、`detail`、网格外像素与网格面积；`wrap` 以贴图描轮廓在包裹 0–32 下为睫毛、头发细束与手生成网格，报告顶点数、轮廓环数、耗时与网格外像素 | `mesh-trace/<用例>.png`、`report.txt`；`mesh-wrap/<用例>.png`、`report.txt` |
 | `StructureMeshTool` | 按纹理结构重布点：在示例 PSD（`PSD2LIVE_STRUCTURE_PSD`，默认 tml）的衣物与头发图层（或 `PSD2LIVE_STRUCTURE_LAYERS` 列出的图层）上运行 `layer_mesh_structure` 的计划，并排绘出旧网格与新网格及识别线（褶皱橙、阴影蓝、图案紫，未采用的线变淡），报告顶点数、采用的线、褶皱带数与耗时；`PSD2LIVE_STRUCTURE_SETTINGS` 传入设置 JSON | `structure-mesh/<网格>.png`、`report.txt` |
-| `ReadmeShotsTool` | 打开真实编辑器窗口，在开始页选「完整」预设后导入 `PSD2LIVE_SAMPLE`，再用「按网格拆分图层」接受全部拆分，等模拟烘焙完，提交自动骨架，再截取各工作区与画布各模式的窗口帧（不截屏），并把工程存为 `project.psd2live`；`PSD2LIVE_SHOT_REUSE=1` 重开已存的工程，`PSD2LIVE_SHOT_W` / `_H` 设窗口大小。用于首页截图 | `readme-shots/<示例>/*.png`、`project.psd2live` |
+| `ReadmeShotsTool` | 打开真实编辑器窗口，在开始页选「完整」预设后导入 `PSD2LIVE_SAMPLE`，再用「检查全模型的独立网格…」检查并确认拆分，等模拟烘焙完，提交自动骨架，再截取各工作区与画布各模式的窗口帧（不截屏），并把工程存为 `project.psd2live`；`PSD2LIVE_SHOT_REUSE=1` 重开已存的工程，`PSD2LIVE_SHOT_W` / `_H` 设窗口大小。用于首页截图 | `readme-shots/<示例>/*.png`、`project.psd2live` |
 | `ReadmeShowcaseTool` | 首页测试图：`meshStress`、`meshParams`、`meshWrap` 为合成图层的网格（孔洞与细桥、边缘层数 × 填充算法、包络宽度）；`rigHead`、`rigFace`、`rigBody` 为两个示例的头部、五官与骨架预设姿态；`rigKnee` 为 `PSD2LIVE_KNEE_SAMPLE`（工程或 PSD）的膝盖弯折；`bodyOrbit` 给 `PSD2LIVE_ORBIT_PROJECTS` 中各工程临时加一段身体 X / Y 上下、左右、椭圆运动的动作，按物理开、关各导出 PNG 帧（`PSD2LIVE_ORBIT` 设幅度，`PSD2LIVE_ORBIT_PERIOD` 设每轮秒数） | `readme-plates/*.png`、`readme-orbit/<工程>-{on,off}/` |
+
+`modifier legacy template` 行统计兼容模板的构建次数。`modifier template consumer` 行记录同一批构建的实际调用方，包含对前序修改器模板的请求。统计总耗时时只计算其中一组。
 
 | 环境变量 | 作用 |
 | --- | --- |
@@ -194,9 +256,69 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 | `PSD2LIVE_RIG_MODES` | `CommitPerfTool.baseline` / `.rigStages` 的生成类提交只测 `staged` 或 `unstaged`，默认 `both` |
 | `PSD2LIVE_TEST_CUBISM_CORE` | 官方 Cubism Core 动态库的路径，供 `CubismCoreCheckTool` 与 `:umamo` 的 `MocDefaultColorsTest`；未设置时二者跳过 |
 
+### 从 PSD 导入到修改器全部生成
+
+桌面开始页通过 `WorkspaceHost.importPsd` 捕获所选文件。`WorkspaceSourceImporter` 解码 PSD，建立图层与素材的关联，生成空修改器栈的可编辑网格预览，固定初始图集并安装工程。拆层和命名结束后，`ImportPresetContinuation` 只在同一工程提交一次 `modifier_initialize`。选择空栈时流程止于导入。MCP 的 `asset_import_psd` 也支持在一次导入中指定预设，这条路径在安装工程前完成下表各阶段。
+
+| 阶段 | 执行位置 | 下游使用的结果 |
+| --- | --- | --- |
+| 准备基础输入 | `WorkspacePresetInitialization` → `RigModifierPipeline` → `buildOrdinaryPreview` | 分析源图，建立图集和普通网格，重放已有编辑，编译修改器的输入 IR。 |
+| 规划与绑定 | `WorkspaceModifierPlan` → `RigModifierEvaluator` | 从实际网格选取目标，按依赖建立实例。每个实例读取上一个实例的输出。绑定结果决定可用参数和已被驱动的物理输出。 |
+| 物理、动作与模拟 | `WorkspacePresetInitialization` → `WorkspaceModifierSimulation.prepare` | 依据已生成参数添加物理和动作。每个模拟读取自身之前的栈，跟踪目标、碰撞网格、Glue 连通网格和祖先变形器，将烘焙结果写入文档。 |
+| 最终求值与提交 | 直接导入由 `WorkspaceSourceImporter` 安装；延后初始化由 `WorkspacePreviewBuilder` 重建候选，再经 `WorkspaceRuntime` 提交 | 候选复用输入匹配的求值前缀，生成最终预览包。延后初始化的整个修改器栈只追加一个历史节点。 |
+
+CLI 从原始 PSD 直接导出时，`buildSourceExport` 选择生成分支。启用变形器的完整生成经过 `CliPresetBindings.build`，共用上述预设规划和有序求值，再按 CLI 配置整理导出模型。仅网格和关闭变形器各有专用分支。
+
+用 `ModifierPerfTool.profile` 测推荐预设的直接导入，用 `ModifierPerfTool.deferredImport` 测空栈导入后执行完整预设的命令路径。`PSD2LIVE_IMPORT_ROUNDS` 控制同一 JVM 内新建工程的次数，默认 2。报告按轮列出耗时、GC 计时，以及模拟校准、训练、动态拟合等各阶段耗时。子阶段耗时已计入所属的上层阶段。延后初始化基准还将预览包文件与模拟烘焙数据的 SHA-256 写入 `build/tools/modifier-perf/deferred.txt`。设置 `PSD2LIVE_VERIFY=1` 后，它会保存并重开最后一次生成的工程，核对完整 IR、修改器报告、静止与转头张嘴姿态的画面，并读回 MOC3。计时仅覆盖应用层命令，验证、窗口绘制和人工拆层时间均在计时范围之外。
+
 ## 代码结构
 
-源码分为多个 Gradle 模块，依赖只能向下，由编译期保证：从 Umamo 移植的引擎 `org.umamo.*` 在 `:umamo`（`umamo/src/main/kotlin/`，不依赖产品代码）；中立绑定 IR `:format-model`、导出框架 `:format-compile` 与光栅导出 `:targets:raster`、运行时模型 `:targets:runtime` 与运行时绑定 `:format-eval` 为 MIT，不依赖任何 GPL 模块；`:targets:cubism`（IR 转换器、moc3、cmo3）与 `:targets:psd` 使用引擎；产品层 `io.github.psd2live.*` 在根项目（`src/main/kotlin/`）。导出模块见[中立绑定 IR 与导出目标](../spec/EXPORT_TARGETS.md)。引擎包如下：
+```text
+psd2live/
+├─ src/                               # 产品层（根 Gradle 项目）
+│  ├─ main/kotlin/io/github/psd2live/
+│  │  ├─ core/                        # 生成流水线、质量检查与可重放编辑
+│  │  ├─ document/                    # 源图、图层变换与纹理值类型
+│  │  ├─ project/                     # WorkspaceDocument、WorkspaceStore、.psd2live 归档
+│  │  ├─ application/                 # WorkspaceRuntime、宿主、命令注册与 schema
+│  │  ├─ history/                     # 分支式撤销 / 重做
+│  │  ├─ agent/                       # 本地 MCP 服务与工具定义
+│  │  ├─ render/                      # 编辑画布与 p2lrt GPU 渲染
+│  │  ├─ ui/                          # Compose Desktop 界面、ViewModel、主题与交互教程
+│  │  ├─ i18n/                        # 多语言加载
+│  │  └─ util/                        # 通用工具
+│  ├─ main/resources/                 # i18n 文案、whatsnew、manual、皮肤预设等资源
+│  └─ test/kotlin/io/github/psd2live/ # 回归测试与开发工具（tools/）
+├─ umamo/                             # 通用引擎（GPL）：runtime、format、interop、render、edit
+├─ umamo-ir-bridge/                   # GPL 转换桥（PuppetIr）
+├─ format-model/                      # 中立绑定 IR（MIT）
+├─ format-compile/                    # 导出编译框架与损失报告（MIT）
+├─ format-eval/                       # 运行时求值绑定（MIT）
+├─ algorithm-api/                     # 独立 JVM 算法契约与清单
+├─ algorithm-worker/                  # 外部算法进程宿主机
+├─ algorithms/                        # 内置算法模块（binding / motion / physics / simulation / swing）
+├─ targets/                           # 导出目标（cubism / raster / psd / spine / runtime / web / gltf / unity / dragonbones）
+├─ plugin-sdk/                        # 插件 SDK（Python / Rust）与打包脚本
+├─ plugins/                           # 内置 / 示例原生插件（native-core）
+├─ runtime/                           # Rust 运行时（p2lrt）、Web / Godot 绑定与一致性测试
+├─ native/                            # 可选 Cubism Native 预览桥接（C++ / CMake）
+├─ packaging/                         # Windows / macOS 安装包与启动器脚本
+├─ tools/                             # mcp_proxy.py、示例拉取/校验与目标检查脚本
+├─ examples/                          # 示例说明与多语言插件示例
+├─ docs/                              # 中文主文档与图片资源
+├─ licenses/                          # 第三方许可证文本
+├─ build.gradle.kts                   # Gradle 构建与打包配置
+├─ settings.gradle.kts                # 22 个 Gradle 子模块定义
+└─ run-gui.bat                        # Windows 快捷启动脚本
+```
+
+源码分为多个 Gradle 模块，模块间依赖由 Gradle 在编译期约束。从 Umamo 移植的引擎 `org.umamo.*` 位于 `:umamo`（`umamo/src/main/kotlin/`），不依赖产品代码。中立绑定 IR `:format-model`、导出框架 `:format-compile`、光栅导出 `:targets:raster`、运行时模型 `:targets:runtime` 与运行时绑定 `:format-eval` 为 MIT，不依赖任何 GPL 模块。GPL 模块 `:umamo-ir-bridge` 只依赖 `:umamo` 和 `:format-model`，拥有通用转换器 `io.github.psd2live.bridge.PuppetIr`；算法和导出目标共用它，不经由目标降级、编译或写出实现。`:targets:cubism` 保留 Cubism 目标降级、编译及写出，`:targets:psd` 使用引擎。详见[中立绑定 IR 与导出目标](../spec/EXPORT_TARGETS.md)。
+
+产品层 `io.github.psd2live.*` 位于根项目（`src/main/kotlin/`）。应用层 `application/SourceExport.kt` 选择源文件导出用例及 CLI 预设，并提供 `PSD2LivePipeline.run` 扩展；`core/PSD2LivePipeline.kt` 保留生成与导出计算。源图、图层变换和纹理值类型归根项目的 `document` 包，它不是独立 Gradle 模块；`project` 中的兼容别名保留旧包名。
+
+产品包依赖由 `LayerDependencyTest` 检查：`core/project/history/document/util` 不反向调用 `application/agent/ui`，`document/util/history` 不依赖 `core/project`。既有 `core/project/render` 强连通组仍存在，其跨包符号例外列在 `src/test/resources/architecture/product-layer-exceptions.txt`；不能新增循环、扩大例外或用跨包通配导入绕过检查。
+
+引擎包如下：
 
 | 包 | 职责 |
 | --- | --- |
@@ -226,17 +348,19 @@ PSD2LIVE_TOOLS=1 PSD2LIVE_SAMPLE=ds ./gradlew test --tests "io.github.psd2live.t
 2. 作者阶段（`RigEditOverlay.replayAuthored`）：从日志中最后一条 `rig_checkpoint` 记录保存的 Rig 开始，没有时从基础 Rig 开始并先重放旧格式的静态字段（参数删除 / 创建、Warp、结构、关键形），然后按实际顺序重放其后的 `authoringJournal`；
 3. 收尾（`RigEditOverlay.finish`）：按生成器依赖图（`core/DocumentGenerators.kt`）运行摆动、模拟等生成器，三方合并生成结果覆盖（`generated_override`），再重放引用生成参数的面板编辑。
 
-已存有作者 Rig 的修订（本进程构建过的，或归档 `rig/` 中保存的）直接从它构建，不生成基础 Rig、也不重放日志。详见[固化 Rig](../spec/MATERIALIZED_RIG.md)与[文档层](../spec/DOCUMENT_LAYER.md)。
+已存有作者 Rig 的修订（本进程构建过的，或归档 `rig/` 中保存的）直接从它构建，不生成基础 Rig、也不重放日志。详见[文档层](../spec/DOCUMENT_LAYER.md)。
 
 因此新增编辑功能时：
 
 - 修改必须写入 `RigEditOverlay` 的可序列化字段（新命令优先作为编辑日志中的 JSON 命令），并在工作区状态编解码中保存与恢复。只改 `PuppetModel` 的修改会在重建后丢失。
 - 界面与 MCP 应调用同一套编辑命令。`org.umamo.edit` 中的底层方法不自动等同于公开接口。
-- 验收链路：领域数据 → 历史重放 → 工程保存与恢复 → 目标 Cubism 版本处理 → 导出读回 → 视觉检查。详见[运行时与导出边界](../spec/RUNTIME_EXPORT_ARCHITECTURE_AND_GAPS.md)。
+- 验收链路：领域数据 → 历史重放 → 工程保存与恢复 → 目标 Cubism 版本处理 → 导出读回 → 视觉检查。
 
 界面文案新增时，`Messages.properties`、`Messages_zh_CN.properties`、`Messages_ja.properties`、`Messages_ko.properties` 四个文件需要同时添加，保持键数一致（`CatalogContractsTest` 检查）。
 
 ## 检查导出结果
+
+插件 Git 分发验收需本机安装 Git 和 `git daemon`，设置 `PSD2LIVE_PLUGIN_GIT_TEST=1` 后运行 `test --tests '*ModifierPluginTest.gitTagsAndCommitsInstallPrebuiltPinnedPackages'`。它在临时目录创建已构建的测试包并仅监听本机，检查标签、提交号、默认分支、版本并存和真实求值；不访问外部仓库。常规回归跳过此项。
 
 - `.model3.json` 引用的所有文件都要随模型交付。
 - 查看日志面板与诊断 JSON 中的警告。

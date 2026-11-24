@@ -2,11 +2,11 @@ package io.github.psd2live.core
 
 import io.github.psd2live.application.WorkspaceLayerTransform
 import io.github.psd2live.application.WorkspacePreviewBuilder
+import io.github.psd2live.document.WorkspaceSourceArt
+import io.github.psd2live.document.WorkspaceSourceLayer
+import io.github.psd2live.document.transform
 import io.github.psd2live.project.WorkspaceDocument
 import io.github.psd2live.project.WorkspaceSettingsCodec
-import io.github.psd2live.project.WorkspaceSourceArt
-import io.github.psd2live.project.WorkspaceSourceLayer
-import io.github.psd2live.project.transform
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive

@@ -1,12 +1,20 @@
 package io.github.psd2live.application
 
+import io.github.psd2live.core.RigBuilder
+import io.github.psd2live.core.RigIrCompiler
 import io.github.psd2live.core.RigPreviewModel
+import io.github.psd2live.core.modifier.BuiltinModifierPlugins
+import io.github.psd2live.core.modifier.RigModifierPipeline
+import io.github.psd2live.core.modifier.RigModifierStack
+import io.github.psd2live.core.modifier.RigOrdinaryMaterials
+import io.github.psd2live.core.recipe.RigRecipe
 import io.github.psd2live.project.WorkspaceRevisions
 import io.github.psd2live.project.WorkspaceSourceArt
 import io.github.psd2live.project.WorkspaceSourceGroup
 import io.github.psd2live.project.WorkspaceSourceLayer
 import io.github.psd2live.project.rawConfig
 import io.github.psd2live.scenario.Characters
+import io.github.psd2live.bridge.PuppetIr
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import org.junit.jupiter.api.io.TempDir
@@ -34,20 +42,69 @@ class WorkspaceSourceImporterTest {
             val importer = WorkspaceSourceImporter(runtime, readPsd = { original.source })
             val result = importer.importPsd(path, null, runtime.state.value.state, initialConfig = original.rawConfig(), modifiers = mode)
             val installed = result.capture
+            assertNotNull(installed.model.modifierEvaluation, "Freezing the imported atlas must retain the evaluated prefix")
+            assertTrue(assertNotNull(installed.model.modifierBuildOwner).retainsMeshCache,
+                "The first edit must retain the import's geometry cache through its owner")
             val stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(installed.document.rigEdits.modifierStack!!)
             assertEquals(1, runtime.history().selections.size)
             if (mode == WorkspaceInitialModifiers.EMPTY) {
                 assertTrue(stack.instances.isEmpty())
                 assertTrue(installed.model.rig.puppet.deformers.isEmpty())
+                val model = installed.model
+                val config = RigModifierPipeline.ordinaryConfig(model.config).copy(meshOnly = true)
+                val previous = RigOrdinaryMaterials.of(RigBuilder.build(model.analysis, model.atlas, config), model.analysis)
+                assertEquals(PuppetIr.toIr(previous.puppet), PuppetIr.toIr(model.baseRig.puppet))
+                assertEquals(previous.seeThrough, model.baseRig.seeThrough)
             } else {
-                assertTrue(stack.instances.all { it.presetGroup == "fitted" })
-                assertEquals(listOf("rig.scaffold") + WorkspaceModifierPlan.groups.getValue("fitted"), stack.instances.map { it.type })
+                assertTrue(stack.instances.all { it.presetGroup == "modern" })
+                assertTrue(stack.instances.any { it.type == "face" && it.config["mode"]?.jsonPrimitive?.content == "fitted" })
+                assertTrue(stack.instances.none { it.type == "face/legacy" || it.type == "face.depth-turn" })
                 assertTrue(installed.model.rig.puppet.deformers.isNotEmpty())
+                val parts = listOf("body", "face", "eye", "brow", "mouth").filter { type -> stack.instances.any { it.type == type } }
+                for (type in parts) {
+                    val instance = stack.instances.single { it.type == type }
+                    assertEquals(1, instance.version, type)
+                    assertEquals(assertNotNull(BuiltinModifierPlugins.reference(type, 1)), instance.plugin)
+                }
+                val locked = stack.copy(instances = stack.instances.map { instance ->
+                    if (instance.type !in parts) return@map instance
+                    instance.copy(version = 1, plugin = assertNotNull(BuiltinModifierPlugins.reference(instance.type, 1)))
+                })
+                val reference = installed.document.copy(rigEdits = installed.document.rigEdits.copy(modifierStack = locked.toJson()))
+                assertEquals(RigIrCompiler.compile(builder.build(reference)), RigIrCompiler.compile(installed.model))
             }
             val rebuilt = builder.build(installed.document)
             assertEquals(io.github.psd2live.core.RigIrCompiler.compile(installed.model),
                 io.github.psd2live.core.RigIrCompiler.compile(rebuilt))
         }
+    }
+
+    @Test fun newLegacyPresetUsesIndependentFaceEyesAndBrowsWithoutChangingTheModel() = runBlocking<Unit> {
+        val original = Characters.head(physics = false)
+        val path = Files.createFile(directory.resolve("legacy-face.psd")).toAbsolutePath()
+        val builder = WorkspacePreviewBuilder()
+        val runtime = WorkspaceRuntime<RigPreviewModel>({ builder.build(it) })
+        val importer = WorkspaceSourceImporter(runtime, readPsd = { original.source })
+        val installed = importer.importPsd(path, null, runtime.state.value.state,
+            initialConfig = original.rawConfig().copy(recipe = RigRecipe.Legacy),
+            modifiers = WorkspaceInitialModifiers.CUSTOM,
+            preset = WorkspaceInitialPreset(headStrength = .7f, bodyStrength = 1.3f, clothing = false)).capture
+        val stack = RigModifierStack.fromJson(assertNotNull(installed.document.rigEdits.modifierStack))
+        val replaced = setOf("face", "eye", "brow")
+        assertEquals(replaced, stack.instances.filter { it.type in replaced }.mapTo(HashSet()) { entry ->
+            assertEquals(1, entry.version, entry.type)
+            assertEquals("legacy", entry.config["mode"]?.jsonPrimitive?.content, entry.type)
+            assertEquals(assertNotNull(BuiltinModifierPlugins.reference(entry.type, 1)), entry.plugin)
+            entry.type
+        })
+        assertEquals(1, runtime.history().selections.size)
+        val locked = stack.copy(instances = stack.instances.map { entry ->
+            if (entry.type in replaced) entry.copy(version = 1, plugin = assertNotNull(BuiltinModifierPlugins.reference(entry.type, 1)))
+            else entry
+        })
+        val reference = installed.document.copy(rigEdits = installed.document.rigEdits.copy(modifierStack = locked.toJson()))
+        assertEquals(RigIrCompiler.compile(builder.build(reference), tileArt = true),
+            RigIrCompiler.compile(installed.model, tileArt = true))
     }
 
     @Test fun shortcutChoicesInstallIndependentModifiersAndReplayInOneHistoryNode() = runBlocking<Unit> {
@@ -63,7 +120,7 @@ class WorkspaceSourceImporterTest {
             val stack = io.github.psd2live.core.modifier.RigModifierStack.fromJson(installed.document.rigEdits.modifierStack!!)
             assertEquals(1, runtime.history().selections.size)
             assertTrue(stack.instances.isNotEmpty())
-            assertTrue(stack.instances.all { it.presetGroup == mode.name.lowercase() })
+            assertTrue(stack.instances.all { it.presetGroup == if (installed.model.config.recipe.modern) "modern" else "legacy" })
             assertTrue(installed.document.rigEdits.simEdits.isEmpty())
             if (mode == WorkspaceInitialModifiers.FULL) assertTrue(stack.instances.any { it.type == "simulation" })
             if (mode == WorkspaceInitialModifiers.MINIMAL) assertTrue(stack.instances.none { it.type == "motion" || it.type == "simulation" })

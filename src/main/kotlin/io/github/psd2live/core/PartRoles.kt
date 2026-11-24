@@ -24,6 +24,8 @@ enum class PartRole(val word: String, val tags: Set<SemanticTag>) {
 	UPPER_LIP("upperlip", setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN)),
 	/** The lower lip with the skin about it. */
 	LOWER_LIP("lowerlip", setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN)),
+	/** Separate neutral seam, excluded from the open cavity and drawing-swap binding. */
+	CLOSED_LINE("closedline", setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN)),
 	/** The upper lip's edge line, drawn apart from the lip. */
 	UPPER_LINE("upperline", setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN)),
 	/** The lower lip's edge line. */
@@ -37,8 +39,11 @@ enum class PartRole(val word: String, val tags: Set<SemanticTag>) {
 	RIBBON("ribbon", setOf(SemanticTag.HEADWEAR, SemanticTag.NECKWEAR, SemanticTag.TOPWEAR, SemanticTag.BOTTOMWEAR, SemanticTag.BACK_HAIR)),
 	PENDANT("pendant", setOf(SemanticTag.HEADWEAR, SemanticTag.EARWEAR, SemanticTag.NECKWEAR, SemanticTag.TOPWEAR, SemanticTag.BOTTOMWEAR)),
 	RIGID("rigid", setOf(SemanticTag.HEADWEAR, SemanticTag.NECKWEAR, SemanticTag.TOPWEAR, SemanticTag.BOTTOMWEAR, SemanticTag.HANDWEAR)),
+	REAR_HEADWEAR("rear-headwear", setOf(SemanticTag.HEADWEAR)),
 	SLEEVE("sleeve", setOf(SemanticTag.TOPWEAR, SemanticTag.HANDWEAR)),
 	SKIRT("skirt", setOf(SemanticTag.BOTTOMWEAR, SemanticTag.TOPWEAR)),
+	EYE_DETAIL("eye-detail", setOf(SemanticTag.EYELASH)),
+	BROW_DETAIL("brow-detail", setOf(SemanticTag.EYEBROW)),
 	PLAIN("", SemanticTag.entries.toSet());
 
 	/** Whether this role can refine a layer of [tag]. */
@@ -60,19 +65,43 @@ enum class PartRole(val word: String, val tags: Set<SemanticTag>) {
  * [PartRole.PLAIN] keeps the guess away. Only the rig's modules read roles; a legacy rig ignores them.
  */
 object PartRoles {
+	internal val lidSkinNames = listOf("眼皮", "上眼皮", "下眼皮", "眼睑", "上眼睑", "下眼睑", "眼瞼", "上眼瞼", "下眼瞼",
+		"eyelid skin", "upper eyelid skin", "lower eyelid skin")
+	internal val eyeDetailNames = listOf("眼角红晕", "上眼角红晕", "下眼角红晕", "眼眶红晕", "眼睑红晕", "眼瞼紅暈",
+		"上眼睑红晕", "下眼睑红晕", "上眼瞼紅暈", "下眼瞼紅暈", "眼睑阴影", "眼瞼陰影", "眼角黑影", "眼窝高光", "眼窝阴影",
+		"眼眶阴影", "下眼眶阴影", "眼眶陰影", "下眼眶陰影", "眼线高光", "眼線高光", "睫毛高光",
+		"眼线遮盖", "眼線遮蓋", "eye corner tint", "eyelid tint", "eyelid makeup", "eyelid shadow",
+		"eyeliner highlight", "lash highlight", "eyeliner cover", "eyelash detail", "eye-detail")
+	internal val browCoverNames = setOf("eyebrow cover", "brow cover", "眉毛遮盖", "眉毛遮蓋")
+	internal val browFrontNames = setOf("eyebrow front", "brow front", "眉前", "眉毛前")
+	internal val browDetailNames = listOf("眉前阴影", "眉后阴影", "眉前陰影", "眉後陰影", "眉毛阴影", "眉毛陰影",
+		"eyebrow shadow", "brow shadow", "eyebrow detail", "brow detail", "brow-detail")
+	private val throughHairGroupNames = setOf("眼眉透发", "眼眉透髮", "眼透发", "眼透髮", "眉透发", "眉透髮",
+		"eye and brow through hair", "eye through hair", "brow through hair")
+
+	internal fun isThroughHairGroup(name: String): Boolean = normalize(name).trim() in throughHairGroupNames
+
+	internal fun isAuthoredBrowCover(name: String): Boolean =
+		LayerClassifier.classify(name).normalizedName.let { it in browCoverNames || it in browFrontNames }
+
 	private val names: List<Pair<PartRole, List<String>>> = listOf(
+		PartRole.EYE_DETAIL to eyeDetailNames,
+		PartRole.BROW_DETAIL to (browDetailNames + browCoverNames),
 		PartRole.PUPIL to listOf("瞳孔", "pupil", "동공"),
+		// Highlights and shadows before lips so lip highlights/shadows do not collapse to lip skin.
+		PartRole.HIGHLIGHT to listOf("高光", "高亮", "反光", "光点", "ハイライト", "ﾊｲﾗｲﾄ", "highlight", "shine", "gloss", "sparkle", "glint", "하이라이트", "반사광"),
+		PartRole.SHADOW to listOf("阴影", "陰影", "暗部", "投影", "影", "かげ", "シャドウ", "shadow", "shade", "그림자", "음영"),
 		// Before the lips: a lip's line names the lip too.
-		PartRole.UPPER_LINE to listOf("上唇线", "上唇線", "上嘴唇线", "上嘴唇線", "上唇ライン", "上唇の線", "upper lip line", "upper lipline", "upperline", "윗입술 선", "윗입술선"),
-		PartRole.LOWER_LINE to listOf("下唇线", "下唇線", "下嘴唇线", "下嘴唇線", "下唇ライン", "下唇の線", "lower lip line", "lower lipline", "lowerline", "아랫입술 선", "아랫입술선"),
+		PartRole.UPPER_LINE to listOf("上唇线", "上唇線", "上嘴线", "上嘴唇线", "上嘴唇線", "上唇ライン", "上唇の線", "upper lip line", "upper lipline", "upperline", "윗입술 선", "윗입술선"),
+		PartRole.LOWER_LINE to listOf("下唇线", "下唇線", "下嘴线", "下嘴唇线", "下嘴唇線", "下唇ライン", "下唇の線", "lower lip line", "lower lipline", "lowerline", "아랫입술 선", "아랫입술선"),
+		PartRole.CLOSED_LINE to listOf("闭嘴线", "閉嘴線", "闭合嘴线", "閉合嘴線", "嘴唇中线", "嘴唇中線", "嘴唇缝", "嘴唇縫", "唇缝", "唇縫", "嘴缝", "嘴縫", "微笑嘴线", "默认嘴线", "默認嘴線", "closed line", "closedline", "mouth seam", "lip seam"),
 		PartRole.UPPER_LIP to listOf("上唇", "上嘴唇", "上くちびる", "上嘴皮", "upper lip", "upperlip", "윗입술"),
 		PartRole.LOWER_LIP to listOf("下唇", "下嘴唇", "下くちびる", "下嘴皮", "lower lip", "lowerlip", "아랫입술"),
-		PartRole.HIGHLIGHT to listOf("高光", "高亮", "反光", "光点", "ハイライト", "ﾊｲﾗｲﾄ", "highlight", "shine", "gloss", "sparkle", "glint", "하이라이트", "반사광"),
 		PartRole.LOWER to listOf("下睫毛", "下まつ毛", "下まつげ", "下睫", "下眼线", "下まぶた", "lower lash", "lowerlash", "under lash", "bottom lash", "lower eyelash",
 			"아랫속눈썹", "아래 속눈썹", "하안검"),
-		PartRole.LID to listOf("双眼皮", "雙眼皮", "二重", "眼皮线", "眼睑线", "まぶた線", "double eyelid", "eyelid line", "lid line", "쌍꺼풀", "쌍커풀"),
+		PartRole.LID to listOf("双眼皮", "雙眼皮", "二重", "眼皮线", "眼睑线", "眼瞼線", "まぶた線",
+			"double eyelid", "eyelid line", "lid line", "eyelid crease", "쌍꺼풀", "쌍커풀"),
 		PartRole.BLUSH to listOf("腮红", "腮紅", "红晕", "紅暈", "脸红", "頬", "ほほ", "ほお", "チーク", "照れ", "赤面", "blush", "cheek", "볼터치", "홍조", "블러셔"),
-		PartRole.SHADOW to listOf("阴影", "陰影", "暗部", "投影", "影", "かげ", "シャドウ", "shadow", "shade", "그림자", "음영"),
 		PartRole.AHOGE to listOf("呆毛", "アホ毛", "あほ毛", "あほげ", "ahoge", "cowlick", "바보털", "더듬이"),
 		PartRole.SIDE to listOf("侧发", "側髪", "侧髮", "鬓发", "鬓角", "鬢", "横髪", "もみあげ", "サイド", "side hair", "sidehair", "side lock", "옆머리", "구레나룻"),
 		PartRole.TAIL to listOf("马尾", "馬尾", "双马尾", "雙馬尾", "ポニーテール", "ポニテ", "ツインテール", "ツインテ", "ponytail", "twintail", "twin tail", "포니테일", "트윈테일", "양갈래"),
@@ -82,6 +111,7 @@ object PartRoles {
 		PartRole.RIBBON to listOf("蝴蝶结", "蝴蝶結", "丝带", "絲帶", "缎带", "緞帶", "领结", "領結", "飘带", "飄帶", "リボン", "ribbon", "bow", "리본", "나비넥타이"),
 		PartRole.PENDANT to listOf("吊坠", "吊墜", "挂件", "掛件", "坠子", "耳坠", "流苏", "流蘇", "铃铛", "鈴鐺", "鈴", "ペンダント", "チャーム", "タッセル", "pendant",
 			"charm", "tassel", "bell", "dangle", "펜던트", "방울", "술장식"),
+		PartRole.REAR_HEADWEAR to listOf("headwear rear", "rear headwear", "rear-headwear", "后置头饰", "後置頭飾"),
 		PartRole.RIGID to listOf("纽扣", "鈕扣", "扣子", "徽章", "胸针", "胸針", "ボタン", "バッジ", "ブローチ", "button", "badge", "brooch", "단추", "배지", "브로치"),
 		PartRole.SLEEVE to listOf("袖子", "袖口", "袖", "そで", "sleeve", "cuff", "소매"),
 		PartRole.SKIRT to listOf("裙", "スカート", "skirt", "치마", "스커트"),
@@ -93,6 +123,7 @@ object PartRoles {
 	fun fromName(name: String, groupPath: String, tag: SemanticTag): PartRole? {
 		fun find(text: String): PartRole? {
 			val value = normalize(text)
+			if (tag == SemanticTag.EYELASH && LayerClassifier.classify(value).normalizedName in lidSkinNames) return PartRole.EYE_DETAIL
 			return names.firstOrNull { (role, words) -> role.fits(tag) && words.any { it in value } }?.first
 		}
 		return find(name) ?: groupPath.split('/').asReversed().firstNotNullOfOrNull { if (it.isEmpty()) null else find(it) }
@@ -178,6 +209,17 @@ object PartRoles {
 			}
 			SemanticTag.BOTTOMWEAR -> if (darkening) PartRole.SHADOW else if (layer.semantic.side == io.github.psd2live.core.Side.NONE && skirtShaped(layer)) PartRole.SKIRT else null
 			SemanticTag.NECK, SemanticTag.TOPWEAR -> if (darkening) PartRole.SHADOW else null
+			SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN -> {
+				val label = normalize(layer.source.name)
+				if ("唇底色" in label || "嘴皮" in label || "唇皮" in label) {
+					val mouthCenterY = layers.filter { it !== layer && it.semantic.tag in setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN, SemanticTag.MOUTH_CLOSE) &&
+						roles[it] in setOf(null, PartRole.CLOSED_LINE) }
+						.map { it.bounds }.reduceOrNull(Bounds::union)?.centerY
+					if (mouthCenterY != null) {
+						if (layer.centroidY < mouthCenterY) PartRole.UPPER_LIP else PartRole.LOWER_LIP
+					} else null
+				} else null
+			}
 			else -> null
 		}
 	}

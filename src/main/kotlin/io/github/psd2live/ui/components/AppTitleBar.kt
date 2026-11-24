@@ -3,11 +3,13 @@ package io.github.psd2live.ui.components
 import io.github.psd2live.ui.views.texture.LocalMenuGlide
 import io.github.psd2live.ui.views.texture.glideRow
 import io.github.psd2live.ui.views.texture.MenuGlide
+import io.github.psd2live.ui.views.texture.MenuItemSideTip
 import io.github.psd2live.ui.views.texture.menuPanel
 import io.github.psd2live.ui.views.texture.menuAppearance
 import io.github.psd2live.ui.theme.Corners
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -15,7 +17,9 @@ import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
@@ -57,12 +61,14 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import io.github.psd2live.ui.state.RecentFileKind
 import io.github.psd2live.ui.state.rememberExistingRecentFiles
+import io.github.psd2live.ui.views.SettingsIcon
 import io.github.psd2live.ui.tutorial.LocalTutorialTargets
 import io.github.psd2live.ui.tutorial.TutorialId
 import io.github.psd2live.ui.tutorial.TutorialOverlay
@@ -153,6 +159,7 @@ fun AppTitleBar(
 	windowState: WindowState,
 	isBusy: Boolean,
 	hasInput: Boolean,
+	canScanMeshSplits: Boolean = hasInput,
 	folders: List<MenuFolder> = emptyList(),
 	currentLanguage: AppLanguage,
 	darkTheme: Boolean = true,
@@ -173,6 +180,8 @@ fun AppTitleBar(
     onSaveProjectAs: () -> Unit,
     projectTitle: String,
 	onReanalyze: () -> Unit,
+	/** Model > Reload PSD: refreshes the linked PSD's images, keeping the rig. */
+	onReloadPsd: () -> Unit = {},
 	onReexportPsd: () -> Unit,
 	onOpenFolder: (String) -> Unit = {},
 	onShowExport: () -> Unit,
@@ -249,6 +258,8 @@ fun AppTitleBar(
 	// With the native frame, the system draws the window buttons and owns the bar's empty middle (drag, double-click,
 	// Snap); the bar tells it its height and leaves room for the buttons it reports.
 	val nativeTitleBar = LocalNativeTitleBar.current
+	val systemTitleBar = window?.isUndecorated == false && NativeTitleBar.useSystemTitleBar(transparent = false)
+	val currentWindowMode by rememberUpdatedState(windowMode)
 	val density = LocalDensity.current
 	var nativeInsets by remember(nativeTitleBar) { mutableStateOf(0.dp to 0.dp) }
 	// The runtime lays its buttons out after a height or size change, so their room is read once that has run.
@@ -381,7 +392,7 @@ fun AppTitleBar(
 									icon = { tint ->
 										when (file.kind) {
 											RecentFileKind.PROJECT -> IconFolder(Modifier.size(14.dp), tint)
-											RecentFileKind.PSD -> GridIcon(Modifier.size(14.dp), tint) { document() }
+											RecentFileKind.PSD -> IconPsd(Modifier.size(14.dp), tint)
 										}
 									},
 									onClick = { activeMenu = null; activeSubmenu = null; onOpenRecent(file.path) },
@@ -685,6 +696,13 @@ fun AppTitleBar(
 						onClick = { activeMenu = null; activeSubmenu = null; onReanalyze() },
 					)
 					AppMenuItem(
+						text = tr("menu.file.reloadPsd"),
+						shortcut = keymap.labelFor(ShortcutAction.RELOAD_PSD),
+						enabled = hasInput && !isBusy,
+						onHover = { activeSubmenu = null },
+						onClick = { activeMenu = null; activeSubmenu = null; onReloadPsd() },
+					)
+					AppMenuItem(
 						text = tr("cmo3.replace"),
 						enabled = !isBusy,
 						onHover = { activeSubmenu = null },
@@ -695,7 +713,7 @@ fun AppTitleBar(
 
 					AppMenuItem(
 						text = tr("menu.tools.meshSplit"),
-						enabled = hasInput && !isBusy,
+						enabled = canScanMeshSplits && !isBusy,
 						onHover = { activeSubmenu = null },
 						onClick = { activeMenu = null; activeSubmenu = null; onMeshSplitScan() },
 					)
@@ -796,7 +814,7 @@ fun AppTitleBar(
 						macSlotWidth = it.size.width
 					}
 				}
-				.then(if (nativeTitleBar != null) Modifier.titleBarHitTest(nativeTitleBar, client = false) else Modifier
+				.then(if (systemTitleBar) Modifier else if (nativeTitleBar != null) Modifier.titleBarHitTest(nativeTitleBar, client = false) else Modifier
 				.pointerInput(window) {
 					detectTapGestures(onDoubleTap = { AppSettings.toggleMaximized() })
 				}
@@ -812,12 +830,13 @@ fun AppTitleBar(
 							val initMouse = initialMouseLocation
 							var initWin = initialWindowLocation
 							// A full-screen window stays put; a maximized one comes off the edge under the pointer.
-							if (mouse != null && initMouse != null && initWin != null && window != null && windowMode != WindowMode.FULLSCREEN) {
-								if (windowMode == WindowMode.MAXIMIZED) {
+							if (mouse != null && initMouse != null && initWin != null && window != null && currentWindowMode != WindowMode.FULLSCREEN) {
+								if (currentWindowMode == WindowMode.MAXIMIZED) {
 									if (mouse.distance(initMouse) < 4.0) return@detectDragGestures
 									initWin = MainWindowModes.restoreForDrag(window, mouse)
 									initialWindowLocation = initWin
 									initialMouseLocation = mouse
+									return@detectDragGestures
 								}
 								window.setLocation(
 									initWin.x + (mouse.x - initMouse.x),
@@ -909,7 +928,7 @@ fun AppTitleBar(
 
 			Spacer(modifier = Modifier.width(4.dp))
 
-			if (nativeTitleBar != null || (io.github.psd2live.ui.utils.MacShell.active && window?.isUndecorated == false)) {
+			if (systemTitleBar || nativeTitleBar != null || (io.github.psd2live.ui.utils.MacShell.active && window?.isUndecorated == false)) {
 				Spacer(Modifier.width(nativeInsets.second))
 				return@Row
 			}
@@ -1046,6 +1065,7 @@ private fun AppSeamlessDropdownMenu(
     visibility.targetState = expanded
     if (!visibility.currentState && !visibility.targetState) return
     val density = LocalDensity.current
+    var anchorWidthPx by remember { mutableStateOf(0) }
     val gapPx = with(density) { 2.dp.roundToPx() }
     val shiftPx = with(density) { (MenuRowInset - MenuTitleInset).roundToPx() }
     val positionProvider = remember(tutorialOverlay != null, gapPx, shiftPx, alignEnd) {
@@ -1055,13 +1075,17 @@ private fun AppSeamlessDropdownMenu(
                 windowSize: androidx.compose.ui.unit.IntSize,
                 layoutDirection: androidx.compose.ui.unit.LayoutDirection,
                 popupContentSize: androidx.compose.ui.unit.IntSize,
-            ): IntOffset = if (tutorialOverlay != null) IntOffset.Zero
+            ): IntOffset {
+                if (anchorWidthPx != anchorBounds.width) anchorWidthPx = anchorBounds.width
+                return if (tutorialOverlay != null) IntOffset.Zero
                 else IntOffset(
                     if (alignEnd) anchorBounds.right - popupContentSize.width else (anchorBounds.left - shiftPx).coerceAtLeast(0),
                     anchorBounds.bottom + gapPx,
                 )
+            }
         }
     }
+    val minInnerWidth = with(density) { (anchorWidthPx - 8.dp.roundToPx()).coerceAtLeast(0).toDp() }
     Popup(
         popupPositionProvider = positionProvider,
         onDismissRequest = onDismissRequest,
@@ -1075,7 +1099,10 @@ private fun AppSeamlessDropdownMenu(
                     .padding(4.dp),
             ) {
                 MenuGlide {
-                    Column(modifier.width(IntrinsicSize.Max), verticalArrangement = Arrangement.spacedBy(1.dp)) { content() }
+                    Column(
+                        modifier.width(IntrinsicSize.Max).defaultMinSize(minWidth = minInnerWidth),
+                        verticalArrangement = Arrangement.spacedBy(1.dp),
+                    ) { content() }
                 }
             }
             // Draw after the menu, in the same popup. No cross-popup z-order or coordinate conversion.
@@ -1103,6 +1130,7 @@ fun AppDropdownMenu(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	val density = LocalDensity.current
+	var anchorWidthPx by remember { mutableStateOf(0) }
 	val gapPx = with(density) { 2.dp.roundToPx() }
 	val shiftX = with(density) { offset.x.roundToPx() }
 	val shiftY = with(density) { offset.y.roundToPx() }
@@ -1114,6 +1142,7 @@ fun AppDropdownMenu(
 				layoutDirection: androidx.compose.ui.unit.LayoutDirection,
 				popupContentSize: androidx.compose.ui.unit.IntSize,
 			): IntOffset {
+				if (anchorWidthPx != anchorBounds.width) anchorWidthPx = anchorBounds.width
 				val x = (anchorBounds.left + shiftX).coerceAtMost(windowSize.width - popupContentSize.width).coerceAtLeast(0)
 				val below = anchorBounds.bottom + gapPx + shiftY
 				val y = if (below + popupContentSize.height <= windowSize.height) below
@@ -1122,6 +1151,7 @@ fun AppDropdownMenu(
 			}
 		}
 	}
+	val minInnerWidth = with(density) { (anchorWidthPx - 8.dp.roundToPx()).coerceAtLeast(0).toDp() }
 	Popup(
 		popupPositionProvider = positionProvider,
 		onDismissRequest = onDismissRequest,
@@ -1139,7 +1169,11 @@ fun AppDropdownMenu(
 					.padding(4.dp),
 			) {
 				MenuGlide {
-					Column(modifier.width(IntrinsicSize.Max), verticalArrangement = Arrangement.spacedBy(1.dp), content = content)
+					Column(
+						modifier.width(IntrinsicSize.Max).defaultMinSize(minWidth = minInnerWidth),
+						verticalArrangement = Arrangement.spacedBy(1.dp),
+						content = content,
+					)
 				}
 			}
 		}
@@ -1178,6 +1212,7 @@ fun AppMenuItem(
 	isChecked: Boolean? = null,
 	enabled: Boolean = true,
 	highlighted: Boolean = false,
+	description: String? = null,
 	icon: (@Composable (tint: Color) -> Unit)? = null,
 	indentCheckSpace: Boolean = false,
 	/**
@@ -1204,7 +1239,7 @@ fun AppMenuItem(
 		highlighted -> colors.controlHover.copy(alpha = 0.5f)
 		isHovered && !glide -> colors.controlHover.copy(alpha = 0.75f)
 		else -> Color.Transparent
-	}, tween(Motion.Instant))
+	}, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f))
 	val contentColor = if (enabled) colors.textPrimary else colors.textDisabled
 
 	Row(
@@ -1220,12 +1255,12 @@ fun AppMenuItem(
 			.clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
 			.padding(horizontal = 8.dp),
 		verticalAlignment = Alignment.CenterVertically,
-		horizontalArrangement = Arrangement.SpaceBetween,
 	) {
+		MenuItemSideTip(description, isHovered && enabled)
 		Row(
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.spacedBy(6.dp),
-			modifier = Modifier.weight(1f, fill = false),
+			modifier = Modifier.weight(1f),
 		) {
 			if (isChild) {
 				Canvas(
@@ -1533,11 +1568,7 @@ private fun TitleBarLanguageButton(
 		) {
 			IconLanguage(
 				modifier = Modifier.size(14.dp),
-				tint = when {
-					expanded -> colors.selectionText
-					isHovered -> colors.textPrimary
-					else -> colors.textMuted
-				},
+				tint = if (expanded) colors.selectionText else colors.textPrimary.copy(alpha = if (isHovered) 1f else 0.85f),
 			)
 			AppSeamlessDropdownMenu(
 				expanded = expanded,
@@ -1707,8 +1738,7 @@ private fun TitleBarSettingsButton(shown: Boolean, onClick: () -> Unit) {
 				.clickable(onClick = onClick),
 			contentAlignment = Alignment.Center,
 		) {
-			PageIcon(
-				AppPage.SETTINGS,
+			SettingsIcon(
 				tint = if (shown) colors.selectionText else colors.textPrimary.copy(alpha = if (isHovered) 1f else 0.85f),
 				modifier = Modifier.size(14.dp),
 			)

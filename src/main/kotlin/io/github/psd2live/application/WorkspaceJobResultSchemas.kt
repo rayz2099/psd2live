@@ -35,11 +35,14 @@ internal object WorkspaceJobResultSchemas {
 
     private val results = linkedMapOf(
         "project_import_psd" to source, "project_create_artwork" to source, "project_import_cmo3" to lifecycle, "project_import_layout" to lifecycle,
+        "project_reload_psd" to lifecycle,
         "project_open" to lifecycle, "project_save" to lifecycle, "project_save_as" to lifecycle,
         "project_export_model" to modelExport, "project_export_target" to targetExport, "project_export_psd" to psdExport, "workspace_apply_edits" to batch,
         "workspace_preview_edits" to WorkspaceGeometrySafetySchemas.preview,
         "workspace_preview_regeneration" to regenerationPreview,
     ).apply {
+        for (id in WorkspacePluginSchemas.jobs) put(id, WorkspacePluginSchemas.result)
+        for (id in WorkspacePluginDevSchemas.jobs) put(id, WorkspacePluginDevSchemas.result(id))
         for (id in WorkspaceModifierEdits.supported) put(id, batch)
         for (id in WorkspaceIntentOperations.batches + WorkspaceLayoutOperations.batches) put(id, batch)
         put(WorkspaceLayoutOperations.EXPORT_PSD, psdExport)

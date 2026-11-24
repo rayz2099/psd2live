@@ -15,8 +15,6 @@
 [![Cubism](https://img.shields.io/badge/Cubism-3.0%20%E2%80%93%205.3-ff6b9d)](#导出与播放)
 [![MCP](https://img.shields.io/badge/MCP-180%2B%20ops-8a63d2)](#连接-agentmcp)
 
-[English](docs/en/README.md) · [日本語](docs/ja/README.md) · [한국어](docs/ko/README.md)
-
 [下载](https://github.com/tsunehimatoi/psd2live/releases/latest) · [快速开始](#快速开始) · [文档](docs/README.md) · [更新日志](docs/zh/CHANGELOG.md) · [路线图](docs/zh/ROADMAP.md)
 
 </div>
@@ -150,7 +148,7 @@ PSD2Live 不依赖 Cubism Editor 或 SDK 运行，但与 Cubism 格式保持兼�
 
 ## 快速开始
 
-1. **导入 PSD**：**文件 → 新建 → 从 PSD 新建工程…**（`Ctrl+Shift+O`），或把 PSD 拖进窗口。导入前在「开始」页的「从 PSD 生成」中选好模型预设（右侧属性面板可逐项调整）（最小 / 默认 / 完整），导入后自动生成并进入编辑；画在同一层的左右部件（如左右腿）用「模型 → 按网格拆分图层…」拆开。
+1. **导入 PSD**：**文件 → 新建 → 从 PSD 新建工程…**（`Ctrl+Shift+O`），或把 PSD 拖进窗口。导入前在「开始」页的「从 PSD 生成」中选好模型预设（右侧属性面板可逐项调整）（最小 / 默认 / 完整），导入后自动生成并进入编辑；画在同一层的左右部件（如左右腿）用「模型 → 检查全模型的独立网格…」拆开。
 2. **核对识别结果**：在「图层」表格中检查每层的部件类型、侧别与差分设置，识别错的直接改。
 3. **预览与修改**：切到「预览」工作区检查动作和物理，再按需进入编辑、绑定、动画、物理、纹理工作区。
 4. **保存与导出**：`Ctrl+S` 保存 `.psd2live` 工程；`Ctrl+G` 导出 `.moc3` / `.cmo3`，其他格式在 **文件 → 导出为** 中。
@@ -184,7 +182,7 @@ PSD2Live 不依赖 Cubism Editor 或 SDK 运行，但与 Cubism 格式保持兼�
 `Ctrl+G` 导出 Cubism 格式，目标版本可选 3.0 – 5.3（默认 5.0）；其余在 **文件 → 导出为** 中。详见[导出目标](docs/zh/spec/EXPORT_TARGETS.md)。
 
 > [!IMPORTANT]
-> 继续工作请保存 `.psd2live` 工程，它包含原始 PSD、素材、设置、全部编辑与历史分支；导出时附带的 `.psd2live.json` 只是诊断报告。导出成功也不等于在所有运行时中效果一致，正式交付前请在目标编辑器和运行环境中检查，支持范围见[运行时与导出边界](docs/zh/spec/RUNTIME_EXPORT_ARCHITECTURE_AND_GAPS.md)。
+> 继续工作请保存 `.psd2live` 工程，它包含原始 PSD、素材、设置、全部编辑与历史分支；导出时附带的 `.psd2live.json` 只是诊断报告。导出成功也不等于在所有运行时中效果一致，正式交付前请在目标编辑器和运行环境中检查，支持范围见[导出目标](docs/zh/spec/EXPORT_TARGETS.md)。
 
 内置渲染无需任何官方 SDK；[Cubism Native 预览](docs/zh/guide/CUBISM_SDK_SETUP.md)是可选项，用于对照官方运行时的渲染与物理。
 
@@ -215,7 +213,7 @@ PSD2Live 不依赖 Cubism Editor 或 SDK 运行，但与 Cubism 格式保持兼�
 ## 连接 Agent（MCP）
 
 1. MCP 服务默认开启，随 PSD2Live 启动监听 `http://127.0.0.1:23871/mcp`。打开 **设置 → MCP**（标题栏右侧的齿轮）可关闭它，或设置端口、访问令牌和发布的工具集（默认精简）。访问令牌以明文保存在本机用户偏好（Java Preferences）中。
-2. 复制与你的宿主对应的命令或配置（Claude Code、Codex、通用 JSON）。只支持 Stdio 的宿主使用仓库根目录的 [`mcp_proxy.py`](mcp_proxy.py)。
+2. 复制与你的宿主对应的命令或配置（Claude Code、Codex、通用 JSON）。只支持 Stdio 的宿主使用 [`tools/mcp_proxy.py`](tools/mcp_proxy.py)。
 3. 让 Agent 先用 `workspace_overview` 读取工程概况、`workspace_inspect` 查看单个对象；未列为工具的操作用 `workspace_list_operations` 查找、经 `workspace_call` 调用。
 
 多项编辑可用 `workspace_apply_edits` 原子提交（全部成功或全部不生效），也可先用 `workspace_preview_edits` 试运行。接口说明见 [MCP 使用与接口](docs/zh/agent/MCP_AUTHORING.md)。已有显式栈的工程可参阅[修改器栈指南](docs/zh/guide/MODIFIERS.md)，其中说明当前入口和仍待完成的部分。
@@ -253,7 +251,7 @@ python tools/examples/fetch.py --case tml
 | [画布编辑](docs/zh/guide/CANVAS_EDITOR.md) | [摇摆生成](docs/zh/guide/SWING.md) | [变形器与参数](docs/zh/spec/DEFORMER_AND_PARAMETER_SPEC.md) |
 | [前后分层](docs/zh/guide/DEPTH_SPLIT.md) | [物理](docs/zh/guide/PHYSICS.md) | [导出目标](docs/zh/spec/EXPORT_TARGETS.md) |
 | [纹理高清化](docs/zh/guide/TEXTURE_UPSCALE.md) | [模拟与烘焙](docs/zh/guide/SIMULATION.md) | [运行时](docs/zh/spec/RUNTIME.md) |
-| [变形路径](docs/zh/guide/DEFORM_PATHS.md) | [模拟图文教程](docs/zh/guide/SIMULATION_TUTORIAL.md) | [运行时与导出边界](docs/zh/spec/RUNTIME_EXPORT_ARCHITECTURE_AND_GAPS.md) |
+| [变形路径](docs/zh/guide/DEFORM_PATHS.md) | [模拟图文教程](docs/zh/guide/SIMULATION_TUTORIAL.md) | [Rig 预设架构](docs/zh/spec/RIG_PRESETS.md) |
 | [开发与命令行](docs/zh/guide/DEVELOPMENT.md) | [MCP 使用与接口](docs/zh/agent/MCP_AUTHORING.md) | [工程格式](docs/zh/spec/PROJECT_FORMAT.md) · [文档层](docs/zh/spec/DOCUMENT_LAYER.md) |
 
 全部文档见[文档目录](docs/README.md)，示例素材、工程、制作案例、Prompt 与 Skill 见[示例仓库](https://github.com/tsunehimatoi/psd2live-examples)，后续方向见[路线图](docs/zh/ROADMAP.md)。

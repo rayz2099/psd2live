@@ -30,7 +30,7 @@ class EditorAndAgentScenario {
 
 	private fun editor(body: suspend Editor.() -> Unit) = runBlocking {
 		PSD2LiveViewModel().use { vm ->
-			vm.setStateForTest(vm.state.value.copy(atlasSize = 512, exportMoc3 = false, generatePhysics = false))
+			vm.setStateForTest(vm.state.value.copy(atlasSize = 256, exportMoc3 = false, generatePhysics = false))
 			DesktopWorkspace(vm, temp.resolve("store")).use { workspace ->
 				vm.attachWorkspace(workspace)
 				WorkspaceOperations(workspace).use { operations ->
@@ -81,10 +81,10 @@ class EditorAndAgentScenario {
 		assertEquals(workspace.snapshot().historyHeadNodeId, state.historySnapshot?.headNodeId, "[$step] the editor shows another history head")
 	}
 
-	private fun Editor.state(): String = workspace.snapshot().state!!
+	private fun Editor.state(): String = workspace.snapshot().state
 
 	@Test fun backgroundPaintEditsQueueAndEndWithTheSession() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
 		consistent("imported")
 		withContext(Dispatchers.Main) {
 			val layers = vm.state.value.previewModel!!.analysis.source.layers
@@ -184,7 +184,7 @@ class EditorAndAgentScenario {
 	}
 
 	@Test fun theDeformMenuCopiesPastesInterpolatesAndResetsAKeyform() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
 		consistent("imported")
 		val angle = ParameterId("ParamAngleX")
 		val parameters = vm.state.value.previewModel!!.rig.puppet.parameters
@@ -363,6 +363,65 @@ class EditorAndAgentScenario {
 		}
 	}
 
+	@Test fun theVertexAndBezierLevelsCanBeOnTogether() = editor {
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
+		consistent("imported")
+		val warp = vm.state.value.previewModel!!.rig.puppet.deformers.filterIsInstance<org.umamo.runtime.model.Deformer.Warp>().first { it.rows >= 3 && it.columns >= 3 }
+		val canvas = withContext(Dispatchers.Main) {
+			vm.selectDeformer(warp.id.raw)
+			io.github.psd2live.ui.CanvasEditor(vm, vm.state.value.activeWorkspace.id, "bezier-test").also {
+				it.hierarchyMode = io.github.psd2live.ui.EditHierarchyMode.DEFORM
+				it.setEditLevel(2)
+				it.activateTool(io.github.psd2live.ui.CanvasTool.SELECT)
+			}
+		}
+		settle()
+		val puppet = vm.state.value.previewModel!!.rig.puppet
+		val viewport = io.github.psd2live.core.CanvasViewport(4.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+		fun points() = canvas.target()!!.let { canvas.screen(it.geometry.points, it, viewport) }
+		// A lattice point clear of every anchor and handle, and a handle's place on screen.
+		val (point, handle) = withContext(Dispatchers.Main) {
+			canvas.ensureBezierState()
+			val t = canvas.target()!!
+			val state = assertNotNull(canvas.bezierState)
+			val controls = (state.anchors.values.map { it.x to it.y } + state.handles.values.map { it.x to it.y })
+				.map { (x, y) -> canvas.screen(floatArrayOf(x, y), t, viewport)[0] }
+			val shown = points()
+			val (key, h) = state.handles.entries.first()
+			shown.indices.first { i -> controls.all { (it - shown[i]).getDistance() > 20f } } to (key to canvas.screen(floatArrayOf(h.x, h.y), t, viewport)[0])
+		}
+
+		// Bezier alone, as before: the lattice points are not picked, and the last level on stays on.
+		withContext(Dispatchers.Main) {
+			canvas.move(points()[point], viewport, shift = false)
+			assertNull(canvas.hoveredVertex, "a lattice point was picked with only the Bezier level on")
+			canvas.toggleEditLevel(2)
+			assertEquals(setOf(2), canvas.editLevels, "the last level on must stay on")
+		}
+
+		// Both on: a lattice point and a Bezier handle are both picked.
+		withContext(Dispatchers.Main) {
+			canvas.toggleEditLevel(1)
+			assertEquals(setOf(1, 2), canvas.editLevels)
+			canvas.move(points()[point], viewport, shift = false)
+			assertEquals(point, canvas.hoveredVertex, "the lattice point was not picked with both levels on")
+			canvas.move(handle.second, viewport, shift = false)
+			assertEquals(handle.first, canvas.hoveredBezierHandle, "the Bezier handle was not picked with both levels on")
+		}
+
+		// The lattice point drags with both on.
+		val before = points()[point]
+		withContext(Dispatchers.Main) {
+			canvas.move(before, viewport, shift = false)
+			canvas.press(before, viewport, shift = false, alt = false)
+			canvas.move(before + androidx.compose.ui.geometry.Offset(30f, 0f), viewport, shift = false)
+			canvas.release()
+		}
+		consistent("dragged a lattice point with both levels on")
+		val after = points()[point]
+		assertTrue(after.x - before.x > 20f, "the lattice point did not move with both levels on: $before -> $after")
+	}
+
 	@Test fun settledPresetFieldChangesThePosedGeometryOnlyOnce() = editor {
 		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
 		consistent("imported")
@@ -395,6 +454,83 @@ class EditorAndAgentScenario {
 			consistent("unchanged field focus")
 		}
 		assertEquals(head, workspace.snapshot().historyHeadNodeId, "unchanged focus must not create edits")
+	}
+
+	@Test fun shiftKeepsALatticePointAndABezierAnchorDragStraight() = editor {
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
+		consistent("imported")
+		val warp = vm.state.value.previewModel!!.rig.puppet.deformers.filterIsInstance<org.umamo.runtime.model.Deformer.Warp>().first { it.rows >= 3 && it.columns >= 3 }
+		val canvas = withContext(Dispatchers.Main) {
+			vm.selectDeformer(warp.id.raw)
+			io.github.psd2live.ui.CanvasEditor(vm, vm.state.value.activeWorkspace.id, "shift-test").also {
+				it.hierarchyMode = io.github.psd2live.ui.EditHierarchyMode.DEFORM
+				it.setEditLevel(1)
+				it.activateTool(io.github.psd2live.ui.CanvasTool.SELECT)
+			}
+		}
+		settle()
+		val puppet = vm.state.value.previewModel!!.rig.puppet
+		val viewport = io.github.psd2live.core.CanvasViewport(4.0, 0.0, 0.0, puppet.canvasWidth, puppet.canvasHeight)
+		fun points() = canvas.target()!!.let { canvas.screen(it.geometry.points, it, viewport) }
+		val drag = androidx.compose.ui.geometry.Offset(30f, 9f)
+
+		// An inner lattice point at the vertex level, clear of the corner badges.
+		val point = warp.columns + 2
+		val before = points()[point]
+		withContext(Dispatchers.Main) {
+			canvas.move(before, viewport, shift = false)
+			canvas.press(before, viewport, shift = false, alt = false)
+			canvas.move(before + drag, viewport, shift = true)
+			canvas.release()
+		}
+		consistent("dragged a lattice point with Shift")
+		val after = points()[point]
+		assertTrue(after.x - before.x > 20f, "the lattice point did not move: $before -> $after")
+		assertEquals(before.y, after.y, 0.5f, "Shift must keep the drag horizontal")
+
+		// A Bezier anchor at the Bezier level.
+		val (anchorKey, anchorBefore) = withContext(Dispatchers.Main) {
+			canvas.setEditLevel(2)
+			canvas.ensureBezierState()
+			val t = canvas.target()!!
+			val (key, anchor) = canvas.bezierState!!.anchors.entries.first()
+			val at = canvas.screen(floatArrayOf(anchor.x, anchor.y), t, viewport)[0]
+			canvas.move(at, viewport, shift = false)
+			canvas.press(at, viewport, shift = false, alt = false)
+			canvas.move(at + drag, viewport, shift = true)
+			canvas.release()
+			key to at
+		}
+		consistent("dragged an anchor with Shift")
+		val anchorAfter = withContext(Dispatchers.Main) {
+			canvas.ensureBezierState()
+			val a = canvas.bezierState!!.anchors.getValue(anchorKey)
+			canvas.screen(floatArrayOf(a.x, a.y), canvas.target()!!, viewport)[0]
+		}
+		assertTrue(anchorAfter.x - anchorBefore.x > 20f, "the anchor did not move: $anchorBefore -> $anchorAfter")
+		assertEquals(anchorBefore.y, anchorAfter.y, 0.5f, "Shift must keep the anchor drag horizontal")
+
+		val (handleKey, handleBefore) = withContext(Dispatchers.Main) {
+			canvas.ensureBezierState()
+			val t = canvas.target()!!
+			val state = canvas.bezierState!!
+			val (key, handle) = state.handles.entries.first()
+			val at = canvas.screen(floatArrayOf(handle.x, handle.y), t, viewport)[0]
+			val grab = at + androidx.compose.ui.geometry.Offset(0f, 3f)
+			canvas.move(grab, viewport, shift = false)
+			assertEquals(key, canvas.hoveredBezierHandle)
+			canvas.press(grab, viewport, shift = false, alt = false)
+			canvas.move(grab + drag, viewport, shift = true)
+			canvas.release()
+			key to at
+		}
+		consistent("dragged a handle with Shift")
+		val handleAfter = withContext(Dispatchers.Main) {
+			canvas.ensureBezierState()
+			val handle = canvas.bezierState!!.handles.getValue(handleKey)
+			canvas.screen(floatArrayOf(handle.x, handle.y), canvas.target()!!, viewport)[0]
+		}
+		assertEquals(handleBefore.y, handleAfter.y, 0.5f, "Shift must keep the handle drag horizontal")
 	}
 
 	@Test fun queuedPresetFieldsKeepGeneratedCheckpointsAndSave() = editor {
@@ -488,7 +624,7 @@ class EditorAndAgentScenario {
 	}
 
 	@Test fun theUsersGesturesLeaveTheEditorShowingTheCommittedDocument() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
 		consistent("imported")
 		val root = workspace.snapshot().historyHeadNodeId!!
 		vm.setFeatureDisplacementEnabled(true)
@@ -527,8 +663,29 @@ class EditorAndAgentScenario {
 		assertEquals(20f, vm.state.value.parameterValues[ParameterId("ParamAngleX")], "the slider jumped back")
 	}
 
+	@Test fun undoAndRedoKeepThePoseTheUserSet() = editor {
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
+		consistent("imported")
+		val angle = ParameterId("ParamAngleX")
+		vm.setParameterValue(angle, -10f)
+		consistent("posed")
+		val before = workspace.snapshot().historyHeadNodeId
+		vm.setFeatureDisplacementEnabled(true)
+		consistent("edited at the pose")
+		val edited = workspace.snapshot().historyHeadNodeId
+		assertNotEquals(before, edited, "the edit made no history node")
+		withContext(Dispatchers.Main) { vm.undoHistory() }
+		consistent("undo")
+		assertEquals(before, workspace.snapshot().historyHeadNodeId)
+		assertEquals(-10f, vm.state.value.parameterValues[angle], "undo moved the slider")
+		withContext(Dispatchers.Main) { vm.redoHistory() }
+		consistent("redo")
+		assertEquals(edited, workspace.snapshot().historyHeadNodeId)
+		assertEquals(-10f, vm.state.value.parameterValues[angle], "redo moved the slider")
+	}
+
 	@Test fun anAgentEditDuringAnOpenFieldLandsAndTheFieldCommitsOverIt() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
 		consistent("imported")
 		fun setting(key: String) = workspace.captureQueries().projectSettings().getValue(key).jsonPrimitive.int
 		val nodes = workspace.history().nodes.size
@@ -556,7 +713,7 @@ class EditorAndAgentScenario {
 	}
 
 	@Test fun savingRecordsTheRuntimeAndNotTheEditorsCopy() = editor {
-		workspace.importPsd(Characters.figurePsd(temp).toString(), true)
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
 		consistent("imported")
 		val nodes = workspace.history().nodes.size
 		val padding = workspace.captureQueries().projectSettings().getValue("texturePadding").jsonPrimitive.int
@@ -570,6 +727,27 @@ class EditorAndAgentScenario {
 		workspace.open(archive)
 		consistent("reopened")
 		assertEquals(padding, vm.state.value.texturePadding, "the archive holds the editor's copy")
+	}
+
+	/** A split whose pieces the user deletes leaves the canvas's visible set, so a View that follows the canvas still renders. */
+	@Test fun aViewFollowingTheCanvasRendersAfterALayerIsDeleted() = editor {
+		workspace.importPsd(Characters.headPsd(temp).toString(), true)
+		consistent("imported")
+		val source = vm.state.value.previewModel!!.analysis.source
+		val layer = source.layers.first().id.raw
+		val (w, h) = source.widthPx to source.heightPx
+		// The pieces of a split, deleted one by one, as a user takes a split back.
+		call("source_split_polygon", req("state" to state(), "layer_id" to layer, "names" to listOf("Left", "Right"),
+			"piece_ids" to listOf("piece_l", "piece_r"), "polygon" to listOf(listOf(0, 0), listOf(w / 2, 0), listOf(w / 2, h), listOf(0, h)))).data()
+		consistent("split")
+		for (piece in listOf("piece_l", "piece_r")) {
+			call("layer_delete", req("state" to state(), "layer_id" to piece)).data()
+			consistent("deleted $piece")
+		}
+		val gone = setOf(layer, "piece_l", "piece_r")
+		assertTrue((vm.state.value.effectiveVisibleLayerIds intersect gone).isEmpty(), "the canvas still shows ${vm.state.value.effectiveVisibleLayerIds intersect gone}")
+		val view = call("view_render_model", req("viewport" to mapOf("mode" to "canvas_rect", "left" to 0, "top" to 0, "width" to 64, "height" to 64)))
+		assertTrue((view.data().getValue("includedLayerIds").jsonArray.map { it.jsonPrimitive.content } intersect gone).isEmpty(), "rendered a deleted layer: $view")
 	}
 
 }

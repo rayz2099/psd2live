@@ -35,11 +35,11 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /** The reference image as a view draws it: its pixels over [rect] on the canvas, turned [rotation] degrees about its centre. */
-class ViewReferenceImage(val image: BufferedImage, val rect: io.github.psd2live.project.LayerCanvasRect,
+class ViewReferenceImage(val image: BufferedImage, val rect: io.github.psd2live.document.LayerCanvasRect,
                                   val mode: io.github.psd2live.project.WorkspaceViewReferenceMode, val opacity: Float, val rotation: Float = 0f)
 
 /** A material item a view outlines: its pixels over [rect] on the canvas. */
-class ViewOutline(val id: String, val image: BufferedImage, val rect: io.github.psd2live.project.LayerCanvasRect)
+class ViewOutline(val id: String, val image: BufferedImage, val rect: io.github.psd2live.document.LayerCanvasRect)
 
 object WorkspaceViewRenderer {
 	private val OUTLINE_COLORS = listOf(Color(0x00, 0xE5, 0xFF), Color(0xFF, 0x3D, 0xC8), Color(0xFF, 0xD6, 0x00), Color(0x64, 0xFF, 0x5A),

@@ -68,11 +68,11 @@ class RigModulesScenario {
 		fun drawable(layer: String) = puppet.drawables.single { it.id.raw == mesh(layer) }
 		fun keys(layer: String) = drawable(layer).geometryGrid!!.axes.single { it.parameterId == StandardParameters.EYE_L_OPEN }.keys.toList()
 		fun swap(layer: String) = drawable(layer).channelGrids[org.umamo.runtime.model.FormChannel.OPACITY]?.axes?.single()?.keys?.toList()
-		val fitted = listOf(0f, io.github.psd2live.core.fit.EyeRig.SWAP)
+		val fitted = listOf(0f, io.github.psd2live.algorithms.binding.EyeRig.SWAP)
 		fun isFitted(label: String) = expect(label, keys("lash_l").take(2) == fitted && keys("lash_l").takeLast(3) == listOf(1f, 1.5f, 2f) && keys("white_l") == keys("lash_l") &&
 			puppet.parameters.single { it.id == StandardParameters.EYE_L_OPEN }.max == 2f &&
 			rides(puppet, mesh("lash_l"), "ParamEyeBallY") && puppet.parameters.any { it.id.raw == "ParamEyeLSmile" } &&
-			swap("lash_l") == listOf(0f, io.github.psd2live.core.fit.EyeRig.SWAP, 1f, 2f) && swap("close_l") == listOf(0f, io.github.psd2live.core.fit.EyeRig.SWAP, 1f, 2f)) {
+			swap("lash_l") == listOf(0f, io.github.psd2live.algorithms.binding.EyeRig.SWAP, 1f, 2f) && swap("close_l") == listOf(0f, io.github.psd2live.algorithms.binding.EyeRig.SWAP, 1f, 2f)) {
 			"the fitted eye keys its lids at closed, the swap to the drawn closed line, the crease and on: ${keys("lash_l")} / ${keys("white_l")}, " +
 				"swaps ${swap("lash_l")} / ${swap("close_l")}" }
 		isFitted("new project")
@@ -123,8 +123,8 @@ class RigModulesScenario {
 		allow("REGENERATION_CONFLICT")
 		fun drawable(layer: String) = puppet.drawables.single { it.id.raw == mesh(layer) }
 		fun axes(layer: String) = drawable(layer).geometryGrid!!.axes.map { it.parameterId.raw to it.keys.toList() }
-		fun isFitted(label: String) = expect(label, axes("mouth") == listOf("ParamMouthForm" to io.github.psd2live.core.fit.MouthRig.FORM_KEYS.toList(),
-			"ParamMouthOpenY" to io.github.psd2live.core.fit.MouthRig.OPEN_KEYS.toList(), "ParamMouthPressLipOpen" to io.github.psd2live.core.fit.MouthRig.PRESS_KEYS.toList()) &&
+		fun isFitted(label: String) = expect(label, axes("mouth") == listOf("ParamMouthForm" to io.github.psd2live.algorithms.binding.MouthRig.FORM_KEYS.toList(),
+			"ParamMouthOpenY" to io.github.psd2live.algorithms.binding.MouthRig.OPEN_KEYS.toList(), "ParamMouthPressLipOpen" to io.github.psd2live.algorithms.binding.MouthRig.PRESS_KEYS.toList()) &&
 			drawable("mouth").blendShapes.map { it.parameterId.raw }.containsAll(listOf("ParamA", "ParamO", "ParamMouthX")) &&
 			rides(puppet, mesh("face"), "ParamMouthOpenY") && puppet.parameters.any { it.id.raw == "ParamCheekPuff" }) {
 			"the fitted mouth keys its form by its staged opening and the lips pressed or parted, with vowels and the jaw: ${axes("mouth")}" }

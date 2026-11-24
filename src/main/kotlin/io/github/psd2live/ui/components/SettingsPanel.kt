@@ -59,6 +59,7 @@ import io.github.psd2live.ui.state.PSD2LiveState
 import io.github.psd2live.ui.state.PSD2LiveViewModel
 import io.github.psd2live.ui.state.SettingsTopic
 import io.github.psd2live.ui.state.WindowMode
+import io.github.psd2live.ui.state.WorkspaceTabLayout
 import io.github.psd2live.ui.views.PageBody
 import io.github.psd2live.ui.views.PageNavItem
 import io.github.psd2live.ui.views.PageNavList
@@ -81,9 +82,7 @@ import kotlin.math.roundToInt
 import io.github.psd2live.ui.theme.handCursor
 
 /**
- * One panel of the settings page: [module] picks the section, as the page's dock arranges them. Every option applies
- * at once; there is no draft state, since [AppSettings.uiScale] falls back to the detected display scale when the user
- * has never set one and so has no previous value a Cancel could restore.
+ * One topic of the docked settings page.
  *
  * The language comes from the state rather than [I18n]: `tr()` reads a plain field, so without a changed parameter
  * Compose would skip the recomposition and keep showing the old language after a switch made in this very panel.
@@ -131,6 +130,7 @@ internal fun SettingsPanel(topic: SettingsTopic, state: PSD2LiveState, viewModel
 			)
 			SettingsTopic.FILES -> SettingsFilesSection(state, viewModel)
 			SettingsTopic.MCP -> SettingsMcpSection()
+            SettingsTopic.PLUGINS -> SettingsPluginsSection()
 		}
 	} }
 }
@@ -143,7 +143,76 @@ internal fun SettingsNav(selected: SettingsTopic, onSelect: (SettingsTopic) -> U
 		onStep = { step -> onSelect(topics[(topics.indexOf(selected) + step).mod(topics.size)]) },
 		footer = { CompactButton(text = tr("dialog.settings.resetDefaults"), onClick = onResetAll, height = 22.dp, modifier = Modifier.fillMaxWidth()) },
 	) {
-		topics.forEach { topic -> PageNavItem(tr(topic.labelKey), topic == selected, onClick = { onSelect(topic) }) }
+		topics.forEach { topic ->
+			PageNavItem(
+				label = tr(topic.labelKey),
+				selected = topic == selected,
+				onClick = { onSelect(topic) },
+			) { tint -> SettingsTopicIcon(topic, tint) }
+		}
+	}
+}
+
+@Composable
+private fun SettingsTopicIcon(topic: SettingsTopic, tint: Color) {
+	GridIcon(Modifier.size(13.dp), tint) {
+		when (topic) {
+			SettingsTopic.SCALE -> {
+				panel(2.2f, 3.4f, 13.6f, 11.2f, 1.4f)
+				line(5.2f, 11.6f, 12.8f, 6.4f, ICON_FINE)
+				chevron(12.8f, 6.4f, 1f, -0.7f, 2.2f, ICON_FINE)
+			}
+			SettingsTopic.THEME -> {
+				shape(circlePath(9f, 9f, 6.4f))
+				fill(path { m(9f, 2.6f); c(12.5f, 2.6f, 15.4f, 5.5f, 15.4f, 9f); c(15.4f, 12.5f, 12.5f, 15.4f, 9f, 15.4f); z() },
+					color.copy(alpha = color.alpha * 0.45f))
+			}
+			SettingsTopic.LANGUAGE -> {
+				// "文 / A" translation glyph: "文" at top-left, "A" at bottom-right.
+				line(5.4f, 1.8f, 5.4f, 3.4f)
+				line(1.8f, 3.6f, 9.0f, 3.6f)
+				outline(path { m(7.4f, 3.6f); q(6.2f, 7.6f, 2.0f, 9.8f) })
+				outline(path { m(3.4f, 4.8f); q(5.4f, 7.6f, 8.8f, 9.6f) })
+				outline(path { m(9.4f, 16.0f); l(12.7f, 8.2f); l(16.0f, 16.0f) })
+				line(10.6f, 13.5f, 14.8f, 13.5f)
+			}
+			SettingsTopic.CANVAS -> {
+				panel(2.4f, 2.4f, 13.2f, 13.2f, 1.4f)
+				line(9f, 3.0f, 9f, 15.0f, ICON_FINE)
+				line(3.0f, 9f, 15.0f, 9f, ICON_FINE)
+			}
+			SettingsTopic.GRAPHICS -> {
+				panel(4.6f, 4.6f, 8.8f, 8.8f, 1.2f)
+				listOf(6.6f, 11.4f).forEach { p ->
+					line(p, 2.0f, p, 4.6f, ICON_FINE); line(p, 13.4f, p, 16.0f, ICON_FINE)
+					line(2.0f, p, 4.6f, p, ICON_FINE); line(13.4f, p, 16.0f, p, ICON_FINE)
+				}
+			}
+			SettingsTopic.PROMPTS -> {
+				shape(path {
+					m(3.6f, 3.2f); l(14.4f, 3.2f); q(15.8f, 3.2f, 15.8f, 4.6f); l(15.8f, 11.0f)
+					q(15.8f, 12.4f, 14.4f, 12.4f); l(7.8f, 12.4f); l(4.4f, 15.2f); l(4.4f, 12.4f)
+					l(3.6f, 12.4f); q(2.2f, 12.4f, 2.2f, 11.0f); l(2.2f, 4.6f); q(2.2f, 3.2f, 3.6f, 3.2f); z()
+				})
+				line(5.6f, 7.8f, 12.4f, 7.8f, ICON_FINE)
+			}
+			SettingsTopic.SHORTCUTS -> {
+				panel(2.0f, 4.2f, 14.0f, 9.6f, 1.4f)
+				listOf(5.0f, 9.0f, 13.0f).forEach { x -> dot(x, 7.2f, 0.9f) }
+				line(5.6f, 11.0f, 12.4f, 11.0f, ICON_FINE)
+			}
+			SettingsTopic.FILES -> folder()
+			SettingsTopic.MCP -> {
+				ring(5.0f, 9.0f, 2.2f); ring(13.0f, 5.0f, 2.2f); ring(13.0f, 13.0f, 2.2f)
+				line(7.0f, 8.0f, 11.0f, 6.0f, ICON_FINE)
+				line(7.0f, 10.0f, 11.0f, 12.0f, ICON_FINE)
+			}
+			SettingsTopic.PLUGINS -> {
+				panel(3.0f, 5.2f, 12.0f, 9.6f, 1.4f)
+				line(6.6f, 2.6f, 6.6f, 5.2f)
+				line(11.4f, 2.6f, 11.4f, 5.2f)
+			}
+		}
 	}
 }
 
@@ -174,14 +243,68 @@ internal fun SettingsSectionDescription(text: String) {
 	)
 }
 
-/** Interface scales offered as one click; any other is a drag of the slider away. */
-private val UiScalePresets = listOf(1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+internal val UiScalePresets = listOf(0.75f, 1f, 1.15f, 1.25f, 1.35f, 1.5f, 1.75f, 2f, 2.5f)
 
 private fun percent(scale: Float) = "${(scale * 100).roundToInt()}%"
 
+internal fun uiScaleLabel(scale: Float): String = when (scale) {
+	1f -> "${percent(scale)} (${tr("settings.scale.standard")})"
+	1.25f -> "${percent(scale)} (2K)"
+	1.5f -> "${percent(scale)} (2K/4K)"
+	1.75f, 2f -> "${percent(scale)} (4K)"
+	else -> percent(scale)
+}
+
+private val SettingsScaleChoices: List<Float?> = UiScalePresets + listOf(null)
+
+internal fun parseUiScalePercent(text: String): Float? =
+	text.trim().removeSuffix("%").trimEnd().toIntOrNull()?.takeIf { it in 75..300 }?.div(100f)
+
+@Composable
+private fun SettingsScalePicker(uiScale: Float, onUiScaleChange: (Float) -> Unit) {
+	var draft by remember(uiScale) { mutableStateOf<String?>(null) }
+	val customLabel = tr("settings.scale.custom")
+	val text = draft
+	CompactDropdown(
+		items = SettingsScaleChoices,
+		selectedItem = uiScale.takeIf { text == null && it in UiScalePresets },
+		onItemSelected = { scale ->
+			if (scale == null) {
+				draft = ((uiScale * 100).roundToInt()).toString()
+			} else {
+				draft = null
+				onUiScaleChange(scale)
+			}
+		},
+		itemLabel = { scale ->
+			when {
+				scale != null -> uiScaleLabel(scale)
+				uiScale !in UiScalePresets -> "$customLabel (${percent(uiScale)})"
+				else -> customLabel
+			}
+		},
+		modifier = Modifier.fillMaxWidth(),
+	)
+	if (text != null) {
+		val scale = parseUiScalePercent(text)
+		Spacer(Modifier.height(4.dp))
+		CompactTextField(text, { draft = it }, Modifier.fillMaxWidth(), isMono = true, selectAllOnFocus = true)
+		SettingsHint("75%–300%", indent = false)
+		Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+			CompactButton(text = tr("action.cancel"), onClick = { draft = null })
+			CompactButton(text = tr("editor.apply"), enabled = scale != null, onClick = {
+				if (scale != null) {
+					draft = null
+					onUiScaleChange(scale)
+				}
+			})
+		}
+	}
+}
+
 /**
  * Scale and display, as the inspector lays out its sections: the interface scale with its common values and the
- * display's own recommendation, the text size, and what the display reports. Everything applies as it changes.
+ * display's own recommendation, the text size, and what the display reports.
  */
 @Composable
 private fun SettingsScaleSection(
@@ -206,29 +329,7 @@ private fun SettingsScaleSection(
 
 	SettingsGroup(tr("settings.scale.group.ui")) {
 		SettingsRow(tr("settings.scale.value")) {
-			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-				CompactSlider(
-					value = uiScale,
-					onValueChange = { onUiScaleChange((it * 100).roundToInt() / 100f) },
-					valueRange = 0.75f..2.50f,
-					height = 14.dp,
-					modifier = Modifier.weight(1f),
-				)
-				Text(percent(uiScale), style = typography.monoSmall.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
-					color = colors.textPrimary, textAlign = TextAlign.End, modifier = Modifier.width(40.dp))
-			}
-		}
-		SettingsRow(tr("settings.scale.presets")) {
-			Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-				for (preset in UiScalePresets) {
-					CompactToggleChip(
-						text = percent(preset),
-						selected = kotlin.math.abs(uiScale - preset) < 0.005f,
-						onToggle = { onUiScaleChange(preset) },
-						modifier = Modifier.weight(1f),
-					)
-				}
-			}
+			SettingsScalePicker(uiScale, onUiScaleChange)
 		}
 		SettingsRow(
 			tr("settings.scale.recommended"),
@@ -325,6 +426,25 @@ private fun SettingsCanvasSection() {
 			}
 		}
 	}
+
+	val tabLayout by AppSettings.workspaceTabLayoutFlow.collectAsState()
+	SettingsGroup(tr("settings.tabs.title")) {
+		for (layout in WorkspaceTabLayout.entries) {
+			Column(Modifier.fillMaxWidth()) {
+				CompactRadioButton(
+					selected = layout == tabLayout,
+					onClick = { AppSettings.workspaceTabLayout = layout },
+					label = tr(layout.labelKey),
+				)
+				Text(
+					text = tr(layout.descriptionKey),
+					style = typography.caption.copy(fontSize = 10.5.sp),
+					color = colors.textMuted,
+					modifier = Modifier.padding(start = 24.dp),
+				)
+			}
+		}
+	}
 }
 
 /**
@@ -344,11 +464,21 @@ private fun SettingsPromptsSection(
 
 	Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
 		for (prompt in AppPrompt.entries) {
-			CompactCheckbox(
-				checked = prompt !in mutedPrompts,
-				onCheckedChange = { onPromptEnabledChange(prompt, it) },
-				label = tr(prompt.labelKey),
-			)
+			Column(Modifier.fillMaxWidth()) {
+				CompactCheckbox(
+					checked = prompt !in mutedPrompts,
+					onCheckedChange = { onPromptEnabledChange(prompt, it) },
+					label = tr(prompt.labelKey),
+				)
+				prompt.detailKey?.let { detailKey ->
+					Text(
+						text = tr(detailKey),
+						style = typography.caption.copy(fontSize = 10.5.sp, lineHeight = 14.sp),
+						color = colors.textMuted,
+						modifier = Modifier.padding(start = 24.dp),
+					)
+				}
+			}
 		}
 	}
 	Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

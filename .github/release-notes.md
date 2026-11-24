@@ -1,18 +1,24 @@
-v3.7.0 预览版：**半成品，效果没有保证。**
+## v3.8.4 · 2026-11-21
 
-正在把自动生成的 Rig 重做为按区域（眼、眉、嘴、头、头发、身体、服装、表情、动作）组织的模块，贴合画出的五官来生成动作。目前只调过嘴，而且还没调完；其余模块只是初步实现，效果并不好。
+### 改进与修复
 
-- 只想试用新的嘴部生成（分阶段张开、元音、分层画法的嘴）时再下载；日常使用请继续用 [v3.6.7](https://github.com/tsunehimatoi/psd2live/releases/tag/v3.6.7)。
-- 旧工程照旧按原方案生成，结果不变；新工程默认使用新模块。打开前请备份工程。
+- **重新加载 PSD**：新增「模型 > 重新加载 PSD」，在修改源图后直接更新工程内的图层贴图，同时保留已有绑定、工程文件与撤销历史；必要时自动重建网格并迁移变形、权重与路径绑定。([#97](https://github.com/tsunehimatoi/psd2live/pull/97))
+- **完整像素网格覆盖**：新增可选网格设置，覆盖所有非透明像素（alpha > 0），避免羽化边缘、微弱发光和细发丝在网格边界被裁切。([#96](https://github.com/tsunehimatoi/psd2live/pull/96))
+- **变形与参数编辑**：曲面变形器支持同时开启顶点与贝塞尔两个编辑层级，无需切换即可配合微调；拖动控制点、手柄或变换框时按住 `Shift` 可锁定主轴移动；编辑中间姿态时自动吸附到最近关键形并提示，同时支持修改器混合形覆盖编辑与组件关键形高亮。([#81](https://github.com/tsunehimatoi/psd2live/pull/81), [#94](https://github.com/tsunehimatoi/psd2live/pull/94), [#95](https://github.com/tsunehimatoi/psd2live/pull/95))
+- **历史与图层修复**：撤销、重做或切换历史记录时保留当前参数姿态，不再重置为默认值；修复拆分图层删除后仍残留在可见图层分析中的问题。([#92](https://github.com/tsunehimatoi/psd2live/pull/92), [#93](https://github.com/tsunehimatoi/psd2live/pull/93))
+- **界面整理**：统一开始页与可折叠的帮助/设置侧栏，优化矢量图标绘制与下拉菜单自适应宽度，并将变形工具选项收拢为更紧凑的下拉菜单。
 
 <details>
 <summary>English</summary>
 
-v3.7.0 preview: **work in progress, results not guaranteed.**
+## v3.8.4 · 2026-11-21
 
-The generated rig is being rebuilt as modules by area (eyes, brows, mouth, head, hair, body, outfit, expressions, motions) that fit the drawn features. So far only the mouth has been tuned, and not finished; the other modules are first passes and do not look good yet.
+### Improvements and fixes
 
-- Download it only to try the new mouth (staged opening, vowels, mouths drawn in layers); for everyday use stay on [v3.6.7](https://github.com/tsunehimatoi/psd2live/releases/tag/v3.6.7).
-- Older projects generate as before; new projects use the new modules. Back up your projects first.
+- **Reload PSD** — Use **Model > Reload PSD** to refresh layer artwork from an updated PSD while keeping the existing rig, project file, and undo history. Meshes that would clip new pixels are rebuilt automatically with their forms, weights, and paths preserved. ([#97](https://github.com/tsunehimatoi/psd2live/pull/97))
+- **Full alpha pixel mesh coverage** — Added an optional mesh setting to cover every pixel with alpha > 0, keeping soft antialiased edges, faint glows, and fine hair strands intact at the mesh border. ([#96](https://github.com/tsunehimatoi/psd2live/pull/96))
+- **Deform and parameter editing** — Warp deformers can now enable vertex and Bezier editing levels together, and holding `Shift` while dragging points, handles, or the transform box constrains movement to the primary axis. Editing intermediate poses snaps parameters to their nearest keyforms with a toast hint, alongside modifier blend-shape override support and component keyform highlighting. ([#81](https://github.com/tsunehimatoi/psd2live/pull/81), [#94](https://github.com/tsunehimatoi/psd2live/pull/94), [#95](https://github.com/tsunehimatoi/psd2live/pull/95))
+- **History and layer fixes** — Undo, redo, and history checkouts now preserve the current parameter pose instead of resetting to defaults. Fixed deleted pieces of a split layer remaining in the visible layer analysis. ([#92](https://github.com/tsunehimatoi/psd2live/pull/92), [#93](https://github.com/tsunehimatoi/psd2live/pull/93))
+- **UI polish** — Unified the start hub with a collapsible rail for help and settings, refined vector icon rendering and auto-sized dropdown menus, and compacted deform tool options into dropdowns.
 
 </details>

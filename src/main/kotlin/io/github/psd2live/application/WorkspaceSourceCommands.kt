@@ -1,7 +1,7 @@
 package io.github.psd2live.application
 
-import io.github.psd2live.project.WorkspaceSourceArt
-import io.github.psd2live.project.WorkspaceSourceLayer
+import io.github.psd2live.document.WorkspaceSourceArt
+import io.github.psd2live.document.WorkspaceSourceLayer
 import io.github.psd2live.project.WorkspaceDocument
 
 import io.github.psd2live.core.*

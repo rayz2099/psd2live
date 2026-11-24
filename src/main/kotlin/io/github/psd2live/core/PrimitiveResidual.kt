@@ -1,5 +1,6 @@
 package io.github.psd2live.core
 
+import io.github.psd2live.algorithms.binding.GeometryResidual
 import kotlinx.serialization.json.*
 import org.umamo.edit.VertexSource
 import org.umamo.render.eval.drawableSpaceMapping
@@ -10,7 +11,6 @@ import org.umamo.runtime.eval.gridCorners
 import org.umamo.runtime.eval.scalarAt
 import org.umamo.runtime.model.*
 import kotlin.math.abs
-import io.github.psd2live.core.legacy.RigGenerationResidual
 
 /**
  * Rule B of version 2 `art_primitive` records ([ArtPrimitiveV2]): what the user authored on a split part is kept
@@ -47,40 +47,13 @@ internal object PrimitiveResidual {
 		return result
 	}
 
-	/** Axes with every knot of [input] per parameter, in first-seen order; near-duplicate knots merge. */
-	fun unionAxes(input: List<KeyformAxis>): List<KeyformAxis> = input.groupBy { it.parameterId }.map { (id, axes) ->
-		val values = ArrayList<Float>()
-		axes.forEach { axis -> axis.keys.forEach { value -> if (values.none { abs(it - value) < EPS_KEY }) values += value } }
-		KeyformAxis(id, values.sorted().toFloatArray())
-	}
-
-	/** Every coordinate of a grid over [axes], first axis fastest. */
-	fun coordinates(axes: List<KeyformAxis>): List<IntArray> {
-		var count = 1L
-		for (axis in axes) {
-			require(axis.keys.isNotEmpty()) { "Art primitive keyform axis is empty" }
-			count = Math.multiplyExact(count, axis.keys.size.toLong())
-			require(count <= 262144) { "Art primitive keyforms exceed the allocation limit" }
-		}
-		return (0 until count.toInt()).map { index ->
-			var value = index
-			IntArray(axes.size) { axis -> (value % axes[axis].keys.size).also { value /= axes[axis].keys.size } }
-		}
-	}
-
-	fun key(axes: List<KeyformAxis>, coordinate: IntArray): Map<ParameterId, Float> =
-		axes.indices.associate { axes[it].parameterId to axes[it].keys[coordinate[it]] }
+	fun unionAxes(input: List<KeyformAxis>): List<KeyformAxis> = io.github.psd2live.algorithms.binding.BindingAxes.unionAxes(input)
+	fun coordinates(axes: List<KeyformAxis>): List<IntArray> = io.github.psd2live.algorithms.binding.BindingAxes.coordinates(axes)
+	fun key(axes: List<KeyformAxis>, coordinate: IntArray): Map<ParameterId, Float> = io.github.psd2live.algorithms.binding.BindingAxes.key(axes, coordinate)
 
 	/** [values] (x/y per vertex) on the vertices [sources] derive from them. */
-	fun transfer(values: FloatArray, sources: List<VertexSource>): FloatArray = FloatArray(sources.size * 2) { index ->
-		val component = index % 2
-		when (val source = sources[index / 2]) {
-			is VertexSource.FromOld -> values[source.oldIndex * 2 + component]
-			is VertexSource.BarycentricOf -> values[source.oldA * 2 + component] * source.wa +
-				values[source.oldB * 2 + component] * source.wb + values[source.oldC * 2 + component] * source.wc
-			else -> error("Unsupported art primitive vertex source")
-		}
-	}
+	fun transfer(values: FloatArray, sources: List<VertexSource>): FloatArray =
+		io.github.psd2live.algorithms.binding.BindingVertices.transfer(values, sources)
 
 	/** Vertex group weights on [sources], clamped after interpolation near tolerated triangle boundaries. */
 	fun transferScalars(values: FloatArray, sources: List<VertexSource>): FloatArray = FloatArray(sources.size) { index ->
@@ -144,7 +117,7 @@ internal object PrimitiveResidual {
 	 * moved into the authored parent space at the default pose when a journal edit reparented the drawable. Moved
 	 * onto other vertices through [sources] when given; null when nothing changed.
 	 *
-	 * Unlike [RigGenerationResidual.geometryDelta] this compares local keyforms only: an ancestor deformer's axes
+	 * Unlike [GeometryResidual.geometryDelta] this compares local keyforms only: an ancestor deformer's axes
 	 * move both alike and never enter the residual.
 	 */
 	fun delta(authoredModel: PuppetModel, authored: Drawable, generatedModel: PuppetModel, generated: Drawable,
@@ -176,7 +149,7 @@ internal object PrimitiveResidual {
 
 	/**
 	 * The residual [delta] - authored minus generated per cell on the recorded vertices ([size] floats), as
-	 * [RigGenerationResidual.geometryDelta] gives it - split by [parked]'s generator axes into the plane residual and
+	 * [GeometryResidual.geometryDelta] gives it - split by [parked]'s generator axes into the plane residual and
 	 * overrides. [convert] maps a delta into the parked part's parent space; [toParked] carries a recorded-vertex
 	 * array onto the parked mesh's vertices (identity when the topologies agree); [owner] names a parameter's
 	 * generator node.
@@ -272,11 +245,11 @@ internal object PrimitiveResidual {
 	private fun colorStatic(drawable: Drawable, channel: FormChannel) = if (channel == FormChannel.MULTIPLY_COLOR) drawable.multiplyColor else drawable.screenColor
 
 	/**
-	 * The channel residual of [authored] over [generated] ([RigGenerationResidual.channelsDelta]), keeping only
+	 * The channel residual of [authored] over [generated] ([GeometryResidual.channelsDelta]), keeping only
 	 * channels with a change: a channel without one stays exactly as generated.
 	 */
 	fun channels(model: PuppetModel, authored: Drawable, generated: Drawable, checkpoint: () -> Unit = {}): ChannelGrids =
-		ChannelGrids(RigGenerationResidual.channelsDelta(model, authored, generated, checkpoint).gridsByChannel.filterValues { grid ->
+		ChannelGrids(GeometryResidual.channelsDelta(model, authored, generated, checkpoint).gridsByChannel.filterValues { grid ->
 			grid.cells.any { cell -> when (val form = cell.form) {
 				is ChannelValue.Scalar -> abs(form.value) > EPS
 				is ChannelValue.Color -> listOf(form.color.red, form.color.green, form.color.blue).any { abs(it) > EPS }

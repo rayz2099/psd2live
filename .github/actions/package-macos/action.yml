@@ -19,33 +19,36 @@ runs:
       env:
         EXPECTED_ARCH: ${{ inputs.architecture }}
       run: test "$(uname -m)" = "$EXPECTED_ARCH"
-    - uses: actions/setup-java@v4
+    - uses: actions/setup-java@v5
       with:
         distribution: temurin
         java-version: '21'
         cache: gradle
     - uses: dtolnay/rust-toolchain@stable
-    - name: Build and test the runtime
+    - uses: ./.github/actions/test-native
       if: inputs.run-tests == 'true'
-      shell: bash
-      run: |
-        cargo test --manifest-path runtime/Cargo.toml --release
-        cargo build --manifest-path runtime/Cargo.toml --release
     - name: Test launcher error handling
       shell: bash
       run: bash packaging/macos/test-launcher.sh
-    - name: Test JVM application
-      if: inputs.run-tests == 'true'
-      shell: bash
-      run: ./gradlew test --no-daemon
-    - name: Package DMG
+    - name: Test and package DMG
       id: package
       shell: bash
+      env:
+        RUN_TESTS: ${{ inputs.run-tests }}
+        PSD2LIVE_NATIVE_REQUIRED: '1'
       run: |
-        ./gradlew packageDistributionForCurrentOS --no-daemon
+        tasks=(packageDistributionForCurrentOS)
+        if [[ "$RUN_TESTS" == true ]]; then
+          tasks+=(test)
+          if [[ "$(uname -m)" == arm64 ]]; then tasks+=(pluginBuildTest); fi
+        fi
+        ./gradlew "${tasks[@]}" --no-daemon
         images=(build/PSD2Live-*-macos-*.dmg)
         [[ ${#images[@]} -eq 1 && -s "${images[0]}" ]]
         echo "dmg=${images[0]}" >> "$GITHUB_OUTPUT"
+    - name: Verify bundled algorithm worker
+      shell: bash
+      run: python3 packaging/smoke-test-workers.py build/PSD2Live.app
     - name: Verify mounted package and bundled runtime
       shell: bash
       env:

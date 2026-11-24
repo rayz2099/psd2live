@@ -1,6 +1,6 @@
 package io.github.psd2live.core
 
-import io.github.psd2live.project.transform
+import io.github.psd2live.document.transform
 import io.github.psd2live.core.sim.*
 import org.umamo.edit.VertexSource
 import org.umamo.format.art.SourceArt
@@ -63,7 +63,7 @@ internal object MaterializedMeshRebuild {
             val canvasGenerated = if (layer is MouthLipLayer) generated.copy(puppet = org.umamo.render.restMeshesToCanvasSpace(generated.puppet)) else generated
             val shownAs = (current.analysis.source.layers.firstOrNull { it.id.raw == layerId }
                 ?: (layer as? MouthLipLayer)?.let { lip -> current.analysis.source.layers.firstOrNull { it.id.raw == lip.ownerId } })?.transform
-                ?: io.github.psd2live.project.LayerTransform.IDENTITY
+                ?: io.github.psd2live.document.LayerTransform.IDENTITY
             val converted = RasterMeshPlacement.underParents(canvasGenerated, model, { previous.parentDeformerId }, { shownAs }) {
                 progress.update("Preparing parent-space mesh", (index + 0.5) / changed.size)
             }
@@ -89,13 +89,13 @@ internal object MaterializedMeshRebuild {
     private fun migrateSimulations(overlay: RigEditOverlay, id: String, count: Int,
                                    sources: List<VertexSource>, checkpoint: () -> Unit): RigEditOverlay = overlay.copy(simEdits = overlay.simEdits.map { sim ->
         checkpoint()
-        if (id !in sim.targets || sim.bake == null) sim else {
-            val bake = sim.bake
+        val bake = sim.bake
+        if (id !in sim.targets || bake == null) sim else {
             require(bake.vertexCounts[id] == count) { "Simulation bake has a stale mesh topology" }
             fun migrate(axis: SimBakedAxis): SimBakedAxis {
                 val previous = axis.offsets[id] ?: return axis
                 require(previous.all { it.size == count * 2 }) { "Simulation bake has a stale mesh topology" }
-                return SimBakedAxis(axis.parameter, axis.keys, axis.offsets + (id to previous.map { values ->
+                return axis.withMeshOffsets(axis.offsets + (id to previous.map { values ->
                     checkpoint()
                     FloatArray(sources.size * 2) { index ->
                         val axisIndex = index % 2
@@ -109,7 +109,7 @@ internal object MaterializedMeshRebuild {
                 }))
             }
             sim.copy(bake = SimBakeResult.fromJson(bake.withGeometry(bake.vertexCounts + (id to sources.size), bake.statics.map(::migrate),
-                bake.modes.map { SimBakedMode(migrate(it.axis), it.amplitude, it.energy) }).toJson()))
+                bake.modes.map { it.withAxis(migrate(it.axis)) }).toJson()))
         }
     })
 }

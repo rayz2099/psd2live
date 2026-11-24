@@ -456,6 +456,7 @@ data class PSD2LiveState(
     val projectDirty: Boolean = false,
     val projectSaving: Boolean = false,
     val projectSaveError: String? = null,
+    val recoveryPersistence: io.github.psd2live.application.WorkspacePersistenceState? = null,
     val showProjectLocationDialog: Boolean = false,
     val showExportDialog: Boolean = false,
     val showExportPsdDialog: Boolean = false,
@@ -485,6 +486,8 @@ data class PSD2LiveState(
     /** Bookmarks, shy and frozen tracks and markers of the motion editor; saved project data, not rig history. */
     val timelineAids: io.github.psd2live.project.TimelineAids = io.github.psd2live.project.TimelineAids(),
     val inputPath: String = "",
+    /** External editable PSD; inputPath may instead point to an archive's extracted source. */
+    val externalPsdPath: String? = null,
 	/** Input identity that produced [analysis]; remains stable while the user edits the next path field. */
 	val loadedInputPath: String? = null,
 	val loadedInputFileSignature: String? = null,
@@ -504,6 +507,7 @@ data class PSD2LiveState(
 	/** New projects measure mesh lengths at the reference document size; older ones keep source pixels. */
 	val meshUnits: io.github.psd2live.core.MeshUnits = io.github.psd2live.core.MeshUnits.DOCUMENT,
 	val meshTrace: io.github.psd2live.core.MeshTrace = io.github.psd2live.core.MeshTrace.TEXTURE,
+	val meshAlphaCoverage: Boolean = false,
 	val meshWrap: Float = 0f,
 	val texturePadding: Int = 2,
 	val alphaThreshold: Int = 8,
@@ -670,6 +674,9 @@ data class PSD2LiveState(
     }
 	val darkTheme: Boolean get() = toolColors.isDark
 
+	internal val canCheckMeshSplits: Boolean
+		get() = previewModel?.let { it.config.rigEdits.importedCmo3 == null } == true
+	val showPsdImportGuide: Boolean get() = AppPrompt.PSD_IMPORT_GUIDE !in mutedPrompts
 	val autoDetectMeshSplitsOnImport: Boolean get() = AppPrompt.MESH_SPLITS_ON_IMPORT !in mutedPrompts
 
 	val activeWorkspace: EditorWorkspace
@@ -760,6 +767,7 @@ data class PSD2LiveState(
 			meshOverrides = meshOverrides,
 			meshUnits = meshUnits,
 			meshTrace = meshTrace,
+			meshAlphaCoverage = meshAlphaCoverage,
 			meshWrap = meshWrap,
 			alphaThreshold = alphaThreshold,
 			headTurnStrength = headStrength,

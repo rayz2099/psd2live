@@ -66,6 +66,8 @@ import io.github.psd2live.agent.AgentMcpController
 import io.github.psd2live.ui.components.AppDataFolders
 import io.github.psd2live.ui.components.LocalAgentMcp
 import io.github.psd2live.ui.components.MenuFolder
+import io.github.psd2live.ui.components.UiScalePresets
+import io.github.psd2live.ui.components.uiScaleLabel
 import io.github.psd2live.ui.components.AppTitleBar
 import io.github.psd2live.ui.components.AppMenuHeader
 import io.github.psd2live.ui.components.AppMenuItem
@@ -78,7 +80,6 @@ import io.github.psd2live.ui.components.ImageLightboxDialog
 import io.github.psd2live.ui.components.ExportDialog
 import io.github.psd2live.ui.components.ExportPsdDialog
 import io.github.psd2live.ui.state.Manual
-import io.github.psd2live.ui.state.HELP_CONTENT
 import io.github.psd2live.ui.components.TextureUpscaleDialog
 import io.github.psd2live.ui.state.PSD2LiveState
 import io.github.psd2live.ui.state.PSD2LiveViewModel
@@ -173,7 +174,8 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 	val baking by viewModel.simulationBaking.collectAsState()
 	val download by viewModel.modelDownloadState.collectAsState()
 	val projectProgress by viewModel.projectProgress.collectAsState()
-	val task = io.github.psd2live.ui.state.taskProgress(state, baking, download, projectProgress)
+	val guideProgress = if (AppPage.PSD_GUIDE in viewModel.openPages || viewModel.psdGuide.saving) viewModel.psdGuide.taskProgress else null
+	val task = io.github.psd2live.ui.state.taskProgress(state, baking, download, projectProgress, guideProgress)
 	var tutorial by remember { mutableStateOf(InteractiveTutorialState()) }
 	val tutorialTargets = rememberTutorialTargetRegistry()
 	// The performance overlay draws outside Compose, in the theme's colours.
@@ -314,7 +316,9 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 			if (!isBusy) {
 				val selected = NativeFilePicker.choosePsdFile(window, state.inputPath)
 				if (!selected.isNullOrBlank()) {
-					viewModel.withSavedChanges { viewModel.setInputPath(selected); viewModel.analyze(discardUnsaved = true) }
+					val path = Path.of(selected)
+                    if (path.fileName.toString().endsWith(".psd", true)) viewModel.openPsdGuide(path)
+                    else viewModel.withSavedChanges { viewModel.setInputPath(selected); viewModel.analyze(discardUnsaved = true) }
 				}
 			}
 		}
@@ -339,7 +343,15 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 		}
         val onReanalyzeAction = {
 			if (hasInput && !isBusy) {
-				viewModel.withSavedChanges { viewModel.analyze(discardUnsaved = true) }
+				viewModel.withSavedChanges { viewModel.analyze(discardUnsaved = true, checkImportedMeshSplits = false) }
+			}
+		}
+        val onReloadPsdAction = {
+			if (hasInput && !isBusy) {
+                val linked = state.externalPsdPath?.let { runCatching { Path.of(it) }.getOrNull() }
+                    ?.takeIf { Files.isRegularFile(it) }
+                val selected = linked ?: NativeFilePicker.choosePsdFile(window, state.externalPsdPath ?: state.inputPath)?.let(Path::of)
+                if (selected != null) viewModel.reloadPsd(selected)
 			}
 		}
 
@@ -453,6 +465,7 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 				ShortcutAction.SAVE_PROJECT -> { viewModel.requestProjectSave(false); true }
 				ShortcutAction.SAVE_PROJECT_AS -> { viewModel.requestProjectSave(true); true }
 				ShortcutAction.REANALYZE -> { onReanalyzeAction(); true }
+				ShortcutAction.RELOAD_PSD -> { onReloadPsdAction(); true }
 				// Falls through when there is no source PSD, as the old Shift-gated branch did.
 				ShortcutAction.REEXPORT_PSD ->
 					if (hasInput && !isBusy) { viewModel.openExportPsdDialog(); true } else false
@@ -493,8 +506,8 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 				ShortcutAction.ZOOM_IN -> { viewModel.zoomIn(); true }
 				ShortcutAction.ZOOM_OUT -> { viewModel.zoomOut(); true }
 				ShortcutAction.ZOOM_RESET -> { viewModel.resetZoom(); true }
-				ShortcutAction.OPEN_SETTINGS -> { viewModel.togglePage(AppPage.SETTINGS); true }
-				ShortcutAction.OPEN_HELP -> { viewModel.togglePage(AppPage.HELP); true }
+				ShortcutAction.OPEN_SETTINGS -> { viewModel.toggleStartSection(StartSection.SETTINGS); true }
+				ShortcutAction.OPEN_HELP -> { viewModel.toggleStartSection(StartSection.HELP); true }
 				ShortcutAction.TOGGLE_FULLSCREEN -> { AppSettings.toggleFullscreen(); true }
 				else -> {
 					// The nine tab-jump actions share one body. A null index means this is a
@@ -595,12 +608,13 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 							onZoomOut = { viewModel.zoomOut() },
 							onResetZoom = { viewModel.resetZoom() },
 							onToggleTheme = { viewModel.toggleDarkTheme() },
-							onShowSettings = { viewModel.togglePage(AppPage.SETTINGS) },
-							onOpenHelp = { viewModel.showPage(AppPage.HELP, HELP_CONTENT) },
+							onShowSettings = { viewModel.toggleStartSection(StartSection.SETTINGS) },
+							onOpenHelp = { viewModel.showStartPage(StartSection.HELP) },
 							onShowHistory = { viewModel.showHistoryModule() },
 						)
 					}
 					AppTitleBar(
+						canScanMeshSplits = state.canCheckMeshSplits,
 						window = window,
 						windowState = windowState,
 						isBusy = isBusy,
@@ -623,6 +637,7 @@ private fun FrameWindowScope.PSD2LiveAppContent(
                         onSaveProjectAs = { viewModel.requestProjectSave(true) },
                         projectTitle = (state.projectFile ?: tr("project.untitled")) + if (state.projectDirty) " *" else "",
 						onReanalyze = onReanalyzeAction,
+						onReloadPsd = onReloadPsdAction,
 						onReexportPsd = { if (hasInput && !isBusy) viewModel.openExportPsdDialog() },
 						onOpenFolder = ::openFolder,
 						onShowExport = { if (hasInput && !isBusy) viewModel.openExportDialog() },
@@ -633,8 +648,8 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 						onZoomOut = { viewModel.zoomOut() },
 						onResetZoom = { viewModel.resetZoom() },
 						onToggleTheme = { viewModel.toggleDarkTheme() },
-						settingsShown = viewModel.activePage == AppPage.SETTINGS,
-						onShowSettings = { viewModel.togglePage(AppPage.SETTINGS) },
+						settingsShown = viewModel.activePage == AppPage.START && viewModel.startSection == StartSection.SETTINGS,
+						onShowSettings = { viewModel.toggleStartSection(StartSection.SETTINGS) },
 						onShowTextureUpscale = { viewModel.openTextureUpscaleDialog() },
 						onStartScreen = { viewModel.showStartPage(StartSection.GENERATE) },
 						onMeshSplitScan = { viewModel.requestMeshSplitScan() },
@@ -650,7 +665,7 @@ private fun FrameWindowScope.PSD2LiveAppContent(
 						onCloseTab = { viewModel.closeWorkspace(state.activeWorkspace.id) },
 						onNextTab = { viewModel.cycleWorkspace(1) },
 						onPrevTab = { viewModel.cycleWorkspace(-1) },
-						onOpenHelp = { viewModel.showPage(AppPage.HELP, HELP_CONTENT) },
+						onOpenHelp = { viewModel.showStartPage(StartSection.HELP) },
 						tutorialMenuForce = if (tutorialShown) workspaceTutorialStep.forcesMenu else null,
 						tutorialHighlightTarget = if (tutorialShown) {
 							workspaceTutorialStep.effectiveTargetId(state)
@@ -863,6 +878,11 @@ private fun StatusBar(
 			)
 		}
 
+        viewModel.projectSaveFeedback(state)?.let { feedback ->
+            Spacer(Modifier.width(12.dp))
+            io.github.psd2live.ui.components.ProjectSaveIndicator(feedback, viewModel::retryRecoveryPersistence)
+        }
+
 		if (task != null) {
 			Spacer(Modifier.width(12.dp))
 			Row(
@@ -929,7 +949,6 @@ private fun StatusBar(
 			AppDropdownMenu(
 				expanded = showZoomMenu,
 				onDismissRequest = { showZoomMenu = false },
-				modifier = Modifier.widthIn(min = 210.dp, max = 280.dp),
 			) {
 				AppMenuHeader(tr("menu.view.category.zoom"))
 				AppMenuItem(
@@ -950,19 +969,10 @@ private fun StatusBar(
 
 				AppMenuSeparator()
 				AppMenuHeader(tr("menu.view.uiScale"))
-				listOf(1.0f, 1.15f, 1.25f, 1.35f, 1.50f, 1.75f, 2.00f, 2.50f).forEach { scale ->
-					val p = (scale * 100).toInt()
-					val label = when (scale) {
-						1.0f -> "$p% (${tr("settings.scale.standard")})"
-						1.25f -> "$p% (2K)"
-						1.5f -> "$p% (2K/4K)"
-						1.75f, 2.0f -> "$p% (4K)"
-						else -> "$p%"
-					}
-					val isCurrent = kotlin.math.abs(state.uiScale - scale) < 0.03f
+				UiScalePresets.forEach { scale ->
 					AppMenuItem(
-						text = label,
-						isChecked = isCurrent,
+						text = uiScaleLabel(scale),
+						isChecked = state.uiScale == scale,
 						onClick = { showZoomMenu = false; viewModel.setUiScale(scale) },
 					)
 				}

@@ -27,7 +27,7 @@ internal data class PresetParts(val frontHair: Boolean, val backHair: Boolean, v
 
 /**
  * The model presets the start page sets: rig strength and facial switches, motion groups, physics and simulation.
- * A PSD import applies them as soon as the model is built.
+ * A new PSD import applies them after its mesh split/naming offers have finished.
  */
 @Serializable
 internal data class StartPresetChoices(
@@ -106,18 +106,18 @@ internal enum class StartQuickPreset(val key: String, val choices: StartPresetCh
 	)),
 	/** Both motion groups, classic hair sway, loose clothing simulated and the eye jelly. */
 	DEFAULT("start.quick.default", StartPresetChoices()),
-	/** The default with simulated hair and feature displacement. */
+	/** The default with simulated hair. */
 	FULL("start.quick.full", StartPresetChoices(
-		featureDisplacement = true, frontHair = HairMode.SIMULATION, backHair = HairMode.SIMULATION,
+		frontHair = HairMode.SIMULATION, backHair = HairMode.SIMULATION,
 	)),
 }
 
 /**
  * The start page's sections, as its navigation lists them. It opens on the recent files; the next three start a
- * project: a model generated from a PSD, an empty canvas to lay materials out on, or a Cubism model. The last is
- * what changed, to read.
+ * project: a model generated from a PSD, an empty canvas to lay materials out on, or a Cubism model. The rest are
+ * what changed, help, and settings.
  */
-internal enum class StartSection { RECENT, GENERATE, LAYOUT, CMO3, UPDATES }
+internal enum class StartSection { RECENT, GENERATE, LAYOUT, CMO3, UPDATES, HELP, SETTINGS }
 
 /** Canvas sizes a Layout project accepts: each side up to 8192, at most 16M pixels. */
 internal fun validLayoutCanvasSize(width: Int?, height: Int?): Boolean =

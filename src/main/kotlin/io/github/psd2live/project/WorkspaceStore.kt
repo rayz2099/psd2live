@@ -1,5 +1,6 @@
 package io.github.psd2live.project
 
+import io.github.psd2live.util.IdentityWeakCache
 import io.github.psd2live.core.LayerClassificationOverride
 import io.github.psd2live.core.LayerType
 import io.github.psd2live.core.PartRole
@@ -15,6 +16,8 @@ import io.github.psd2live.core.RigTargetRef
 import io.github.psd2live.core.SemanticTag
 import io.github.psd2live.core.Side
 import io.github.psd2live.core.SkeletonSpec
+import io.github.psd2live.core.modifier.ModifierPluginReference
+import io.github.psd2live.core.modifier.RigModifierStack
 import io.github.psd2live.history.WorkspaceHistoryNode
 import io.github.psd2live.history.WorkspaceHistorySelection
 import io.github.psd2live.history.WorkspaceHistoryState
@@ -183,6 +186,17 @@ internal class WorkspaceStore(
 		val file = project.resolve("history/snapshots/$key.json")
 		if (Files.isRegularFile(file)) return expandSnapshot(project, readJson(file), shared)
 		return ArchiveMirror(project.resolve(ArchiveMirror.FOLDER)).snapshot(key, shared)
+	}
+
+	/** Read plugin locks from a v1 archive's snapshot metadata without loading its raster blobs. */
+	internal fun legacyPluginReferences(projectId: String, snapshotHashes: Collection<String>): Set<ModifierPluginReference> = buildSet {
+		val snapshots = projectRoot(projectId).resolve("history/snapshots")
+		for (hash in snapshotHashes.toSet()) {
+			val file = snapshots.resolve("${fileKey(hash)}.json")
+			if (!Files.isRegularFile(file)) continue
+			val stack = ((readJson(file)["rigEdits"] as? JsonObject)?.get("modifierStack") as? JsonObject) ?: continue
+			addAll(RigModifierStack.pluginReferences(stack))
+		}
 	}
 
     /** Legacy v1 projects have no index; capture their existing immutable IDs once. */
@@ -610,6 +624,7 @@ internal class WorkspaceStore(
             if (document.rigEdits.interiorEffects.isNotEmpty()) putJsonArray("interiorEffects") { document.rigEdits.interiorEffects.forEach { add(it.toJson()) } }
             putJsonArray("swings") { document.rigEdits.swingEdits.forEach { add(it.toJson()) } }
             putJsonArray("motions") { document.rigEdits.motionClips.forEach { add(io.github.psd2live.core.MotionClips.toJson(it)) } }
+            if (document.rigEdits.motionSources.isNotEmpty()) put("motionSources", JsonObject(document.rigEdits.motionSources))
             if (document.rigEdits.motionPresets.isNotEmpty()) put("motionPresets", io.github.psd2live.core.MotionPresets.toJson(document.rigEdits.motionPresets))
             // Only a document that took its expressions in or has a pose writes them, so others keep their stored form.
             document.rigEdits.expressions?.let { expressions -> putJsonArray("expressions") { expressions.forEach { add(io.github.psd2live.core.ModelExpressions.toJson(it)) } } }
@@ -758,6 +773,7 @@ internal class WorkspaceStore(
             interiorEffects = rigEditObject.optionalArray("interiorEffects").map { io.github.psd2live.core.interior.NativeInteriorEffect.fromJson(it.jsonObject) },
             swingEdits = rigEditObject.optionalArray("swings").map { io.github.psd2live.core.RigSwingEdit.fromJson(it.jsonObject) },
             motionClips = rigEditObject.optionalArray("motions").map { io.github.psd2live.core.MotionClips.fromJson(it.jsonObject) },
+            motionSources = rigEditObject["motionSources"]?.jsonObject?.mapValues { it.value.jsonObject }.orEmpty(),
             motionPresets = io.github.psd2live.core.MotionPresets.fromJson(rigEditObject["motionPresets"]?.jsonObject),
             expressions = rigEditObject["expressions"]?.jsonArray?.map { io.github.psd2live.core.ModelExpressions.fromJson(it.jsonObject) },
             pose = rigEditObject["pose"]?.jsonObject?.let(io.github.psd2live.core.ModelPoses::fromJson),

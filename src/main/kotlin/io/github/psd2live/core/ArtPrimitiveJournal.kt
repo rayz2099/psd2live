@@ -1,6 +1,6 @@
 package io.github.psd2live.core
 
-import io.github.psd2live.project.WorkspaceSourceLayer
+import io.github.psd2live.document.WorkspaceSourceLayer
 import kotlinx.serialization.json.*
 import org.umamo.format.art.*
 import org.umamo.edit.VertexSource
@@ -102,15 +102,20 @@ internal object ArtPrimitiveJournal {
 		return replacements.mapNotNull { current[it]?.order }.maxOrNull()
 	}
 
-	/** The analysis without superseded layers: they keep a transparent tile only while their records replay. */
+	/**
+	 * The analysis without superseded layers or deleted parts: they keep a transparent tile only while their records
+	 * replay ([RigGenerationSource] keeps the same stand-ins).
+	 */
 	fun visibleAnalysis(analysis: PipelineAnalysis, overlay: RigEditOverlay): PipelineAnalysis {
 		val superseded = supersededLayers(overlay)
-		if (superseded.isEmpty()) return analysis
+		val resolution = PrimitiveResolution.of(overlay)
+		if (superseded.isEmpty() && !resolution.active) return analysis
 		val current = analysis.source.layers.mapTo(HashSet()) { it.id.raw }
 		// Ribbons generated from a superseded mouth stay: their meshes are not superseded, only a sliced ribbon is.
 		return analysis.copy(layers = analysis.layers.filterNot { layer ->
 			val id = layer.source.id.raw
-			id !in current && (id in superseded || layer.source !is MouthLipLayer && superseded.any { id.startsWith("$it:") })
+			id !in current && (id in superseded || resolution.isPartLayer(id) ||
+				layer.source !is MouthLipLayer && superseded.any { id.startsWith("$it:") })
 		})
 	}
 

@@ -1,21 +1,37 @@
 package io.github.psd2live.core
 
 import io.github.psd2live.core.modifier.*
-import io.github.psd2live.format.model.Canvas
-import io.github.psd2live.format.model.Parameter
-import io.github.psd2live.format.model.Part
-import io.github.psd2live.format.model.RigIR
+import io.github.psd2live.format.model.*
 import kotlinx.serialization.json.*
 import kotlin.test.*
 
 class RigModifierStackTest {
+    @Test fun upstreamKeyOverridesCannotChangeParameterDefinitions() {
+        val parameter = Parameter("P", "P", 0f, 1f, 0f)
+        var replacement = parameter.copy(keys = Floats.values(0f, .5f, 1f))
+        val definition = RigModifierDefinition("key-edit", 1, composableKinds = setOf("parameter"),
+            plugin = ModifierAlgorithmPlugin { input, _, _ -> input })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(definition)), applyOverrides = { rig, _, _ ->
+            ModifierOverrideResult(rig.copy(parameters = listOf(replacement)), parameterOverrides = mapOf("P" to replacement))
+        })
+        val input = authored.copy(parameters = listOf(parameter))
+        val stack = RigModifierStack(listOf(entry("edit", "key-edit"))).withOverrides("edit",
+            listOf(buildJsonObject { put("op", "parameter_keys") }))
+        assertEquals(listOf(replacement), engine.evaluate(input, stack).rig.parameters)
+        for (invalid in listOf(replacement.copy(min = -1f), replacement.copy(max = 2f),
+            replacement.copy(default = .5f), replacement.copy(blend = true), replacement.copy(repeat = true))) {
+            replacement = invalid
+            assertFailsWith<IllegalArgumentException> { engine.evaluate(input, stack) }
+        }
+    }
+
     private val target = ModifierTarget("part", "body")
     private val other = ModifierTarget("part", "other")
     private val authored = RigIR(Canvas(100f, 100f), emptyList(), parts = listOf(Part("body", "Body", emptyList()), Part("other", "Other", emptyList())))
     private fun entry(id: String, type: String, enabled: Boolean = true, targets: List<ModifierTarget> = listOf(target)) =
         RigModifierInstance(id, type, 1, targets, enabled)
     private fun transform(type: String, change: (Int) -> Int, requires: Set<String> = emptySet(), family: String? = null) =
-        RigModifierDefinition(type, 1, requires, family, composableKinds = setOf("part"), evaluate = { rig, instance, checkpoint ->
+        RigModifierDefinition(type, 1, requires, family, composableKinds = setOf("part"), plugin = ModifierAlgorithmPlugin { rig, instance, checkpoint ->
             checkpoint()
             rig.copy(parts = rig.parts.map { if (ModifierTarget("part", it.id) in instance.targets) it.copy(drawOrder = change(it.drawOrder)) else it })
         })
@@ -24,9 +40,106 @@ class RigModifierStackTest {
     private val registry = RigModifierRegistry(listOf(add, multiply))
     private val evaluator = RigModifierEvaluator(registry)
 
+    @Test fun evaluationFailureIdentifiesTheInstanceWithoutPublishingPartialResults() {
+        val failure = IllegalArgumentException("unsupported artwork")
+        val broken = RigModifierDefinition("broken", 1, plugin = ModifierAlgorithmPlugin { _, _, _ -> throw failure })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(add, broken)))
+        val stack = RigModifierStack(listOf(entry("good", "add"), entry("bad", "broken")))
+        val cache = RigModifierEvaluationCache()
+        val caught = assertFailsWith<ModifierEvaluationFailure> { engine.evaluate(authored, stack, cache) }
+        assertEquals("bad", caught.instanceId)
+        assertSame(failure, caught.cause)
+        assertNull(cache.snapshot)
+        val recovered = stack.update("bad") { it.copy(enabled = false) }.copy(initializationFailures = mapOf("bad" to failure.message!!))
+        assertEquals(recovered, RigModifierStack.fromJson(recovered.toJson()))
+        assertEquals(510, engine.evaluate(authored, recovered).rig.parts.first().drawOrder)
+    }
+
+    @Test fun evaluationDoesNotWrapCancellation() {
+        val cancellation = java.util.concurrent.CancellationException("cancelled")
+        val broken = RigModifierDefinition("broken", 1, plugin = ModifierAlgorithmPlugin { _, _, _ -> throw cancellation })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(broken)))
+        assertSame(cancellation, assertFailsWith<java.util.concurrent.CancellationException> {
+            engine.evaluate(authored, RigModifierStack(listOf(entry("bad", "broken"))))
+        })
+    }
+
+    @Test fun isolatedFailuresSuspendOnlyTheirTransitiveDependentsAndRemainCached() {
+        var attempts = 0
+        val broken = RigModifierDefinition("broken", 1, plugin = ModifierAlgorithmPlugin { _, _, _ ->
+            attempts++; error("broken input")
+        })
+        val dependent = transform("dependent", { it + 1 }, requires = setOf("broken"))
+        val descendant = transform("descendant", { it + 1 }, requires = setOf("dependent"))
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(broken, dependent, descendant, add)))
+        val stack = RigModifierStack(listOf(entry("bad", "broken"), entry("child", "dependent"),
+            entry("grandchild", "descendant"), entry("independent", "add")))
+        val cache = RigModifierEvaluationCache()
+        val result = engine.evaluate(authored, stack, cache, isolateFailures = true)
+        assertEquals(listOf(ModifierStatus.FAILED, ModifierStatus.MISSING_DEPENDENCY,
+            ModifierStatus.MISSING_DEPENDENCY, ModifierStatus.ACTIVE), result.entries.map { it.status })
+        assertEquals(510, result.rig.parts.first().drawOrder)
+        assertEquals("broken input", result.entries.first().error)
+        assertEquals(result, engine.evaluate(authored, stack, cache, isolateFailures = true))
+        assertEquals(1, attempts, "An unrelated rebuild must not continuously restart a failed plugin")
+        val retry = stack.copy(retryRevisions = mapOf("bad" to 1L))
+        engine.evaluate(authored, retry, cache, isolateFailures = true)
+        assertEquals(2, attempts, "Re-enabling a suspended plugin must perform a fresh attempt")
+        assertFailsWith<ModifierEvaluationFailure> { engine.evaluate(authored, stack, cache) }
+    }
+
+    @Test fun lateFailureRollsBackGeometryOwnershipAndExclusiveReservations() {
+        val broken = transform("broken", { 999 }, family = "one").copy(references = { _, _, _ -> error("late failure") })
+        val independent = transform("independent", { it + 10 }, family = "one")
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(broken, independent)))
+        val result = engine.evaluate(authored, RigModifierStack(listOf(entry("bad", "broken"), entry("good", "independent"))),
+            isolateFailures = true)
+        assertEquals(listOf(ModifierStatus.FAILED, ModifierStatus.ACTIVE), result.entries.map { it.status })
+        assertEquals(510, result.rig.parts.first().drawOrder)
+        assertTrue(result.entries.first().contributions.isEmpty())
+    }
+
+    @Test fun missingPluginsBlockSelectedConsumersButNotIndependentOnes() {
+        val consumer = transform("consumer", { it + 1 }).copy(providers = { mapOf("unavailable" to "missing") })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(consumer, add)))
+        val result = engine.evaluate(authored, RigModifierStack(listOf(entry("missing", "unavailable"),
+            entry("child", "consumer"), entry("good", "add"))), isolateFailures = true)
+        assertEquals(listOf(ModifierStatus.MISSING_PLUGIN, ModifierStatus.MISSING_DEPENDENCY, ModifierStatus.ACTIVE),
+            result.entries.map { it.status })
+        assertEquals(510, result.rig.parts.first().drawOrder)
+    }
+
+    @Test fun changedAuthorCaptureFailuresRemainLocalAndCachedCapabilitiesDoNotRerunCallbacks() {
+        var brokenCapture = false
+        var configCalls = 0
+        val contextual = add.copy(authorContext = {
+            check(!brokenCapture) { "capture failed" }; ModifierAlgorithmContext.Empty
+        }, appliedConfig = { configCalls++; JsonObject(emptyMap()) })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(contextual)))
+        val cache = RigModifierEvaluationCache()
+        val stack = RigModifierStack(listOf(entry("first", "add")))
+        engine.evaluate(authored, stack, cache, isolateFailures = true)
+        engine.evaluate(authored, stack, cache, isolateFailures = true)
+        assertEquals(1, configCalls)
+        brokenCapture = true
+        val result = engine.evaluate(authored, stack, cache, isolateFailures = true)
+        assertEquals(ModifierStatus.FAILED, result.entries.single().status)
+        assertEquals(authored, result.rig)
+    }
+
+    @Test fun isolationStillPropagatesCancellationWithoutPublishingPartialResults() {
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(add, RigModifierDefinition("stop", 1,
+            plugin = ModifierAlgorithmPlugin { _, _, _ -> throw java.util.concurrent.CancellationException("cancel") }))))
+        val cache = RigModifierEvaluationCache()
+        assertFailsWith<java.util.concurrent.CancellationException> {
+            engine.evaluate(authored, RigModifierStack(listOf(entry("good", "add"), entry("stop", "stop"))), cache, isolateFailures = true)
+        }
+        assertNull(cache.snapshot)
+    }
+
     @Test fun cachedPrefixesMatchColdEvaluationAndDoNotPublishFailures() {
         val calls = ArrayList<String>()
-        val counted = RigModifierDefinition("counted", 1, composableKinds = setOf("part"), evaluate = { rig, instance, _ ->
+        val counted = RigModifierDefinition("counted", 1, composableKinds = setOf("part"), plugin = ModifierAlgorithmPlugin { rig, instance, _ ->
             calls += instance.id
             require(instance.config["fail"]?.jsonPrimitive?.boolean != true)
             rig.copy(parts = rig.parts.map { it.copy(drawOrder = it.drawOrder + 1) })
@@ -66,9 +179,9 @@ class RigModifierStackTest {
         val motionId = provider.outputId("motion")
         val clip = io.github.psd2live.format.model.Clip(motionId, "Training", "Idle", "training", 1f, 30f, true, curves = emptyList())
         val producer = RigModifierDefinition("clip", 1, motionOutputs = { setOf(it.outputId("motion")) },
-            evaluate = { rig, _, _ -> rig.copy(clips = rig.clips + clip) })
+            plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(clips = rig.clips + clip) })
         val consumer = RigModifierDefinition("train", 1, motionInputs = { setOf(motionId) },
-            evaluate = { rig, _, _ -> rig.copy(parts = rig.parts.map { it.copy(drawOrder = it.drawOrder + 1) }) })
+            plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(parts = rig.parts.map { it.copy(drawOrder = it.drawOrder + 1) }) })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(producer, consumer)))
         val stack = RigModifierStack(listOf(provider, entry("simulation", "train")))
         val expected = engine.evaluate(authored, stack)
@@ -170,6 +283,75 @@ class RigModifierStackTest {
         assertEquals(ModifierStatus.MISSING_DEPENDENCY, engine.evaluate(authored, wrongTarget).entries.last().status)
     }
 
+    @Test fun capabilitiesBelongToTheSelectedVersionAndSurviveApplication() {
+        val capability = transform("feature", { it })
+        val provider = add.copy(version = 2, provides = setOf("feature"))
+        val consumer = transform("consumer", { it * 2 }, setOf("feature"))
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(add, provider, capability, consumer)))
+        val original = RigModifierStack(listOf(entry("provider", "add"), entry("consumer", "consumer")))
+        val missing = engine.evaluate(authored, original)
+        assertEquals(ModifierStatus.MISSING_DEPENDENCY, missing.entries.last().status)
+        assertEquals(ModifierStatus.MISSING_DEPENDENCY, engine.evaluate(authored, original.move("consumer", 0)).entries.first().status)
+
+        val supported = original.copy(instances = listOf(original.instances.first().copy(version = 2), original.instances.last()))
+        val expected = engine.evaluate(authored, supported)
+        assertEquals(1020, expected.rig.parts.first().drawOrder)
+        assertFailsWith<IllegalArgumentException> { engine.evaluate(authored, supported.move("consumer", 0)) }
+        val applied = engine.applyThrough(authored, supported, "provider")
+        val restored = RigModifierStack.fromJson(applied.stack.toJson())
+        assertEquals(setOf("feature"), restored.appliedCapabilities.single().provides)
+        val withoutProvider = RigModifierEvaluator(RigModifierRegistry(listOf(add, capability, consumer)))
+        assertEquals(expected.rig, withoutProvider.evaluate(applied.authored, restored).rig)
+
+        val historical = applied.stack.copy(appliedCapabilities = applied.stack.appliedCapabilities.map { it.copy(provides = null) })
+        assertEquals(expected.rig, engine.evaluate(applied.authored, RigModifierStack.fromJson(historical.toJson())).rig)
+    }
+
+    @Test fun keyformOwnershipRecordsOnlyNewKeysAndAxes() {
+        val original = listOf(KeyAxis("x", Floats.values(0f)), KeyAxis("y", Floats.values(0f)))
+        val widened = listOf(KeyAxis("x", Floats.values(0f, 1f)), KeyAxis("y", Floats.values(0f, 2f)))
+        val delta = MeshOffsets(Floats.Empty)
+        val mesh = Mesh("mesh", "Mesh", null, geometry = null,
+            offsets = KeyGrid(original, listOf(KeyCell(Ints.values(0, 0), delta))))
+        val opacity = KeyGrid<ChannelValue>(listOf(KeyAxis("y", Floats.values(0f))),
+            listOf(KeyCell(Ints.values(0), ChannelValue.Scalar(1f))))
+        val output = mesh.copy(offsets = KeyGrid(widened, listOf(
+            KeyCell(Ints.values(0, 0), delta), KeyCell(Ints.values(0, 1), delta), KeyCell(Ints.values(1, 1), delta),
+        )), channels = mapOf(Channel.OPACITY to opacity))
+        val extend = RigModifierDefinition("extend", 1, plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(meshes = listOf(output)) })
+        val withAxes = authored.copy(meshes = listOf(mesh), parameters = listOf(
+            Parameter("x", "X", -1f, 1f, 0f), Parameter("y", "Y", -2f, 2f, 0f)))
+        val result = RigModifierEvaluator(RigModifierRegistry(listOf(extend))).evaluate(withAxes,
+            RigModifierStack(listOf(entry("extend", "extend", targets = listOf(ModifierTarget("mesh", mesh.id))))))
+        assertEquals(listOf(
+            ModifierKeyform("mesh", mesh.id, "y", key = mapOf("x" to 0f, "y" to 2f)),
+            ModifierKeyform("mesh", mesh.id, "x", key = mapOf("x" to 1f, "y" to 2f)),
+            ModifierKeyform("mesh", mesh.id, "y", channel = "opacity"),
+        ), result.entries.single().ownedKeyforms)
+    }
+
+    @Test fun existingCellEditsBelongToTheLastWriterRatherThanItsCreator() {
+        val axes = listOf(KeyAxis("x", Floats.values(0f, 1f)))
+        val mesh = Mesh("mesh", "Mesh", null, geometry = null, offsets = KeyGrid(axes, listOf(
+            KeyCell(Ints.values(0), MeshOffsets(Floats.values(0f, 0f))),
+            KeyCell(Ints.values(1), MeshOffsets(Floats.values(1f, 0f))))))
+        fun writer(type: String, value: Float) = RigModifierDefinition(type, 1, composableKinds = setOf("mesh"),
+            plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(meshes = rig.meshes.map { m ->
+                m.copy(offsets = m.offsets!!.copy(cells = m.offsets!!.cells.map { cell ->
+                    if (cell.coordinate[0] == 1) cell.copy(form = MeshOffsets(Floats.values(value, 0f))) else cell
+                }))
+            }) })
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(writer("first", 2f), writer("last", 3f))))
+        val base = authored.copy(meshes = listOf(mesh), parameters = listOf(Parameter("x", "X", 0f, 1f, 0f)))
+        val stack = RigModifierStack(listOf("first", "last").map { entry(it, it, targets = listOf(ModifierTarget("mesh", "mesh"))) })
+        val result = engine.evaluate(base, stack)
+        val cell = ModifierKeyform("mesh", "mesh", "x", key = mapOf("x" to 1f))
+        assertTrue(result.entries.all { it.ownedKeyforms == listOf(cell) })
+        val graph = DocumentGenerators.graph(RigEditOverlay(), modifierReport = result.report())
+        assertEquals("modifier:last", DocumentGenerators.owner(graph, DocumentGenerators.keyformCell("mesh", "mesh", mapOf("x" to 1f)))?.id)
+        assertNull(DocumentGenerators.owner(graph, DocumentGenerators.keyformCell("mesh", "mesh", mapOf("x" to 0f))))
+    }
+
     @Test fun registryRejectsCyclesUnknownDependenciesAndDuplicateVersions() {
         assertFailsWith<IllegalArgumentException> { RigModifierRegistry(listOf(add, add)) }
         assertFailsWith<IllegalArgumentException> { RigModifierRegistry(listOf(transform("a", { it }, setOf("unknown")))) }
@@ -232,7 +414,7 @@ class RigModifierStackTest {
 
     @Test fun parameterDefinitionsCanBeSharedButIncompatibleDefinitionsFail() {
         val parameter = Parameter("ParamShared", "Shared", -1f, 1f, 0f)
-        val definition = RigModifierDefinition("parameter", 1, parameters = { listOf(parameter) }, evaluate = { rig, _, _ ->
+        val definition = RigModifierDefinition("parameter", 1, parameters = { listOf(parameter) }, plugin = ModifierAlgorithmPlugin { rig, _, _ ->
             if (rig.parameters.any { it.id == parameter.id }) rig else rig.copy(parameters = rig.parameters + parameter)
         })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(definition)))
@@ -250,7 +432,7 @@ class RigModifierStackTest {
         val definition = RigModifierDefinition("extend", 1, parameters = { listOf(extended) },
             composableKinds = setOf("parameter"),
             resolveParameter = { _, before, desired -> desired.takeIf { before.copy(max = desired.max) == desired } },
-            evaluate = { rig, _, _ -> rig.copy(parameters = listOf(extended)) })
+            plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(parameters = listOf(extended)) })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(definition))) { rig, _, commands ->
             ModifierOverrideResult(if (commands.isEmpty()) rig else rig.copy(parameters = listOf(extended.copy(default = .5f))))
         }
@@ -269,7 +451,7 @@ class RigModifierStackTest {
 
     @Test fun adaptersCannotSilentlyChangeSharedParameterDefinitions() {
         val parameter = Parameter("P", "P", 0f, 1f, 0f)
-        val definition = RigModifierDefinition("bad", 1, evaluate = { rig, _, _ -> rig.copy(parameters = listOf(parameter.copy(max = 2f))) })
+        val definition = RigModifierDefinition("bad", 1, plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig.copy(parameters = listOf(parameter.copy(max = 2f))) })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(definition)))
         assertFailsWith<IllegalArgumentException> { engine.evaluate(authored.copy(parameters = listOf(parameter)), RigModifierStack(listOf(entry("a", "bad")))) }
     }
@@ -277,7 +459,8 @@ class RigModifierStackTest {
     @Test fun missingTargetsUnknownVersionsAndCancellationFailWithoutPublishingResults() {
         val stack = RigModifierStack(listOf(entry("a", "add"), entry("b", "multiply")))
         assertFailsWith<IllegalArgumentException> { evaluator.evaluate(authored, stack.update("a") { it.copy(targets = listOf(ModifierTarget("mesh", "missing"))) }) }
-        assertFailsWith<IllegalArgumentException> { evaluator.evaluate(authored, stack.copy(instances = listOf(entry("a", "add").copy(version = 2)))) }
+        assertEquals(listOf(ModifierStatus.MISSING_PLUGIN),
+            evaluator.evaluate(authored, stack.copy(instances = listOf(entry("a", "add").copy(version = 2)))).entries.map { it.status })
         var checkpoints = 0
         assertFailsWith<java.util.concurrent.CancellationException> {
             evaluator.evaluate(authored, stack) { if (++checkpoints == 4) throw java.util.concurrent.CancellationException() }
@@ -303,7 +486,7 @@ class RigModifierStackTest {
     }
 
     @Test fun incompatibleWritesAreRejectedAndCompositionRequiresBothProvidersToOptIn() {
-        val replace = RigModifierDefinition("replace", 1, evaluate = { rig, _, _ ->
+        val replace = RigModifierDefinition("replace", 1, plugin = ModifierAlgorithmPlugin { rig, _, _ ->
             rig.copy(parts = rig.parts.map { it.copy(name = "Replaced") })
         })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(add, replace)))
@@ -331,7 +514,7 @@ class RigModifierStackTest {
         fun mesh(id: String) = io.github.psd2live.format.model.Mesh(id, id, null, geometry = null, offsets = null)
         val input = authored.copy(meshes = listOf(mesh("overlay"), mesh("face"), mesh("neck")))
         fun masks(type: String, sources: List<String>, inverted: Boolean = false) = RigModifierDefinition(type, 1,
-            composableKinds = setOf("mesh", "relations"), evaluate = { rig, _, _ ->
+            composableKinds = setOf("mesh", "relations"), plugin = ModifierAlgorithmPlugin { rig, _, _ ->
                 rig.copy(meshes = rig.meshes.map { if (it.id == "overlay") it.copy(maskedBy = sources, invertMask = inverted) else it })
             })
         val engine = RigModifierEvaluator(RigModifierRegistry(listOf(masks("faceMask", listOf("face"), true),
@@ -351,4 +534,129 @@ class RigModifierStackTest {
         assertEquals(result.rig, engine.applyThrough(input, stack, "a").result.rig)
     }
 
+    @Test fun directChangesRejectUndeclaredWritesBeforeReturningACandidate() {
+        val algorithm = object : ChangingModifierAlgorithmPlugin {
+            override fun changes(input: RigIR, instance: RigModifierInstance, context: ModifierAlgorithmContext,
+                                 checkpoint: () -> Unit) = ModifierModelChanges(parts = ModifierObjectChanges(
+                updated = listOf(ModifierObjectUpdate(input.parts.first(), input.parts.first().copy(drawOrder = 123)))))
+        }
+        val definition = RigModifierDefinition("direct", 1, plugin = algorithm, changeWrites = setOf("physics"))
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(definition)))
+        val stack = RigModifierStack(listOf(entry("direct1", "direct")))
+        val failure = assertFailsWith<IllegalArgumentException> { engine.evaluate(authored, stack) }
+        assertTrue(failure.message.orEmpty().contains("Undeclared change sections"))
+        val allowed = RigModifierEvaluator(RigModifierRegistry(listOf(definition.copy(changeWrites = setOf("part")))))
+        assertEquals(123, allowed.evaluate(authored, stack).rig.parts.first().drawOrder)
+        assertNotEquals(123, authored.parts.first().drawOrder)
+    }
+    @Test fun parallelSuccessorRechecksActualReadsBeforeApplyingInStackOrder() {
+        val caller = Thread.currentThread()
+        val reads = java.util.concurrent.ConcurrentLinkedQueue<Pair<Float, Boolean>>()
+        val physics = object : ReadingModifierAlgorithmPlugin {
+            override fun changes(input: ModifierEvaluationInput, instance: RigModifierInstance, checkpoint: () -> Unit) =
+                ModifierModelChanges(physicsFps = ModifierFieldChange(input.physics.fps, 120f))
+        }
+        val motion = object : ReadingModifierAlgorithmPlugin {
+            override fun changes(input: ModifierEvaluationInput, instance: RigModifierInstance, checkpoint: () -> Unit): ModifierModelChanges {
+                val fps = requireNotNull(input.physics.fps)
+                reads += fps to (Thread.currentThread() == caller)
+                val clip = Clip(instance.outputId("motion"), "Read", "Read", "read", 1f, fps, false, curves = emptyList())
+                return ModifierModelChanges(clips = ModifierObjectChanges(added = listOf(clip)))
+            }
+        }
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(
+            RigModifierDefinition("physics", 1, plugin = physics, changeWrites = setOf("physics")),
+            RigModifierDefinition("motion", 1, plugin = motion, changeWrites = setOf("motion")),
+        )))
+        val input = authored.copy(physics = Physics(fps = 30f))
+        val result = engine.evaluate(input, RigModifierStack(listOf(entry("a", "physics"), entry("b", "motion"))))
+        val expectedReads = if (java.util.concurrent.ForkJoinPool.getCommonPoolParallelism() >= 2)
+            listOf(30f to false, 120f to true) else listOf(120f to true)
+        assertEquals(expectedReads, reads.toList())
+        assertEquals(120f, result.rig.clips.single().fps)
+        assertEquals(listOf("a", "b"), result.entries.map { it.instance.id })
+    }
+
+    @Test fun directReadCacheReusesOnlyUnchangedObservedInputsAfterUpstreamEdits() {
+        var calls = 0
+        val algorithm = object : ReadingModifierAlgorithmPlugin {
+            override fun changes(input: ModifierEvaluationInput, instance: RigModifierInstance, checkpoint: () -> Unit): ModifierModelChanges {
+                calls++
+                val part = requireNotNull(input.part("other"))
+                return ModifierModelChanges(parts = ModifierObjectChanges(updated =
+                    listOf(ModifierObjectUpdate(part, part.copy(drawOrder = part.drawOrder + 1)))))
+            }
+        }
+        val upstream = RigModifierDefinition("upstream", 1, composableKinds = setOf("part"), plugin = ModifierAlgorithmPlugin { rig, instance, _ ->
+            rig.copy(parts = rig.parts.map { if (it.id == instance.targets.single().id)
+                it.copy(drawOrder = instance.config.getValue("order").jsonPrimitive.content.toInt()) else it })
+        })
+        val direct = RigModifierDefinition("direct", 1, plugin = algorithm,
+            composableKinds = setOf("part"), changeWrites = setOf("part"))
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(upstream, direct)))
+        val cache = RigModifierEvaluationCache()
+        fun stack(order: Int, targetId: String = "body") = RigModifierStack(listOf(
+            entry("a", "upstream", targets = listOf(ModifierTarget("part", targetId))).copy(config = buildJsonObject { put("order", order) }),
+            entry("b", "direct", targets = listOf(other))))
+        engine.evaluate(authored, stack(10), cache)
+        val reused = engine.evaluate(authored, stack(20), cache)
+        assertEquals(1, calls)
+        assertEquals(20, reused.rig.parts.first().drawOrder)
+        val renamed = authored.copy(parts = authored.parts.map {
+            if (it.id == "body") it.copy(name = "Renamed") else it
+        })
+        val afterRename = engine.evaluate(renamed, stack(20), cache, context = "renamed")
+        assertEquals(1, calls)
+        assertEquals("Renamed", afterRename.rig.parts.first().name)
+        val edited = renamed.copy(parts = renamed.parts.map {
+            if (it.id == "other") it.copy(drawOrder = 40) else it
+        })
+        assertEquals(41, engine.evaluate(edited, stack(20), cache, context = "edited").rig.parts.last().drawOrder)
+        assertEquals(2, calls)
+        val changed = engine.evaluate(authored, stack(30, "other"), cache)
+        assertEquals(3, calls)
+        assertEquals(31, changed.rig.parts.last().drawOrder)
+        assertEquals(changed, engine.evaluate(authored, stack(30, "other")))
+    }
+    @Test fun resolvedCapabilitiesInvalidateReadsAndSurviveApplyingTheirProvider() {
+        val observed = mutableListOf<ModifierUpstreamCapability>()
+        val provider = RigModifierDefinition("provider", 3, provides = setOf("shape"), appliedConfig = { it.config },
+            plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig })
+        val algorithm = object : ReadingModifierAlgorithmPlugin {
+            override fun changes(input: ModifierEvaluationInput, instance: RigModifierInstance, checkpoint: () -> Unit): ModifierModelChanges {
+                val dependency = input.providers("shape").single()
+                observed += dependency
+                val body = requireNotNull(input.part("body"))
+                return ModifierModelChanges(parts = ModifierObjectChanges(updated = listOf(ModifierObjectUpdate(body,
+                    body.copy(drawOrder = dependency.config.getValue("order").jsonPrimitive.content.toInt())))))
+            }
+        }
+        val consumer = RigModifierDefinition("consumer", 1, requires = setOf("shape"), providers = { mapOf("shape" to "source") },
+            plugin = algorithm, changeWrites = setOf("part"))
+        val engine = RigModifierEvaluator(RigModifierRegistry(listOf(provider, consumer)))
+        fun stack(order: Int) = RigModifierStack(listOf(
+            RigModifierInstance("source", "provider", 3, listOf(target), config = buildJsonObject { put("order", order) },
+                outputAliases = mapOf("root" to "preserved-root")), entry("consumer1", "consumer")))
+        val cache = RigModifierEvaluationCache()
+        engine.evaluate(authored, stack(10), cache)
+        val changed = engine.evaluate(authored, stack(20), cache)
+        assertEquals(2, observed.size)
+        assertEquals(20, changed.rig.parts.first().drawOrder)
+        assertEquals("shape", observed.last().capability)
+        assertEquals("provider", observed.last().type)
+        assertEquals(3, observed.last().version)
+        assertEquals("preserved-root", observed.last().outputAliases["root"])
+        val applied = engine.applyThrough(authored, stack(20), "source")
+        assertEquals(changed.rig, applied.result.rig)
+        assertEquals(observed[1], observed.last())
+        val pinned = ModifierPluginReference("example.provider", "1.2.3", "content")
+        val persisted = applied.stack.copy(appliedCapabilities = applied.stack.appliedCapabilities.map { it.copy(plugin = pinned) })
+        assertEquals(pinned, RigModifierStack.fromJson(persisted.toJson()).appliedCapabilities.single().plugin)
+    }
+    @Test fun capabilityAliasesParticipateInDependencyCycleValidation() {
+        val a = RigModifierDefinition("a", 1, provides = setOf("cap-a"), requires = setOf("cap-b"), plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig })
+        val b = RigModifierDefinition("b", 1, provides = setOf("cap-b"), requires = setOf("cap-a"), plugin = ModifierAlgorithmPlugin { rig, _, _ -> rig })
+        assertFailsWith<IllegalArgumentException> { RigModifierRegistry(listOf(a, b)) }
+        RigModifierRegistry(listOf(a, b.copy(requires = emptySet())))
+    }
 }

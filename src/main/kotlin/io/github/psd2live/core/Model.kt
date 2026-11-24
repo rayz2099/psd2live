@@ -41,7 +41,7 @@ enum class SemanticTag(val canonicalName: String, val group: LayerGroup) {
 
 enum class LayerGroup { HEAD, BODY, EXTRA, UNKNOWN }
 
-enum class Side { LEFT, RIGHT, NONE }
+typealias Side = io.github.psd2live.algorithms.binding.Side
 
 enum class LayerType { PRESET, TOGGLE, SWITCH }
 
@@ -67,26 +67,7 @@ data class ClassifiedLayer(
 	val opaquePixels: Int,
 )
 
-data class Bounds(val left: Float, val top: Float, val right: Float, val bottom: Float) {
-	val width: Float get() = right - left
-	val height: Float get() = bottom - top
-	val centerX: Float get() = (left + right) * 0.5f
-	val centerY: Float get() = (top + bottom) * 0.5f
-
-	fun union(other: Bounds): Bounds =
-		Bounds(
-			minOf(left, other.left),
-			minOf(top, other.top),
-			maxOf(right, other.right),
-			maxOf(bottom, other.bottom),
-		)
-
-	fun expanded(fraction: Float): Bounds {
-		val dx = width * fraction
-		val dy = height * fraction
-		return Bounds(left - dx, top - dy, right + dx, bottom + dy)
-	}
-}
+typealias Bounds = io.github.psd2live.algorithms.binding.Bounds
 
 data class RigAnchors(
 	val character: Bounds,
@@ -204,6 +185,11 @@ data class PipelineConfig(
 	val meshUnits: MeshUnits = MeshUnits.DOCUMENT,
 	/** What mesh outlines are traced from; projects saved before it trace the canvas view. */
 	val meshTrace: MeshTrace = MeshTrace.TEXTURE,
+	/**
+	 * Whether generated meshes cover every pixel with any alpha, not only those above [alphaThreshold], so soft edges
+	 * are never clipped. Off by default; projects saved before it keep their meshes.
+	 */
+	val meshAlphaCoverage: Boolean = false,
 	/** [MeshSettings.wrap] of every layer without an override; projects saved before it wrap nothing. */
 	val meshWrap: Float = 0f,
 	val alphaThreshold: Int = 8,
@@ -308,9 +294,9 @@ data class PipelineConfig(
 	/** The stored atlas budget (`atlas` setting); null keeps [atlasSize] and [texturePadding] with the default page count. */
 	val atlasBudget: AtlasBudget? = null,
 	/** Per-layer texture density, lock and pin by source layer ID ([AtlasLayout]). */
-	val textureOverrides: Map<String, io.github.psd2live.project.TextureOverride> = emptyMap(),
+	val textureOverrides: Map<String, io.github.psd2live.document.TextureOverride> = emptyMap(),
 	/** The stored atlas layout (`atlasArrangement` setting); null arranges the atlas automatically on every build. */
-	val atlasArrangement: io.github.psd2live.project.AtlasArrangement? = null,
+	val atlasArrangement: io.github.psd2live.document.AtlasArrangement? = null,
 ) {
 	/** The budget the atlas is packed within: [atlasBudget], else the legacy page size and padding with the default page count. */
 	fun effectiveAtlasBudget(): AtlasBudget = atlasBudget ?: AtlasBudget(atlasSize.coerceAtLeast(1), AtlasBudget.DEFAULT_MAX_PAGES, texturePadding.coerceAtLeast(0))
@@ -479,7 +465,9 @@ class AtlasPage private constructor(
 	constructor(image: BufferedImage) : this(image, null, null, null)
 
 	/** The canonical PNG (ImageIO), byte for byte what exports have always written. */
-	val png: ByteArray by lazy { encoded ?: AtlasPagePng.canonical(image) }
+	private val canonicalEncoding = lazy { encoded ?: AtlasPagePng.canonical(image) }
+	val png: ByteArray by canonicalEncoding
+	internal val hasCanonicalPng: Boolean get() = encoded != null || canonicalEncoding.isInitialized()
 
 	private val stripEncoding = lazy {
 		val reused = base?.takeIf { it.image.width == image.width && it.image.height == image.height }?.strips
@@ -518,7 +506,7 @@ data class PackedAtlas(
 	/** Why the layout departs from the request: a fit below 1, locks or pins that did not fit, pages beyond the budget. Logged only. */
 	val notices: List<String> = emptyList(),
 	/** The mesh footprints the stored arrangement gave tiles; a tile without one owns its whole rectangle. */
-	val footprints: Map<String, io.github.psd2live.project.TextureFootprint> = emptyMap(),
+	val footprints: Map<String, io.github.psd2live.document.TextureFootprint> = emptyMap(),
 	/** Whether the layout is a stored arrangement rather than the automatic one. */
 	val arranged: Boolean = false,
 ) {
@@ -562,6 +550,14 @@ data class RigPreviewModel(
 ) {
     /** Transient, immutable evaluation snapshot installed before publication; never document state. */
     internal var modifierEvaluation: io.github.psd2live.core.modifier.RigModifierEvaluationCache.Snapshot? = null
+    /** A releasable service handle, never part of the immutable evaluated model. */
+    internal var modifierBuildOwner: ModifierBuildCacheOwner? = null
+    internal var modifierBaseSnapshot: io.github.psd2live.core.modifier.ModifierBaseSnapshot? = null
+    internal fun retainModifierCachesFrom(previous: RigPreviewModel): RigPreviewModel = apply {
+        modifierEvaluation = previous.modifierEvaluation
+        modifierBuildOwner = previous.modifierBuildOwner
+        modifierBaseSnapshot = previous.modifierBaseSnapshot
+    }
 	/**
 	 * The generated rig the document's edits replay onto. A model built from a stored authored rig generates it only
 	 * when something asks for it.

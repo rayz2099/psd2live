@@ -29,6 +29,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -344,7 +347,7 @@ fun CanvasViewportComposable(
         }
     }
     val sourcePreviewModel = canvasState.previewModel
-    val editPuppet = if (mode == CanvasMode.EDIT) editor.preview else null
+    val editPuppet = if (mode == CanvasMode.EDIT) editor.displayPuppet else null
     val referenceOpacityDraft by viewModel.referenceOpacityDraft.collectAsState()
     val previewModel = remember(sourcePreviewModel, editPuppet, referenceOpacityDraft) {
         sourcePreviewModel?.let { source ->
@@ -1679,7 +1682,8 @@ fun CanvasViewportComposable(
 				val holeSize = size
 				val boundaryOffset = Offset(viewport.offsetX.toFloat(), viewport.offsetY.toFloat())
 				val boundarySize = Size((viewport.canvasWidth * viewport.scale).toFloat(), (viewport.canvasHeight * viewport.scale).toFloat())
-				composited.showView(renderKey, io.github.psd2live.render.CompositedView(canvasOrigin.x, canvasOrigin.y, holeSize.width, holeSize.height) { target, frame ->
+				val presentationOrigin = canvasOrigin
+				composited.showView(renderKey, io.github.psd2live.render.CompositedView(presentationOrigin.x, presentationOrigin.y, holeSize.width, holeSize.height) { target, frame ->
 					androidx.compose.ui.graphics.drawscope.CanvasDrawScope().draw(drawDensity, drawDirection, target.asComposeCanvas(), holeSize) {
 						when (background.kind) {
 							CanvasBackgroundKind.CHECKER -> drawRect(brush = checkerboardBrush)
@@ -1687,7 +1691,7 @@ fun CanvasViewportComposable(
 							CanvasBackgroundKind.TRANSPARENT -> drawRect(color = TransparentCanvasFill, blendMode = BlendMode.Src)
 						}
 						drawRect(color = Color(198, 205, 216, 105), topLeft = boundaryOffset, size = boundarySize, style = Stroke(width = 1f))
-						frame?.let { drawGpuFrame(it) }
+						frame?.let { drawGpuFrame(it, presentationOrigin = presentationOrigin) }
 					}
 				})
 				drawRect(Color.Transparent, blendMode = BlendMode.Clear)
@@ -1695,7 +1699,7 @@ fun CanvasViewportComposable(
 				previewHole.set(false)
 				previewGpu?.hideView(renderKey)
 				// Drawn in this draw, for this frame's request: the texture already matches the camera.
-				drawGpuFrame(previewDrawn)
+				drawGpuFrame(previewDrawn, presentationOrigin = canvasOrigin)
 			} else if (snapshotGeometry == null) {
 				if (previewHole.getAndSet(false)) previewGpu?.hideView(renderKey)
 				// Paint is an isolated document-canvas session: its live tiles belong only on the Edit
@@ -2331,6 +2335,15 @@ fun CanvasViewportComposable(
 				)
 			}
 		}
+        editor.error?.let { message ->
+            Row(Modifier.align(Alignment.TopCenter).padding(8.dp).widthIn(max = 600.dp)
+                .background(colors.windowBackground, RoundedCornerShape(4.dp))
+                .border(1.dp, colors.warning, RoundedCornerShape(4.dp)).padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text(message, color = colors.textPrimary, modifier = Modifier.weight(1f).padding(end = 8.dp))
+                io.github.psd2live.ui.components.CompactButton(tr("dialog.close"), onClick = { editor.error = null })
+            }
+        }
         // Overlay: Empty hint or Stats Badge
 		if (previewModel == null) {
 			EmptyCanvasHint(
@@ -2400,6 +2413,35 @@ fun CanvasViewportComposable(
 			}
 			if (mode == CanvasMode.EDIT && editor.hierarchyMode == EditHierarchyMode.SKELETON && editor.committedSkeleton == null) {
 				SkeletonCreatePrompt(editor, Modifier.align(Alignment.Center))
+			}
+			if (mode == CanvasMode.EDIT) {
+				val snapNotice by viewModel.parameterSnapNotice.collectAsState()
+				androidx.compose.animation.AnimatedVisibility(
+					visible = snapNotice != null,
+					enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(io.github.psd2live.ui.theme.Motion.Fade,
+						easing = androidx.compose.animation.core.LinearOutSlowInEasing)),
+					exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(io.github.psd2live.ui.theme.Motion.Instant,
+						easing = androidx.compose.animation.core.FastOutLinearInEasing)),
+					modifier = Modifier.align(Alignment.TopCenter).padding(top = 52.dp),
+				) {
+					val message = snapNotice ?: ""
+					Row(
+						modifier = Modifier
+							.frostedGlass(shape = RoundedCornerShape(io.github.psd2live.ui.theme.Corners.Panel), elevation = 2.dp, alpha = 0.82f)
+							.padding(horizontal = 10.dp, vertical = 5.dp),
+						verticalAlignment = Alignment.CenterVertically,
+						horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp),
+					) {
+						Box(Modifier.size(6.dp).background(colors.accent, androidx.compose.foundation.shape.CircleShape))
+						Text(
+							text = message,
+							style = typography.captionSmall,
+							color = colors.textPrimary,
+							maxLines = 1,
+							overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+						)
+					}
+				}
 			}
 			// Merges an earlier version made that this one makes differently: offered where the trouble shows, not only in Tools.
 			if (canvasState.staleRegenerations > 0 && !canvasState.staleRegenerationsDismissed && viewModel.canUpdateGeneration(canvasState)) {
@@ -2734,7 +2776,7 @@ private const val ONION_TINT = 0.6f
  * Draws a GPU frame at the origin: the top-left [GpuFrame.width] × [GpuFrame.height] texels of its texture, faded
  * to [alpha] and, for an onion-skin ghost, washed with [tint].
  */
-internal fun androidx.compose.ui.graphics.drawscope.DrawScope.drawGpuFrame(frame: GpuFrame, alpha: Float = 1f, tint: Color? = null) {
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.drawGpuFrame(frame: GpuFrame, alpha: Float = 1f, tint: Color? = null, presentationOrigin: Offset? = null) {
 	drawIntoCanvas { canvas ->
 		val rect = org.jetbrains.skia.Rect.makeWH(frame.width.toFloat(), frame.height.toFloat())
 		val paint = if (alpha < 1f || tint != null) org.jetbrains.skia.Paint().apply {
@@ -2743,6 +2785,7 @@ internal fun androidx.compose.ui.graphics.drawscope.DrawScope.drawGpuFrame(frame
 		} else null
 		try {
 			canvas.nativeCanvas.drawImageRect(frame.image, rect, rect, org.jetbrains.skia.SamplingMode.DEFAULT, paint, true)
+            io.github.psd2live.render.WindowFramePresentation.consume(frame, presentationOrigin?.x, presentationOrigin?.y)
 		} finally {
 			paint?.close()
 		}

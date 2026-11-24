@@ -174,6 +174,12 @@ class WorkspaceTextureView internal constructor(private val capture: WorkspaceCa
     private val model get() = capture.model
     private val document get() = capture.document
 
+    /** Only the model in this atomic capture can carry its committed revision into the renderer. */
+    internal fun presentationOrigin(preview: RigPreviewModel): io.github.psd2live.util.PresentationOrigin? =
+        if (preview === capture.model) io.github.psd2live.util.PresentationOrigin(capture.revision, capture.state,
+            capture.observation?.takeIf { it.state == capture.state && it.revision == capture.revision &&
+                it.edit.projectId == capture.projectId && it.edit.loadingIdentity == capture.loadingIdentity }) else null
+
     private fun tile(id: String): WorkspaceAtlasTile? {
         val placement = model.atlas.placementByLayerId[id] ?: return null
         val override = document.textureOverrides[id] ?: TextureOverride()

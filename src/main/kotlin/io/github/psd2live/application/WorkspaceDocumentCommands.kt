@@ -1,16 +1,24 @@
 package io.github.psd2live.application
 
 import io.github.psd2live.core.RigPreviewModel
+import io.github.psd2live.core.RigBuildProfile
 import io.github.psd2live.core.GeometrySafetyEvaluator
 import io.github.psd2live.core.GeometrySafetyRejectedException
 import io.github.psd2live.core.GeometrySafetyReport
+import io.github.psd2live.core.PSD2LivePipeline
+import io.github.psd2live.core.ProgressListener
+import io.github.psd2live.core.modifier.BuiltinModifierPlugins
+import io.github.psd2live.core.modifier.ModifierStatus
+import io.github.psd2live.core.modifier.RigModifierStack
 import io.github.psd2live.project.MutationAuthor
 import io.github.psd2live.project.WorkspaceDocument
 import io.github.psd2live.project.WorkspaceMutationResult
 import io.github.psd2live.project.WorkspaceRevisions
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import org.umamo.runtime.model.Deformer
 import org.umamo.runtime.model.PuppetModel
@@ -25,9 +33,9 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
     suspend fun execute(projectId: String, state: String, summary: String, edits: List<WorkspaceDocumentOperation>,
                         author: MutationAuthor, taskId: String? = null,
                         poses: (Map<String, WorkspacePose>) -> Unit = {},
-                        beforeCommit: (WorkspaceCapture<RigPreviewModel>, WorkspaceDocument, RigPreviewModel) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> {
+                        beforeCommit: (WorkspaceCapture<RigPreviewModel>, WorkspaceDocument, RigPreviewModel) -> Unit = { _, _, _ -> }): WorkspaceCommit<RigPreviewModel> = WorkspaceEditObservation.observe(state, summary, taskId) {
         require(edits.size in 1..128) { "Use 1..128 edits" }
-        require(edits.all { it.operation in WorkspaceDocumentEdits.supported }) { "Batch contains an unsupported document operation" }
+        require(edits.all { it.operation in WorkspaceDocumentEdits.supported || it.operation == "modifier_rebind" }) { "Batch contains an unsupported document operation" }
         val (before, resources) = runtime.withCapture { capture ->
             if (capture.state != state) throw WorkspaceConflict(state, capture.state)
             require(capture.projectId == projectId) { "Operation targets another project" }
@@ -37,12 +45,14 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
         val context = currentCoroutineContext()
         val batch = context[WorkspaceBatchJobExecution]
         require(batch == null || batch.edits == edits) { "A nested document command cannot replace the active batch" }
-        val prepared = prepare(projectId, state, edits, resources)
-        val geometry = checkGeometry(prepared)
+        val prepared = RigBuildProfile.stage("document edit: prepare candidate") {
+            prepare(projectId, state, edits, resources)
+        }
+        val geometry = RigBuildProfile.stage("document edit: validate geometry") { checkGeometry(prepared) }
         if (!geometry.safe) throw GeometrySafetyRejectedException(geometry)
         val diagnostics = geometry.takeIf { it.affectedTargets.isNotEmpty() }?.toJson()
         val result = runtime.commitPrepared(projectId, state, summary, author, prepared.draft.document, prepared.model,
-            taskId = taskId, auxiliary = prepared.draft.auxiliary.takeIf { it != prepared.before.auxiliary },
+            taskId = taskId, observation = prepared.observation, auxiliary = prepared.draft.auxiliary.takeIf { it != prepared.before.auxiliary },
             beforeCommit = { captured, document, model ->
                 batch?.committing()
                 beforeCommit(captured, document, model)
@@ -50,7 +60,7 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
             }).copy(geometryDiagnostics = diagnostics)
         // No suspension between the authoritative CAS and retaining its complete public result.
         batch?.committed(mutationResult(before, result, summary, edits))
-        return result
+        result
     }
 
     /** Same preparation and gate as commit, without projection, CAS, history or resource publication. */
@@ -123,12 +133,47 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
         }
     }
 
+    /** Rebuilds the static rig for a style sample without preparing playback or publishing a document draft. */
+    suspend fun <T> renderTurnStyle(projectId: String, state: String, operation: WorkspaceDocumentOperation,
+                                   render: suspend (RigPreviewModel) -> T): T {
+        val before = runtime.withCapture {
+            if (it.state != state) throw WorkspaceConflict(state, it.state)
+            require(it.projectId == projectId) { "Operation targets another project" }
+            it
+        }
+        val model = when (operation.operation) {
+            "modifier_update" -> buildTurnStyleStack(before.document, before.model, operation.request)
+            "settings_update" -> {
+                val builder = WorkspacePreviewBuilder(deferRuntimeBundles = true)
+                val document = runInterruptible(Dispatchers.Default) {
+                    val settings = WorkspaceSettingsIntent.parse(before.document, before.model, operation.request.getValue("changes").jsonObject).settings
+                    val overlay = before.document.rigEdits
+                    before.document.copy(settings = settings, rigEdits = overlay.copy(simEdits = overlay.simEdits.map { it.copy(enabled = false) }))
+                }
+                builder.build(builder.normalizeMeshEdits(document, before.model), before.model)
+            }
+            else -> error("Unsupported turn style edit: ${operation.operation}")
+        }
+        try {
+            if (operation.operation == "modifier_update") {
+                val id = operation.request.getValue("id").jsonPrimitive.content
+                val entry = model.modifierEvaluation?.entries?.firstOrNull { it.instance.id == id }
+                require(entry?.status == ModifierStatus.ACTIVE) { entry?.error ?: "Modifier $id is inactive" }
+            }
+            return render(model)
+        } finally {
+            model.modifierBuildOwner?.takeUnless { it.published }?.close()
+        }
+    }
+
     private suspend fun prepare(projectId: String, state: String, edits: List<WorkspaceDocumentOperation>,
                                 resources: WorkspaceAssetWorkflow?): WorkspacePreparedDraft<RigPreviewModel> {
         val context = currentCoroutineContext()
         val batch = context[WorkspaceBatchJobExecution]
-        val prepared = runtime.prepareDraft(projectId, state,
-            edits.mapIndexed { index, operation -> WorkspaceDraftEdit { draft, model ->
+        val draftInputs = WorkspaceModifierDraftInputs()
+        val draftEdits = edits.mapIndexed { index, operation ->
+            WorkspaceDraftEdit<RigPreviewModel> { draft, model ->
+                draftInputs.pipeline = null
                 batch?.preparing(index)
                 if (operation.operation == "settings_update") {
                     // Settings also release authored poses; both stay in this member's private candidate.
@@ -144,13 +189,26 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
                     batch?.fitting(index, id, fraction) ?: context[WorkspaceJobContext]?.progress(0.1f + 0.65f * fraction, "Fitting physics $id")
                 }, rasterWork.cancellable(context) { fraction, message ->
                     batch?.painting(index, fraction, message) ?: context[WorkspaceJobContext]?.progress(0.05f + 0.75f * fraction, message)
-                }, resources) }
-                draft.copy(document = if (operation.operation in WorkspaceModifierEdits.supported) previews.normalizeMeshEdits(candidate, model)
+                }, resources, draftInputs) }
+                val paintOnly = operation.operation == "vertex_group_paint" && operation.request["auto_bake"]?.jsonPrimitive?.boolean != true
+                val skipSimulationBake = paintOnly || operation.operation in WorkspaceModifierEdits.supported ||
+                    operation.operation == "modifier_rebind" || WorkspaceMeshPointEdits.simulationInputsUnchanged(document, candidate)
+                draft.copy(document = if (skipSimulationBake) previews.normalizeMeshEdits(candidate, model)
                     else normalizeCandidate(candidate, model))
-            } },
-            editFailure = { index, failure -> WorkspaceBatchEditException(index, edits[index].operation, failure) })
+            }
+        }
+        val prepared = withContext(draftInputs) {
+            runtime.prepareDraft(projectId, state, draftEdits,
+                editFailure = { index, failure -> WorkspaceBatchEditException(index, edits[index].operation, failure) })
+        }
         runInterruptible(Dispatchers.Default) {
             WorkspaceAssetLayerEdits.validate(prepared.before.document, prepared.draft.document, prepared.model)
+            try {
+                WorkspaceModifierEdits.validateAppliedContent(prepared.before.model, prepared.model)
+            } catch (failure: IllegalArgumentException) {
+                val index = edits.lastIndex
+                throw WorkspaceBatchEditException(index, edits[index].operation, failure)
+            }
             // Tile moves and densities land on their spots or not at all, as the same single commands do; a batch that
             // also lays the atlas out anew (budget, packing, new pixels) places tiles by its own rule.
             val operations = edits.mapTo(HashSet()) { it.operation }
@@ -188,18 +246,20 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
                                  taskId: String? = null,
                                  mutation: (WorkspaceDocument, RigPreviewModel) -> WorkspaceDocument,
                                  beforeCommit: (WorkspaceCapture<RigPreviewModel>, WorkspaceDocument, RigPreviewModel) -> Unit = { _, _, _ -> },
-                                 validate: (WorkspaceDocument, RigPreviewModel, WorkspaceDocument, RigPreviewModel) -> Unit = { _, _, _, _ -> }): WorkspaceCommit<RigPreviewModel> {
+                                 validate: (WorkspaceDocument, RigPreviewModel, WorkspaceDocument, RigPreviewModel) -> Unit = { _, _, _, _ -> }): WorkspaceCommit<RigPreviewModel> = WorkspaceEditObservation.observe(state, summary, taskId) {
         val prepared = runtime.prepareDraft(projectId, state, listOf(WorkspaceDraftEdit { draft, model ->
             val candidate = runInterruptible(Dispatchers.Default) { mutation(draft.document, model) }
-            draft.copy(document = normalizeCandidate(candidate, model))
+            draft.copy(document = if (WorkspaceMeshPointEdits.simulationInputsUnchanged(draft.document, candidate))
+                previews.normalizeMeshEdits(candidate, model) else normalizeCandidate(candidate, model))
         }))
         // The candidate's own build, checked before anything is published.
+        WorkspaceModifierEdits.validateAppliedContent(prepared.before.model, prepared.model)
         runInterruptible(Dispatchers.Default) { validate(prepared.before.document, prepared.before.model, prepared.draft.document, prepared.model) }
         val geometry = checkGeometry(prepared)
         if (!geometry.safe) throw GeometrySafetyRejectedException(geometry)
         val diagnostics = geometry.takeIf { it.affectedTargets.isNotEmpty() }?.toJson()
-        return runtime.commitPrepared(projectId, state, summary, author, prepared.draft.document, prepared.model,
-            taskId = taskId, auxiliary = prepared.draft.auxiliary, beforeCommit = beforeCommit).copy(geometryDiagnostics = diagnostics)
+        runtime.commitPrepared(projectId, state, summary, author, prepared.draft.document, prepared.model,
+            taskId = taskId, observation = prepared.observation, auxiliary = prepared.draft.auxiliary, beforeCommit = beforeCommit).copy(geometryDiagnostics = diagnostics)
     }
 
     /** Settings commands that may release authored poses; other generation inputs keep [executeCandidate]. */
@@ -211,11 +271,45 @@ internal class WorkspaceDocumentCommands(private val runtime: WorkspaceRuntime<R
             val next = runInterruptible(Dispatchers.Default) { WorkspaceSettingsIntent.parse(draft.document, model, changes).apply(draft, model) }
             next.copy(document = normalizeCandidate(next.document, model))
         })) { captured, draft, model ->
+            WorkspaceModifierEdits.validateAppliedContent(captured.model, model)
             beforeCommit(captured, draft.document, model)
             changedPoses(captured, draft, model).takeIf { it.isNotEmpty() }?.let(poses)
         }
 
     companion object {
+        internal suspend fun buildTurnStyleStack(document: WorkspaceDocument, current: RigPreviewModel, request: JsonObject, shareOwner: Boolean = true): RigPreviewModel {
+            val context = currentCoroutineContext()
+            return runInterruptible(Dispatchers.Default) {
+                val overlay = document.rigEdits
+                val stack = WorkspaceModifierEdits.updateConfiguration(
+                    RigModifierStack.fromJson(requireNotNull(overlay.modifierStack)), request, current)
+                // Applied patches are authored geometry. Only live playback stages are omitted from the render stack.
+                val skipped = stack.instances.filter { it.type in playbackModifierTypes && it.id !in stack.appliedNodes }
+                    .mapTo(HashSet()) { it.id }
+                val staticStack = if (skipped.isEmpty()) stack else stack.copy(
+                    instances = stack.instances.filterNot { it.id in skipped },
+                    overrides = stack.overrides - skipped,
+                    initializationFailures = stack.initializationFailures - skipped,
+                    retryRevisions = stack.retryRevisions - skipped,
+                    organization = null,
+                )
+                val pipeline = PSD2LivePipeline().apply {
+                    deferRuntimeBundles = true
+                    reuseModifierInputs(current, shareOwner)
+                }
+                val config = current.config.copy(rigEdits = overlay.copy(modifierStack = staticStack.toJson()))
+                val model = pipeline.buildPreview(document.source, config,
+                    ProgressListener { _, _ -> context.ensureActive() }, current.atlas)
+                WorkspaceReferenceMeshes.sketched(model, document)
+            }
+        }
+
+        private val playbackModifierTypes by lazy {
+            val aliases = setOf("simulation", "physics", "motion")
+            aliases + aliases.flatMap { type ->
+                BuiltinModifierPlugins.entry(type, 1)?.artifact?.manifest?.algorithms.orEmpty().map { it.type }
+            }
+        }
         /** The authored poses a commit changes, read against the committed model as every later reader will. */
         fun changedPoses(before: WorkspaceCapture<RigPreviewModel>, draft: WorkspaceDraft, model: RigPreviewModel): Map<String, WorkspacePose> {
             val records = draft.auxiliary["posesByWorkspace"]?.jsonObject.orEmpty()

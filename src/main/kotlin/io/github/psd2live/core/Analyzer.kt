@@ -4,18 +4,23 @@ import io.github.psd2live.i18n.tr
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import org.umamo.format.art.SourceArt
+import org.umamo.format.art.isEffectivelyVisible
 import kotlin.math.max
 
 object CharacterAnalyzer {
 	/** [layer] classified at canvas resolution ([CanvasDensity]): a dense layer is analysed through its canvas view. */
-	internal fun classify(layer: org.umamo.format.art.SourceLayer, config: PipelineConfig): ClassifiedLayer =
-		LayerClassifier.classify(CanvasDensity.canvasLayer(layer), config.alphaThreshold).withOverride(config.layerOverrides[layer.id.raw])
+	internal fun classify(layer: org.umamo.format.art.SourceLayer, config: PipelineConfig): ClassifiedLayer {
+		val canvas = CanvasDensity.canvasLayer(layer)
+		val classified = LayerClassifier.classify(canvas, config.alphaThreshold)
+		val covered = if (config.meshAlphaCoverage && classified.opaquePixels == 0) LayerClassifier.classify(canvas, 1) else classified
+		return covered.withOverride(config.layerOverrides[layer.id.raw])
+	}
 
 	/** Recreate retained legacy component identities without building a model or discarding deleted pixels. */
 	internal fun expandLayer(original: ClassifiedLayer, config: PipelineConfig, unitScale: Float = 1f,
 	                         references: LegacySplitReferences = LegacySplitReferences(config)): List<ClassifiedLayer> {
 		if (!references.preserves(original.source.id.raw)) return listOf(original)
-		return ComponentSplitter.split(original, config.meshSpacing.toFloat(), config.alphaThreshold, unitScale).map { component ->
+		return ComponentSplitter.split(original, config.meshSpacing.toFloat(), config.alphaThreshold, unitScale, config.meshAlphaCoverage).map { component ->
 			val override = config.layerOverrides[component.source.id.raw] ?: config.layerOverrides[original.source.id.raw]
 			component.withOverride(override, preserveSide = component.source.id != original.source.id)
 		}
@@ -42,8 +47,10 @@ object CharacterAnalyzer {
 		// reference generated :r/:l IDs, so retain those identities when they carry edits.
 		val unitScale = MeshResolution.unitScale(config, source)
 		val references = LegacySplitReferences(config)
-		val layers = PartRoles.infer(initiallyClassified.flatMap { expandLayer(it, config, unitScale, references) }
+		val sided = inferBrowSides(initiallyClassified, source.widthPx / 2f, config.layerOverrides.keys)
+		val withRoles = PartRoles.infer(sided.flatMap { expandLayer(it, config, unitScale, references) }
 			.filter { it.source.id.raw !in config.deletedLayerIds }, config.layerOverrides)
+		val layers = inferEyeDetailSides(withRoles, source, config.layerOverrides.keys)
 		if (RigBuildProfile.recording) RigBuildProfile.add("analyze: classify layers", System.nanoTime() - classifyStart)
 		val warnings = source.warnings.toMutableList()
 		val nonEmpty = layers.filter { it.opaquePixels > 0 }
@@ -73,6 +80,50 @@ object CharacterAnalyzer {
         }
         return PipelineAnalysis(source, layers, calibration?.anchors ?: anchors, warnings,
             RigBuildProfile.stage("analyze: composite preview") { preview() }, calibration)
+	}
+
+	/** Unnamed unilateral brows use artwork placement; drawings spanning both eyes remain bilateral. */
+	internal fun inferBrowSides(layers: List<ClassifiedLayer>, canvasCenter: Float, explicit: Set<String> = emptySet()): List<ClassifiedLayer> {
+		val whites = layers.filter { it.semantic.tag == SemanticTag.EYEWHITE && it.opaquePixels > 0 }
+		val center = if (whites.isEmpty()) canvasCenter else (whites.minOf { it.bounds.left } + whites.maxOf { it.bounds.right }) / 2f
+		return layers.map { layer ->
+			if (layer.semantic.tag != SemanticTag.EYEBROW || layer.semantic.side != Side.NONE || layer.source.id.raw in explicit) layer
+			else {
+				val side = when {
+					layer.bounds.right <= center -> Side.RIGHT
+					layer.bounds.left >= center -> Side.LEFT
+					else -> Side.NONE
+				}
+				if (side == Side.NONE) layer else layer.copy(semantic = layer.semantic.copy(side = side))
+			}
+		}
+	}
+
+	/** Place eyelid paint on the corresponding eye when the named openings confirm both sides of the face. */
+	private fun inferEyeDetailSides(layers: List<ClassifiedLayer>, source: SourceArt, explicit: Set<String>): List<ClassifiedLayer> {
+		if (layers.none { it.semantic.role == PartRole.EYE_DETAIL }) return layers
+		val eyes = layers.filter {
+			it.semantic.tag == SemanticTag.EYEWHITE && it.semantic.role == null && it.semantic.confidence >= .85f &&
+				it.opaquePixels >= 12 && it.source.opacity > 0f && source.isEffectivelyVisible(it.source)
+		}
+		fun eyeOf(side: Side) = eyes.filter { it.semantic.side == side }.maxByOrNull { it.opaquePixels }?.bounds
+		val right = eyeOf(Side.RIGHT) ?: return layers
+		val left = eyeOf(Side.LEFT) ?: return layers
+		if (right.right >= left.left || kotlin.math.abs(right.centerY - left.centerY) > max(right.height, left.height)) return layers
+		val middle = (right.right + left.left) * .5f
+		return layers.map { layer ->
+			val id = layer.source.id.raw
+			val overridden = id in explicit || (id.endsWith(":l") || id.endsWith(":r")) && id.dropLast(2) in explicit
+			if (layer.semantic.role != PartRole.EYE_DETAIL || layer.opaquePixels <= 0 || overridden) layer
+			else {
+				val side = when {
+					layer.bounds.right <= middle -> Side.RIGHT
+					layer.bounds.left >= middle -> Side.LEFT
+					else -> layer.semantic.side
+				}
+				if (side == layer.semantic.side) layer else layer.copy(semantic = layer.semantic.copy(side = side))
+			}
+		}
 	}
 
 	/** Refit rig anchors after the actual renderable mesh footprints replace pixel alpha boxes. */
@@ -178,7 +229,7 @@ internal class LegacySplitReferences(config: PipelineConfig) {
 	}
 
 	private companion object {
-		private val cache = io.github.psd2live.project.IdentityWeakCache<kotlinx.serialization.json.JsonObject, Set<String>>()
+		private val cache = io.github.psd2live.util.IdentityWeakCache<kotlinx.serialization.json.JsonObject, Set<String>>()
 
 		fun quotedComponents(command: kotlinx.serialization.json.JsonObject): Set<String> = cache.getOrPut(command) {
 			val text = command.toString()

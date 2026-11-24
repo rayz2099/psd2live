@@ -6,11 +6,14 @@ import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.rememberTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import io.github.psd2live.ui.theme.Corners
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.TooltipArea
@@ -26,6 +29,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -33,10 +37,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.Surface
@@ -336,12 +343,13 @@ internal fun AccentButton(label: String?, onClick: () -> Unit, enabled: Boolean 
  * A menu dropping from a bar control, in the mode menu's style: frosted, scaling in from its anchor's corner.
  * Put it in the anchor's Box; [alignment] TopStart drops it under the anchor's left edge, TopEnd under its right.
  * [rise] opens it above the anchor instead, for controls at the bottom of a canvas (align the Box BottomStart).
+ * When [width] is unspecified, the menu is at least as wide as its anchor control and expands to fit its content.
  */
 @Composable
 internal fun FloatingMenu(
 	expanded: Boolean,
 	onDismiss: () -> Unit,
-	width: Dp = 220.dp,
+	width: Dp = Dp.Unspecified,
 	alignment: Alignment = Alignment.TopStart,
 	rise: Boolean = false,
 	content: @Composable ColumnScope.() -> Unit,
@@ -352,20 +360,59 @@ internal fun FloatingMenu(
 	val colors = LocalToolColors.current
 	val typography = LocalToolTypography.current
 	val density = LocalDensity.current
+	var anchorWidthPx by remember { mutableStateOf(0) }
+	val gapPx = with(density) { 4.dp.roundToPx() }
+	val marginPx = with(density) { 4.dp.roundToPx() }
+	val alignEnd = alignment == Alignment.TopEnd || alignment == Alignment.BottomEnd
+	val positionProvider = remember(gapPx, marginPx, alignEnd, rise) {
+		object : androidx.compose.ui.window.PopupPositionProvider {
+			override fun calculatePosition(
+				anchorBounds: androidx.compose.ui.unit.IntRect,
+				windowSize: androidx.compose.ui.unit.IntSize,
+				layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+				popupContentSize: androidx.compose.ui.unit.IntSize,
+			): IntOffset {
+				if (anchorWidthPx != anchorBounds.width) anchorWidthPx = anchorBounds.width
+				val rawX = if (alignEnd) anchorBounds.right - popupContentSize.width else anchorBounds.left
+				val x = rawX.coerceIn(marginPx, maxOf(marginPx, windowSize.width - popupContentSize.width - marginPx))
+				val aboveY = anchorBounds.top - gapPx - popupContentSize.height
+				val belowY = anchorBounds.bottom + gapPx
+				val rawY = if (rise) {
+					if (aboveY >= marginPx || aboveY >= windowSize.height - belowY - popupContentSize.height) aboveY else belowY
+				} else {
+					if (belowY + popupContentSize.height <= windowSize.height - marginPx || belowY + popupContentSize.height <= windowSize.height) belowY else aboveY
+				}
+				val y = rawY.coerceIn(marginPx, maxOf(marginPx, windowSize.height - popupContentSize.height - marginPx))
+				return IntOffset(x, y)
+			}
+		}
+	}
+	val anchorMinWidth = with(density) { anchorWidthPx.toDp() }
+	val minOuterWidth = if (width != Dp.Unspecified) maxOf(width, anchorMinWidth) else anchorMinWidth
+	val minInnerWidth = (minOuterWidth - 8.dp).coerceAtLeast(0.dp)
 	val body: @Composable () -> Unit = {
 		CompositionLocalProvider(LocalDensity provides density, LocalToolColors provides colors, LocalToolTypography provides typography) {
 			Box(
 				Modifier
-					.menuAppearance(visibility, TransformOrigin(if (alignment == Alignment.TopEnd || alignment == Alignment.BottomEnd) 0.88f else 0.12f, if (rise) 1f else 0f), rise)
-					.width(width)
+					.menuAppearance(visibility, TransformOrigin(if (alignEnd) 0.88f else 0.12f, if (rise) 1f else 0f), rise)
+					.then(if (width != Dp.Unspecified) Modifier.width(minOuterWidth) else Modifier.defaultMinSize(minWidth = anchorMinWidth))
+					.heightIn(max = 360.dp)
 					.menuPanel()
-					.padding(4.dp),
-			) { MenuGlide { Column(verticalArrangement = Arrangement.spacedBy(1.dp), content = content) } }
+					.padding(4.dp)
+					.verticalScroll(rememberScrollState()),
+			) {
+				MenuGlide {
+					Column(
+						Modifier.width(IntrinsicSize.Max).defaultMinSize(minWidth = minInnerWidth),
+						verticalArrangement = Arrangement.spacedBy(1.dp),
+						content = content,
+					)
+				}
+			}
 		}
 	}
 	Popup(
-		alignment = alignment,
-		offset = with(density) { IntOffset(0, (if (rise) -28 else 28).dp.roundToPx()) },
+		popupPositionProvider = positionProvider,
 		onDismissRequest = onDismiss,
 		properties = PopupProperties(focusable = true),
 		content = body,
@@ -373,48 +420,105 @@ internal fun FloatingMenu(
 }
 
 /**
+ * A small side popover shown to the right (or left, when near the window's right edge) of a hovered dropdown row to
+ * explain an abbreviated option without covering sibling rows in the open list.
+ */
+@Composable
+internal fun MenuItemSideTip(description: String?, visible: Boolean) {
+	if (!visible || description.isNullOrBlank()) return
+	val colors = LocalToolColors.current
+	val typography = LocalToolTypography.current
+	val density = LocalDensity.current
+	val gapPx = with(density) { 10.dp.roundToPx() }
+	val marginPx = with(density) { 8.dp.roundToPx() }
+	val provider = remember(gapPx, marginPx) {
+		object : androidx.compose.ui.window.PopupPositionProvider {
+			override fun calculatePosition(
+				anchorBounds: androidx.compose.ui.unit.IntRect,
+				windowSize: androidx.compose.ui.unit.IntSize,
+				layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+				popupContentSize: androidx.compose.ui.unit.IntSize,
+			): IntOffset {
+				val right = anchorBounds.right + gapPx
+				val left = anchorBounds.left - gapPx - popupContentSize.width
+				val opensLeft = right + popupContentSize.width > windowSize.width - marginPx &&
+					(left >= marginPx || anchorBounds.left > windowSize.width - anchorBounds.right)
+				val x = (if (opensLeft) left else right)
+					.coerceIn(marginPx, maxOf(marginPx, windowSize.width - popupContentSize.width - marginPx))
+				val y = anchorBounds.top
+					.coerceIn(marginPx, maxOf(marginPx, windowSize.height - popupContentSize.height - marginPx))
+				return IntOffset(x, y)
+			}
+		}
+	}
+	Popup(
+		popupPositionProvider = provider,
+		properties = PopupProperties(focusable = false),
+	) {
+		CompositionLocalProvider(
+			LocalDensity provides density,
+			LocalToolColors provides colors,
+			LocalToolTypography provides typography,
+		) {
+			Box(
+				Modifier
+					.widthIn(max = 220.dp)
+					.menuPanel()
+					.padding(horizontal = 8.dp, vertical = 5.dp),
+			) {
+				Text(
+					text = description,
+					style = typography.captionSmall.copy(fontSize = 10.5.sp, lineHeight = 14.5.sp),
+					color = colors.textPrimary,
+				)
+			}
+		}
+	}
+}
+
+/**
  * How every menu comes and goes: fading in while it grows from [origin] and settles toward its anchor, leaving
  * quicker than it came. [rise] for a menu that opens upward from its anchor.
  */
 @Composable
-internal fun Modifier.menuAppearance(visibility: MutableTransitionState<Boolean>, origin: TransformOrigin, rise: Boolean): Modifier {
-	val density = LocalDensity.current
+internal fun Modifier.menuAppearance(visibility: MutableTransitionState<Boolean>, origin: TransformOrigin, @Suppress("UNUSED_PARAMETER") rise: Boolean): Modifier {
 	val transition = rememberTransition(visibility, "menu")
 	val alpha by transition.animateFloat({
-		if (false isTransitioningTo true) tween(Motion.Fade, easing = LinearOutSlowInEasing) else tween(Motion.Instant, easing = FastOutLinearInEasing)
+		if (false isTransitioningTo true) spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 2400f)
+		else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f)
 	}, "alpha") { if (it) 1f else 0f }
 	val scale by transition.animateFloat({
-		if (false isTransitioningTo true) tween(Motion.Quick, easing = LinearOutSlowInEasing) else tween(Motion.Instant, easing = FastOutLinearInEasing)
-	}, "scale") { if (it) 1f else 0.92f }
-	val lift by transition.animateFloat({
-		if (false isTransitioningTo true) tween(Motion.Quick, easing = FastOutSlowInEasing) else tween(Motion.Instant, easing = FastOutLinearInEasing)
-	}, "lift") { if (it) 0f else 6f }
+		if (false isTransitioningTo true) spring(dampingRatio = 0.68f, stiffness = 2400f)
+		else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f)
+	}, "scale") { if (it) 1f else 0.94f }
 	return graphicsLayer {
 		this.alpha = alpha; scaleX = scale; scaleY = scale
-		translationY = (if (rise) lift else -lift) * density.density
 		transformOrigin = origin
 	}
 }
 
-/** The frosted panel every menu sits on. */
+/** The elevated panel every menu sits on. */
 @Composable
 internal fun Modifier.menuPanel(): Modifier {
 	val colors = LocalToolColors.current
-	val shape = RoundedCornerShape(7.dp)
-	return frostedGlass(shape, isHovered = true, elevation = 12.dp, baseColor = colors.panelElevated, alpha = 0.9f)
-		.border(0.5.dp, colors.borderHover.copy(alpha = 0.45f), shape)
+	val shape = RoundedCornerShape(Corners.Panel)
+	return this
+		.clip(shape)
+		.background(colors.panelElevated, shape)
+		.border(1.dp, colors.border, shape)
 }
 
-/** A menu row arriving in turn: [index] rows after the first, fading and sliding in from its side. */
+/** A menu row arriving with a crisp fade-in, without sliding movement. */
 @Composable
 internal fun Modifier.menuArrival(index: Int): Modifier {
 	val arrival = remember { androidx.compose.animation.core.Animatable(0f) }
 	// Staggered on the frame clock, so it keeps time with the frames that draw it.
-	LaunchedEffect(Unit) { arrival.animateTo(1f, tween(Motion.RowArrival, delayMillis = index * Motion.RowStagger, easing = FastOutSlowInEasing)) }
-	val density = LocalDensity.current
+	LaunchedEffect(Unit) {
+		if (index > 0) kotlinx.coroutines.delay((index * 8L).coerceAtMost(40L))
+		arrival.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 2400f))
+	}
 	return graphicsLayer {
 		alpha = arrival.value
-		translationX = (1f - arrival.value) * -8f * density.density
 	}
 }
 
@@ -451,8 +555,8 @@ internal fun MenuGlide(modifier: Modifier = Modifier, content: @Composable () ->
 	val density = LocalDensity.current
 	val host = remember { MenuGlideHost() }
 	val target = host.target
-	val glow by animateFloatAsState(if (target != null) 1f else 0f, tween(Motion.Quick, easing = FastOutSlowInEasing))
-	val highlightColor by animateColorAsState(if (host.danger) colors.error.copy(alpha = 0.14f) else colors.controlHover.copy(alpha = 0.75f), tween(Motion.Instant))
+	val glow by animateFloatAsState(if (target != null) 1f else 0f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f))
+	val highlightColor by animateColorAsState(if (host.danger) colors.error.copy(alpha = 0.14f) else colors.controlHover.copy(alpha = 0.75f), spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f))
 	val left = remember { androidx.compose.animation.core.Animatable(0f) }
 	val top = remember { androidx.compose.animation.core.Animatable(0f) }
 	val width = remember { androidx.compose.animation.core.Animatable(0f) }
@@ -460,10 +564,10 @@ internal fun MenuGlide(modifier: Modifier = Modifier, content: @Composable () ->
 	LaunchedEffect(target) {
 		val rect = target ?: return@LaunchedEffect
 		val edges = listOf(left to rect.left, top to rect.top, width to rect.width, height to rect.height)
-		// Appearing, it starts on its row; moving, it glides there.
+		// Appearing, it starts on its row; moving, it glides there with a crisp slight rebound.
 		if (glow < 0.05f) edges.forEach { (edge, value) -> edge.snapTo(value) }
 		else kotlinx.coroutines.coroutineScope {
-			edges.forEach { (edge, value) -> launch { edge.animateTo(value, tween(Motion.Instant, easing = FastOutSlowInEasing)) } }
+			edges.forEach { (edge, value) -> launch { edge.animateTo(value, spring(dampingRatio = 0.76f, stiffness = 2800f)) } }
 		}
 	}
 	Box(modifier.onGloballyPositioned { host.coordinates = it }.onPointerEvent(PointerEventType.Exit) { host.target = null }) {
@@ -554,9 +658,11 @@ internal fun FloatingMenuRow(
 	selected: Boolean = false,
 	enabled: Boolean = true,
 	hint: String? = null,
+	description: String? = null,
 	trailing: String? = null,
 	bar: Boolean = true,
 	danger: Boolean = false,
+	warning: Boolean = false,
 	icon: (@Composable (Color) -> Unit)? = null,
 	control: (@Composable () -> Unit)? = null,
 ) {
@@ -564,17 +670,16 @@ internal fun FloatingMenuRow(
 	val interactionSource = remember { MutableInteractionSource() }
 	val hovered by interactionSource.collectIsHoveredAsState()
 	val tint = when {
-		!enabled -> colors.textMuted.copy(alpha = 0.5f)
+		!enabled -> colors.textDisabled
 		danger -> colors.error
-		selected -> colors.textPrimary
-		hovered -> colors.textPrimary
-		else -> colors.textMuted
+		warning -> colors.warning
+		else -> colors.textPrimary
 	}
 	val glide = LocalMenuGlide.current
 	val background by animateColorAsState(if (hovered && enabled && !glide) {
 		if (danger) colors.error.copy(alpha = 0.14f) else colors.controlHover.copy(alpha = 0.75f)
-	} else Color.Transparent, tween(Motion.Instant))
-	val edge by animateFloatAsState(if (selected && bar) 1f else 0f, tween(Motion.Instant, easing = FastOutSlowInEasing))
+	} else Color.Transparent, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 3200f))
+	val edge by animateFloatAsState(if (selected && bar) 1f else 0f, spring(dampingRatio = 0.78f, stiffness = 2800f))
 	Row(
 		Modifier
 			.glideRow(enabled, danger)
@@ -588,6 +693,7 @@ internal fun FloatingMenuRow(
 			.padding(horizontal = 6.dp, vertical = 3.dp),
 		verticalAlignment = Alignment.CenterVertically,
 	) {
+		MenuItemSideTip(description, hovered && enabled)
 		Box(Modifier.width(2.dp).height(14.dp * edge).clip(CircleShape).background(colors.accent.copy(alpha = edge)))
 		Spacer(Modifier.width(5.dp))
 		if (icon != null) {
@@ -595,12 +701,21 @@ internal fun FloatingMenuRow(
 			Spacer(Modifier.width(7.dp))
 		} else Spacer(Modifier.width(2.dp))
 		Column(Modifier.weight(1f)) {
-			Text(label, color = if (enabled && !danger && (selected || hovered)) colors.textPrimary else tint, fontSize = 11.5.sp,
+			Text(label, color = tint, fontSize = 11.5.sp,
 				fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, overflow = TextOverflow.Ellipsis)
 			if (hint != null) Text(hint, color = colors.textMuted.copy(alpha = 0.8f), fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
 		}
-		if (trailing != null) Text(trailing, color = colors.textMuted.copy(alpha = 0.7f), fontSize = 9.5.sp, maxLines = 1,
-			modifier = Modifier.padding(start = 6.dp))
+		if (trailing != null) Text(
+			trailing,
+			color = when {
+				danger -> colors.error.copy(alpha = 0.85f)
+				warning -> colors.warning.copy(alpha = 0.85f)
+				else -> colors.textMuted.copy(alpha = 0.7f)
+			},
+			fontSize = 9.5.sp,
+			maxLines = 1,
+			modifier = Modifier.padding(start = 6.dp),
+		)
 		if (control != null) Box(Modifier.padding(start = 8.dp, end = 2.dp)) { control() }
 	}
 }
@@ -922,8 +1037,8 @@ internal fun <T> GlidingSegments(
 /** One choice of a group in a [FloatingMenu]: a radio mark at the end, filled while [selected]. */
 @Composable
 internal fun FloatingMenuRadio(label: String, selected: Boolean, onSelect: () -> Unit, enabled: Boolean = true, hint: String? = null,
-                               icon: (@Composable (Color) -> Unit)? = null) {
-	FloatingMenuRow(label, onSelect, selected = selected, enabled = enabled, hint = hint, bar = false, icon = icon,
+                               description: String? = null, icon: (@Composable (Color) -> Unit)? = null) {
+	FloatingMenuRow(label, onSelect, selected = selected, enabled = enabled, hint = hint, description = description, bar = false, icon = icon,
 		control = { RadioMark(selected, enabled) })
 }
 

@@ -31,6 +31,8 @@ internal class WorkspaceOperations(private val workspace: WorkspaceBackend,
         registerLayoutOperations(registry, workspace, workspace, jobs)
         registerSidecarOperations(registry, workspace, workspace)
         registerModifierOperations(registry, workspace, jobs)
+        registerPluginOperations(registry, jobs)
+        registerPluginDevOperations(registry, workspace, jobs)
         registerDocumentBatch(registry, workspace, workspace, jobs) { edits ->
             WorkspaceMotionIds.chosen(edits, workspace.captureQueries().motionClips(), workspace.savedProjectData().data.timelineAids)
         }
@@ -46,6 +48,19 @@ internal class WorkspaceOperations(private val workspace: WorkspaceBackend,
                 schema(command.schema.properties.mapValues { it.value.jsonObject }, command.schema.required),
                 WorkspaceOperationKind.PROJECT, jobBacked = true) { request ->
                 start(id, allowUnloaded = true) { commands.invoke(commandId, request).data }
+            }
+        }
+        register("project_reload_psd", "Reload external PSD images into the current project, as Model > Reload PSD does. " +
+            "Preserves the authored rig, project file and undo history; changed source images replace local painting on those layers. " +
+            "Accepts transparency, visibility and added layers; meshes that clip new pixels are rebuilt with their rig data migrated, so check their poses. " +
+            "Incompatible canvas or existing layer structure changes are refused without changing the project. The refresh is one undoable step; " +
+            "identical images add no step. Does not save automatically or discard unsaved rig edits. Provide an absolute PSD path; no file picker opens. " +
+            "Use a fresh request_id for each deliberate refresh after editing the external file, including after a no-op; reuse an ID only to retry that same refresh. Returns a job handle.",
+            schema(mapOf("state" to string(), "path" to string()), listOf("state", "path")),
+            WorkspaceOperationKind.DOCUMENT, jobBacked = true) { request ->
+            val path = absolutePath(request.text("path"))
+            start("project_reload_psd") {
+                workspace.reloadPsd(request.text("state"), path.toString()).lifecycleResult()
             }
         }
         register("project_create", "Create a new empty project of width x height canvas units that is not generated yet: import materials (material_import), " +

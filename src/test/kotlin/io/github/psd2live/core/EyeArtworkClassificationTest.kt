@@ -4,7 +4,7 @@ import io.github.psd2live.core.fit.EyeArtworkFitting
 import io.github.psd2live.core.fit.EyeFit
 import io.github.psd2live.core.fit.EyePrimitive
 import io.github.psd2live.core.fit.EyeRegion
-import io.github.psd2live.core.fit.EyeRig
+import io.github.psd2live.algorithms.binding.EyeRig
 import io.github.psd2live.core.fit.EyeOpeningAssociation
 import io.github.psd2live.core.fit.EyeModules
 import io.github.psd2live.core.fit.EyeOptions
@@ -18,6 +18,7 @@ import kotlin.math.abs
 import kotlin.math.sin
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class EyeArtworkClassificationTest {
@@ -85,6 +86,19 @@ class EyeArtworkClassificationTest {
 		assertTrue(part.branches.isEmpty())
 	}
 
+	@Test fun tintedLidSkinDoesNotThickenLashInkOrGainAVisibilityTrack() {
+		val tint = layer("lid-tint", PartRole.EYE_DETAIL) { x, y -> x in 35f..100f && abs(y - upper(x)) < 10f }
+		val original = fit(listOf(main()))
+		val tinted = fit(listOf(main(), tint))
+		val part = tinted.components.single { it.layerId == "lid-tint" }
+		assertEquals(original.upper, tinted.upper)
+		assertEquals(EyePrimitive.SKIN, part.primitive)
+		assertTrue(part.branches.isEmpty())
+		assertEquals(EyeRig.EyeMesh.SKIN, EyeModules.meshOf("EYELASH", "EYE_DETAIL"))
+		val rig = EyeRig(eye, .25f, 1f, .6f)
+		assertNull(EyeModules.opacity("EYELASH", "EYE_DETAIL", Side.LEFT, rig, EyeOptions(lidFade = true)))
+	}
+
 	@Test fun observationReductionCannotMergeSeparateSourceStrands() {
 		val strands = layer("strands", w = 600) { x, y -> (x in 64f..65f || x in 66f..67f) && y in 10f..25f }
 		assertEquals(2, fit(listOf(main(), strands)).components.count { it.layerId == "strands" })
@@ -132,7 +146,7 @@ class EyeArtworkClassificationTest {
 		val right = EyeRig(eye.copy(side = Side.RIGHT, originX = -20f, axisX = -1f), 0.25f, 1f, 0.6f)
 		val eyes = FittedEyes(EyeFitting.Result(emptyMap(), emptyMap()), linkedMapOf(Side.LEFT to left, Side.RIGHT to right), EyeOptions())
 		val grid = requireNotNull(EyeModules.pairedLidGrid(EyeRig.EyeMesh.UPPER_LASH, "both", floatArrayOf(70f, 25f, -70f, 25f),
-			Bounds(-200f, 0f, 200f, 100f), eyes))
+			Bounds(-200f, 0f, 200f, 100f), eyes.motion))
 		val closeLeft = grid.cells.single { it.coordinate.contentEquals(intArrayOf(0, right.keys.lastIndex)) }.form.positionDeltas
 		assertTrue(closeLeft[1] != 0f)
 		assertEquals(0f, closeLeft[2]); assertEquals(0f, closeLeft[3])

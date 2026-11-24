@@ -249,6 +249,11 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
                 "before tracing, so fine protrusions such as lashes or strand tips share one envelope; 0 (default) traces the drawn edge. " +
                 "Every painted pixel stays inside the mesh. Layers with a layer_mesh override keep their own wrap")
         })
+        put("meshAlphaCoverage", buildJsonObject {
+            put("type", "boolean")
+            put("description", "Generated meshes cover every pixel with any alpha, not only those above alphaThreshold, so soft " +
+                "antialiased edges are never clipped; false (default) meshes what alphaThreshold keeps")
+        })
         put("runtimeTarget", string()); put("textureUpscale", upscaleSettings)
         put("meshFillParameters", fillParameterFields)
         put("rigTuning", rigTuningFields)
@@ -398,7 +403,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         buildJsonObject { put("state", string()); put("changes", arraySchema(oneOf(listOf(
             variant("op", "seed", formBase, listOf("target", "key")),
             variant("op", "copy", JsonObject(formBase + buildJsonObject { put("from", key); put("destination", string()); put("channels", arraySchema(string(), 1, 8)) }), listOf("target", "from", "key")),
-            variant("op", "set", JsonObject(formBase + buildJsonObject { put("channels", channels); put("geometry", objectSchema(buildJsonObject {
+            variant("op", "set", JsonObject(formBase + buildJsonObject { put("edit_stage", string()); put("correction_mode", choices("delta", "absolute")); put("channels", channels); put("geometry", objectSchema(buildJsonObject {
                 put("originX", number()); put("originY", number()); put("angle", number()); put("scale", number())
             })) }), listOf("target", "key")),
             variant("op", "delete", buildJsonObject { put("target", string()); put("parameter", string()); put("value", number()); put("channel", string()) }, listOf("target", "parameter")),

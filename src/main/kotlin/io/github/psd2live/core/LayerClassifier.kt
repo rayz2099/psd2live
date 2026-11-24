@@ -11,6 +11,7 @@ object LayerClassifier {
 		names(SemanticTag.BACK_HAIR, "back hair", "backhair", "hair back", "hair_back", "后发", "后髪", "后脑勺", "後ろ髪", "後髪", "うしろがみ", "后头", "後頭部", "马尾", "馬尾", "ポニーテール", "ポニテ", "双马尾", "雙馬尾", "ツインテール", "ツインテ", "背发", "背髪", "뒷머리", "뒤머리", "뒤통수", "포니테일", "트윈테일", "양갈래", "묶은 머리", "묶은머리")
 		names(SemanticTag.FRONT_HAIR, "front hair", "fronthair", "hair front", "hair_front", "hair", "bangs", "前发", "前髪", "刘海", "瀏海", "まえがみ", "侧发", "側髪", "横髪", "鬓角", "もみあげ", "サイドヘア", "サイド", "呆毛", "アホ毛", "ahoge", "앞머리", "옆머리", "잔머리", "머리카락", "구레나룻", "바보털", "더듬이")
 		names(SemanticTag.HEADWEAR, "headwear", "hat", "cap", "帽子", "头饰", "頭飾", "发饰", "髪飾り", "カチューシャ", "リボン", "发带", "蝴蝶结", "모자", "머리띠", "머리장식", "머리 장식", "헤어핀", "머리핀", "리본", "카츄샤", "머리끈")
+		names(SemanticTag.HEADWEAR, "rear headwear", "rear-headwear", "后置头饰", "後置頭飾")
 		names(SemanticTag.FACE, "face", "head", "脸", "臉", "脸部", "面部", "顔", "かお", "輪郭", "脸轮廓", "脸部轮廓", "脸蛋", "头部", "头", "頭", "あたま", "얼굴", "윤곽", "얼굴 윤곽", "얼굴윤곽")
 		names(SemanticTag.FACE_DETAIL, "facedetail", "face detail", "face_detail", "脸部细节", "面部细节", "腮红", "紅暈", "红晕", "ほほ", "頬", "チーク", "blush", "脸颊", "泪痕", "얼굴 디테일", "볼", "볼터치", "홍조", "블러셔", "눈물")
 		names(SemanticTag.IRIDES, "irides", "iris", "pupil", "pupils", "eyes", "eye", "瞳孔", "虹膜", "眼珠", "眼睛", "目", "眼", "瞳", "ひとみ", "眼球", "眼黑", "目玉", "め", "ハイライト", "高光", "眼睛高光", "眼部高光", "瞳高光", "눈", "눈동자", "동공", "홍채", "눈알", "하이라이트", "눈 하이라이트", "눈하이라이트")
@@ -18,16 +19,21 @@ object LayerClassifier {
 		names(SemanticTag.EYEWHITE, "eyewhite", "eye white", "eye_white", "eyewhites", "眼白", "白眼", "白目", "目白", "巩膜", "흰자", "흰자위", "눈흰자", "공막", "눈 흰자")
 		names(SemanticTag.EYELASH, "eyelash", "eyelashes", "lash", "lashes", "eye open", "eye_open", "睫毛", "まつ毛", "まつげ", "上睫毛", "下睫毛", "上まつ毛", "下まつ毛", "上まつげ", "下まつげ", "アイライン", "眼线", "上眼线", "下眼线", "二重", "속눈썹", "윗속눈썹", "위 속눈썹", "아랫속눈썹", "아래 속눈썹", "아이라인", "쌍꺼풀")
 		names(SemanticTag.EYE_CLOSE, "eye close", "eye_close", "eye c", "eye_c", "eyelash c", "eyelash_c", "closed eye", "closed_eye", "闭眼", "閉眼", "目閉じ", "閉じ目", "笑眼", "眯眼", "笑顔", "笑い目", "eye smile", "eye_smile", "감은 눈", "감은눈", "눈 감음", "눈감음", "웃는 눈", "웃는눈")
+		names(SemanticTag.EYELASH, "双眼皮", "雙眼皮", "眼睑线", "眼皮线", "眼瞼線", "细眼线", "細眼線", "眼角黑线", "眼角黑線",
+			"上睫毛内角", "上睫毛外角", "上睫毛內角", "double eyelid", "eyelid line", "eyelid crease", "eyeliner")
+		for (name in PartRoles.lidSkinNames + PartRoles.eyeDetailNames) put(name, SemanticTag.EYELASH)
+		names(SemanticTag.EYELASH, "眼影", "上眼影", "下眼影")
+		for (name in PartRoles.browCoverNames + PartRoles.browFrontNames + PartRoles.browDetailNames) put(name, SemanticTag.EYEBROW)
 		names(SemanticTag.EYEWEAR, "eyewear", "glasses", "眼镜", "眼鏡", "めがね", "안경")
 		names(SemanticTag.EARS, "ears", "ear", "耳朵", "耳", "みみ", "귀")
 		names(SemanticTag.EARWEAR, "earwear", "earring", "earrings", "耳环", "耳環", "耳饰", "耳飾", "イヤリング", "ピアス", "귀걸이", "귀고리", "피어싱", "이어링", "귀 장식", "귀장식")
 		names(SemanticTag.NOSE, "nose", "鼻子", "鼻", "はな", "코")
 		names(SemanticTag.MOUTH, "mouth", "口", "嘴", "嘴巴", "口内", "口腔", "嘴部", "くち", "입", "입술", "입안", "입 안", "구강",
 			"lip", "lips", "upper lip", "lower lip", "upper lip line", "lower lip line", "唇", "嘴唇", "上唇", "下唇", "上嘴唇", "下嘴唇", "唇线", "唇線",
-			"上唇线", "下唇线", "上唇線", "下唇線", "嘴皮", "上嘴皮", "下嘴皮", "くちびる", "上くちびる", "下くちびる", "윗입술", "아랫입술")
-		names(SemanticTag.MOUTH_OPEN, "mouth open", "mouth_open", "mouth o", "mouth_o", "open mouth", "open_mouth", "张嘴", "張嘴", "开口", "開口", "口開き", "开嘴", "開嘴", "开嘴巴", "벌린 입", "벌린입", "입 벌림", "입벌림", "입 열림", "입열림")
-		names(SemanticTag.MOUTH_CLOSE, "mouth close", "mouth_close", "mouth c", "mouth_c", "close mouth", "close_mouth", "闭嘴", "閉嘴", "闭口", "閉口", "口閉じ", "다문 입", "다문입", "입 다묾", "입 닫힘", "입닫힘")
-		names(SemanticTag.TOOTH_T, "tooth-t", "tooth_t", "tooth t", "upper tooth", "upper teeth", "上牙", "上歯", "上齿", "윗니", "위 이빨", "윗 이빨", "윗이빨")
+			"上唇线", "下唇线", "上唇線", "下唇線", "上嘴线", "下嘴线", "嘴线", "嘴皮", "上嘴皮", "下嘴皮", "くちびる", "上くちびる", "下くちびる", "윗입술", "아랫입술")
+		names(SemanticTag.MOUTH_OPEN, "mouth open", "mouth_open", "mouth o", "mouth_o", "open mouth", "open_mouth", "张嘴", "張嘴", "开口", "開口", "口開き", "开嘴", "開嘴", "开嘴巴", "露齿", "露齒", "露牙", "벌린 입", "벌린입", "입 벌림", "입벌림", "입 열림", "입열림")
+		names(SemanticTag.MOUTH_CLOSE, "mouth close", "mouth_close", "mouth c", "mouth_c", "close mouth", "close_mouth", "闭嘴", "閉嘴", "闭口", "閉口", "抿嘴", "抿唇", "口閉じ", "다문 입", "다문입", "입 다묾", "입 닫힘", "입닫힘")
+		names(SemanticTag.TOOTH_T, "tooth-t", "tooth_t", "tooth t", "upper tooth", "upper teeth", "上牙", "上歯", "上齿", "牙齿", "牙齒", "teeth", "tooth", "윗니", "위 이빨", "윗 이빨", "윗이빨")
 		names(SemanticTag.TOOTH_B, "tooth-b", "tooth_b", "tooth b", "lower tooth", "lower teeth", "下牙", "下歯", "下齿", "아랫니", "아래 이빨", "아랫 이빨", "아랫이빨")
 		names(SemanticTag.TONGUE, "tongue", "舌头", "舌頭", "舌", "ベロ", "혀")
 		names(SemanticTag.NECK, "neck", "脖子", "颈部", "頸部", "首", "くび", "목")
@@ -42,16 +48,35 @@ object LayerClassifier {
 		names(SemanticTag.OBJECTS, "objects", "object", "prop", "props", "道具", "物件", "소품", "물건", "오브젝트")
 	}
 
+	// ">" and "<" are side marks too: ">" is the character's left (it points to the screen right, where that side is
+	// drawn) and "<" the character's right, so "눈썹_>" reads as "눈썹_좌".
 	private val sideSuffix = Regex(
-		"(?:[\\s_-]*[（\\(\\[【](l|r|left|right|左|右|왼쪽|오른쪽|좌|우)[）\\)\\]】]|[\\s_-]+(l|r|left|right|左|右|왼쪽|오른쪽|좌|우)|(?<=[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\d])(左|右)|(?<=[\\p{IsHangul}\\d])(왼쪽|오른쪽)|(?<=[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\p{IsHangul}])(l|r))$",
+		"(?:[\\s_-]*[（\\(\\[【](l|r|left|right|左|右|왼쪽|오른쪽|좌|우|<|>)[）\\)\\]】]|[\\s_-]+(l|r|left|right|左|右|왼쪽|오른쪽|좌|우|<|>)|(?<=[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\d])(左|右)|(?<=[\\p{IsHangul}\\d])(왼쪽|오른쪽)|(?<=[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\p{IsHangul}])(l|r))$",
 		RegexOption.IGNORE_CASE,
 	)
 	private val sidePrefix = Regex(
-		"^(?:(左|右)[-_.\\s]*|(왼쪽|오른쪽)[-_.\\s]*|(왼|오른)(?=\\p{IsHangul})|(l|r|left|right|좌|우)[-_.\\s]+|[（\\(\\[【](l|r|left|right|左|右|왼쪽|오른쪽|좌|우)[）\\)\\]】][\\s_-]*)",
+		"^(?:(左|右)[-_.\\s]*|(왼쪽|오른쪽)[-_.\\s]*|(왼|오른)(?=\\p{IsHangul})|(l|r|left|right|좌|우|<|>)[-_.\\s]+|[（\\(\\[【](l|r|left|right|左|右|왼쪽|오른쪽|좌|우|<|>)[）\\)\\]】][\\s_-]*)",
 		RegexOption.IGNORE_CASE,
 	)
 	private val variantSuffix = Regex("(?:[-_.\\s]+|(?<=[\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\p{IsHangul}a-zA-Z]))(\\d+)$")
 	private val copySuffix = Regex("\\s*(?:copy|のコピー|的副本|副本|복사)\\s*\\d*$", RegexOption.IGNORE_CASE)
+	private val closedDescriptor = Regex("闭合|閉合|合拢|合攏|(?<![a-z])closed(?![a-z])")
+	private val lipSkinDescriptor = Regex("唇底色|嘴皮|唇皮|上唇|下唇|upper\\s*lip(?!\\s*line)|lower\\s*lip(?!\\s*line)")
+	private val nonMouthPartHint = Regex("眼|眉|鼻|耳|发|髪|袖|裙|衣|裤|鞋|袜|手|脚|腿|尾|翼|腮红|紅暈|红晕|blush|嘴角")
+	private val blushKeyword = Regex("腮红|紅暈|红晕|blush")
+	private val redundantEyePrefix = Regex("^眼(?:上眼线|下眼线|上眼線|下眼線|双眼皮|雙眼皮|上眼皮|下眼皮|上眼睑|下眼睑|上眼瞼|下眼瞼|眼眶|下眼眶|细眼线|細眼線|上睫毛[内內外]角)")
+	private val hairProjection = Regex("^(?:(?:前发|前髮|前髪|刘海|瀏海|头发|頭髮|发|髮|髪)(?:阴影|陰影|投影)|(?:front hair|hair|bangs|fringe) (?:cast )?shadows?(?:$|[ _-]))")
+	private val mouthSuffixKeywords: List<Pair<String, SemanticTag>> = listOf(
+		"张嘴" to SemanticTag.MOUTH_OPEN, "張嘴" to SemanticTag.MOUTH_OPEN, "开口" to SemanticTag.MOUTH_OPEN,
+		"開口" to SemanticTag.MOUTH_OPEN, "开嘴" to SemanticTag.MOUTH_OPEN, "開嘴" to SemanticTag.MOUTH_OPEN,
+		"露齿" to SemanticTag.MOUTH_OPEN, "露齒" to SemanticTag.MOUTH_OPEN, "露牙" to SemanticTag.MOUTH_OPEN,
+		"闭嘴" to SemanticTag.MOUTH_CLOSE, "閉嘴" to SemanticTag.MOUTH_CLOSE, "闭口" to SemanticTag.MOUTH_CLOSE,
+		"閉口" to SemanticTag.MOUTH_CLOSE, "抿嘴" to SemanticTag.MOUTH_CLOSE, "抿唇" to SemanticTag.MOUTH_CLOSE,
+		"上牙" to SemanticTag.TOOTH_T, "下牙" to SemanticTag.TOOTH_B, "牙齿" to SemanticTag.TOOTH_T, "牙齒" to SemanticTag.TOOTH_T,
+		"舌头" to SemanticTag.TONGUE, "舌頭" to SemanticTag.TONGUE,
+		"嘴唇" to SemanticTag.MOUTH, "嘴巴" to SemanticTag.MOUTH, "口腔" to SemanticTag.MOUTH, "口内" to SemanticTag.MOUTH,
+		"嘴线" to SemanticTag.MOUTH, "唇线" to SemanticTag.MOUTH, "嘴" to SemanticTag.MOUTH,
+	)
 
 	fun classify(name: String): LayerSemantic {
 		var normalized = Normalizer.normalize(name, Normalizer.Form.NFKC)
@@ -92,7 +117,30 @@ object LayerClassifier {
 			}
 			if (!changed) break
 		}
-		val tag = aliases[normalized] ?: prefixMatch(normalized) ?: SemanticTag.UNKNOWN
+		if (redundantEyePrefix.containsMatchIn(normalized)) normalized = normalized.removePrefix("眼")
+		val named = aliases[normalized] ?: prefixMatch(normalized) ?: SemanticTag.UNKNOWN
+		val withoutClosed = normalized.replace(closedDescriptor, " ").trim()
+		val unqualified = aliases[withoutClosed] ?: prefixMatch(withoutClosed)
+		val closedTag = if (withoutClosed != normalized && unqualified in setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN))
+			SemanticTag.MOUTH_CLOSE else named
+		// An opening-state prefix describes the pose, not the identity of a named tooth or tongue.
+		val component = if (closedTag in setOf(SemanticTag.MOUTH_OPEN, SemanticTag.MOUTH_CLOSE)) aliasesByLength
+			.asSequence().filter { it.value in setOf(SemanticTag.MOUTH_OPEN, SemanticTag.MOUTH_CLOSE) && normalized.startsWith(it.key) }
+			.mapNotNull { (alias, _) -> normalized.removePrefix(alias).trim(' ', '_', '-').let {
+				aliases[it] ?: prefixMatch(it)
+			} }.firstOrNull { it in setOf(SemanticTag.TONGUE, SemanticTag.TOOTH_T, SemanticTag.TOOTH_B) }
+		else null
+		val poseFallback = if (component == null && closedTag == SemanticTag.UNKNOWN) {
+			when {
+				blushKeyword.containsMatchIn(normalized) -> SemanticTag.FACE_DETAIL
+				!nonMouthPartHint.containsMatchIn(normalized) ->
+					mouthSuffixKeywords.firstOrNull { (key, _) -> key in normalized }?.second
+				else -> null
+			}
+		} else null
+		val resolved = component ?: poseFallback ?: closedTag
+		// Lip-skin covers named with a closed pose prefix remain mouth skin rather than a closed-drawing swap.
+		val tag = if (resolved == SemanticTag.MOUTH_CLOSE && lipSkinDescriptor.containsMatchIn(normalized)) SemanticTag.MOUTH else resolved
 		val confidence = when {
 			aliases.containsKey(normalized) -> 1f
 			tag != SemanticTag.UNKNOWN -> 0.85f
@@ -114,9 +162,34 @@ object LayerClassifier {
 
 	private fun sideOf(raw: String): Side =
 		when (raw.lowercase(Locale.ROOT)) {
-			"l", "left", "左", "왼쪽", "왼", "좌" -> Side.LEFT
+			"l", "left", "左", "왼쪽", "왼", "좌", ">" -> Side.LEFT
 			else -> Side.RIGHT
 		}
+
+	/** A specific part folder supplies missing semantics; broad eye/body folders are not pixel roles. */
+	internal fun classifyArtwork(name: String, groupPath: String): LayerSemantic {
+		val own = classify(name)
+		val folders = groupPath.split('/').asReversed()
+		// A hair projection painted in the face stack moves as the fringe, while the skin clips its edge.
+		if (own.tag == SemanticTag.UNKNOWN && (hairProjection.containsMatchIn(own.normalizedName) ||
+				folders.any { hairProjection.containsMatchIn(Normalizer.normalize(it, Normalizer.Form.NFKC).trim().lowercase(Locale.ROOT)) }) &&
+			folders.any { classify(it).tag == SemanticTag.FACE }) {
+			return own.copy(tag = SemanticTag.FRONT_HAIR, confidence = .85f, role = PartRole.SHADOW)
+		}
+		if (own.tag != SemanticTag.UNKNOWN) return own
+		for (folder in folders) {
+			val parent = classify(folder)
+			if (parent.tag == SemanticTag.UNKNOWN) continue
+			if (parent.confidence != 1f || parent.tag !in inheritedParts) return own
+			// Generic layer numbers identify artwork, not alternate expressions of the inherited part.
+			return own.copy(tag = parent.tag, side = own.side.takeUnless { it == Side.NONE } ?: parent.side,
+				variant = parent.variant, confidence = .7f)
+		}
+		return own
+	}
+
+	private val inheritedParts = setOf(SemanticTag.FACE, SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN, SemanticTag.MOUTH_CLOSE,
+		SemanticTag.EYEBROW, SemanticTag.EYEWHITE, SemanticTag.TOOTH_T, SemanticTag.TOOTH_B, SemanticTag.TONGUE)
 
 	/** A raster's opaque box, pixel count and coordinate sums at one threshold - all [classify] reads of its pixels. */
 	private class AlphaStats(val width: Int, val threshold: Int, val minX: Int, val minY: Int, val maxX: Int, val maxY: Int,
@@ -174,7 +247,7 @@ object LayerClassifier {
 		}
 		return ClassifiedLayer(
 			source = layer,
-			semantic = classify(layer.name),
+			semantic = IrisGroupSide.inherit(layer, classifyArtwork(layer.name, layer.groupPath), alphaThreshold, count),
 			bounds = bounds,
 			centroidX = if (count == 0) bounds.centerX else layer.bounds.left + sumX.toFloat() / count,
 			centroidY = if (count == 0) bounds.centerY else layer.bounds.top + sumY.toFloat() / count,

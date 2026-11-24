@@ -264,23 +264,19 @@ fun IconSearch(
 }
 
 /**
- * Globe marking the language choice. It carries no text, so someone who switched to a language they
- * cannot read still finds the way back.
+ * "文 / A" translation glyph marking the language choice: "文" at top-left, "A" at bottom-right.
  */
 @Composable
 fun IconLanguage(
 	modifier: Modifier = Modifier.size(14.dp),
 	tint: Color = LocalToolColors.current.textPrimary,
 ) = GridIcon(modifier, tint) {
-	val r = 7f
-	dot(9f, 9f, r, soft)
-	// Meridians: an ellipse half as wide as the globe, and its axis; the equator and two parallels.
-	scope.drawOval(color, p(9f - r * 0.45f, 9f - r), Size(r * 0.9f * s, 2 * r * s), style = stroke(ICON_FINE))
-	line(9f, 9f - r, 9f, 9f + r, ICON_FINE)
-	line(9f - r, 9f, 9f + r, 9f, ICON_FINE)
-	line(9f - r * 0.866f, 9f - r * 0.5f, 9f + r * 0.866f, 9f - r * 0.5f, ICON_FINE)
-	line(9f - r * 0.866f, 9f + r * 0.5f, 9f + r * 0.866f, 9f + r * 0.5f, ICON_FINE)
-	ring(9f, 9f, r)
+	line(5.4f, 1.8f, 5.4f, 3.4f)
+	line(1.8f, 3.6f, 9.0f, 3.6f)
+	outline(path { m(7.4f, 3.6f); q(6.2f, 7.6f, 2.0f, 9.8f) })
+	outline(path { m(3.4f, 4.8f); q(5.4f, 7.6f, 8.8f, 9.6f) })
+	outline(path { m(9.4f, 16.0f); l(12.7f, 8.2f); l(16.0f, 16.0f) })
+	line(10.6f, 13.5f, 14.8f, 13.5f)
 }
 
 /** Parameter chain with rounded links and clear negative space at small sizes. */
@@ -380,6 +376,27 @@ fun IconFolder(
 	modifier: Modifier = Modifier.size(14.dp),
 	tint: Color = LocalToolColors.current.textPrimary,
 ) = GridIcon(modifier, tint) { folder() }
+
+/** A file: a generic document. */
+@Composable
+fun IconDocument(
+	modifier: Modifier = Modifier.size(14.dp),
+	tint: Color = LocalToolColors.current.textPrimary,
+) = GridIcon(modifier, tint) { document() }
+
+/** A Photoshop PSD file: folded document with the "Ps" monogram. */
+@Composable
+fun IconPsd(
+	modifier: Modifier = Modifier.size(14.dp),
+	tint: Color = LocalToolColors.current.textPrimary,
+) = GridIcon(modifier, tint) { psdFile() }
+
+/** A Live2D Cubism CMO3 file: notched tapered badge with folded ribbon wings. */
+@Composable
+fun IconCmo3(
+	modifier: Modifier = Modifier.size(14.dp),
+	tint: Color = LocalToolColors.current.textPrimary,
+) = GridIcon(modifier, tint) { cmo3File() }
 
 /** A disclosure chevron, pointing down when [expanded] and right when not. */
 @Composable
@@ -632,7 +649,7 @@ fun CompactMenuItem(
 
 	val labelColor = when {
 		!enabled -> colors.textDisabled
-		danger -> if (isHovered) colors.error else colors.error.copy(alpha = 0.9f)
+		danger -> colors.error
 		active -> colors.accent
 		else -> colors.textPrimary
 	}
@@ -722,6 +739,8 @@ fun CompactMenuDivider() {
 	)
 }
 
+internal val LocalMenuOpensLeft = androidx.compose.runtime.compositionLocalOf { false }
+
 /**
  * The panels' context menu, opened at the click ([clickOffset] in the holding layout; under its left edge when zero),
  * flipping to the left of it or above it where the window runs out. It looks and moves as the canvas's context menu
@@ -736,6 +755,7 @@ fun TreeContextMenu(
 	modifier: Modifier = Modifier,
 	minWidth: Dp = 200.dp,
 	maxWidth: Dp = 270.dp,
+	preferredMaxWidth: Dp? = null,
 	content: @Composable ColumnScope.() -> Unit,
 ) {
 	val expandedStates = remember { MutableTransitionState(false) }
@@ -747,7 +767,8 @@ fun TreeContextMenu(
 	val density = LocalDensity.current
 	// The corner of the menu at the click, which it grows from.
 	var corner by remember { mutableStateOf(TransformOrigin(0f, 0f)) }
-	val positionProvider = remember(clickOffset, density) {
+	var lockedLeft by remember(expanded) { mutableStateOf<Boolean?>(null) }
+	val positionProvider = remember(clickOffset, density, preferredMaxWidth) {
 		object : PopupPositionProvider {
 			override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection, popupContentSize: IntSize): IntOffset {
 				val marginPx = with(density) { 8.dp.roundToPx() }
@@ -755,7 +776,18 @@ fun TreeContextMenu(
 				val mouseX = anchorBounds.left + if (clickOffset != Offset.Zero) clickOffset.x.roundToInt() else with(density) { 24.dp.roundToPx() }
 				val mouseY = if (clickOffset != Offset.Zero) anchorBounds.top + clickOffset.y.roundToInt() else anchorBounds.bottom
 				var x = mouseX + cursorPaddingPx
-				val left = x + popupContentSize.width > windowSize.width - marginPx
+				val left = lockedLeft ?: run {
+					val decided = if (preferredMaxWidth != null) {
+						val neededPx = with(density) { preferredMaxWidth.roundToPx() }
+						val rightSpace = windowSize.width - marginPx - x
+						val leftSpace = (mouseX - cursorPaddingPx) - marginPx
+						rightSpace < neededPx && leftSpace > rightSpace
+					} else {
+						x + popupContentSize.width > windowSize.width - marginPx
+					}
+					if (preferredMaxWidth != null) lockedLeft = decided
+					decided
+				}
 				if (left) x = mouseX - popupContentSize.width - cursorPaddingPx
 				x = x.coerceIn(marginPx, max(marginPx, windowSize.width - popupContentSize.width - marginPx))
 				var y = mouseY + cursorPaddingPx
@@ -772,7 +804,12 @@ fun TreeContextMenu(
 	}
 
 	Popup(popupPositionProvider = positionProvider, onDismissRequest = onDismissRequest, properties = PopupProperties(focusable = true)) {
-		androidx.compose.runtime.CompositionLocalProvider(LocalDensity provides density, LocalToolColors provides colors, LocalToolTypography provides typography) {
+		androidx.compose.runtime.CompositionLocalProvider(
+			LocalDensity provides density,
+			LocalToolColors provides colors,
+			LocalToolTypography provides typography,
+			LocalMenuOpensLeft provides (corner.pivotFractionX == 1f),
+		) {
 			Column(
 				modifier
 					.menuAppearance(expandedStates, corner, rise = corner.pivotFractionY == 1f)
@@ -875,6 +912,7 @@ fun <T> CompactSelect(
 	modifier: Modifier = Modifier,
 	enabled: Boolean = true,
 	optionEnabled: (T) -> Boolean = { true },
+	optionDescription: ((T) -> String?)? = null,
 	height: Dp = 24.dp,
 ) {
 	val colors = LocalToolColors.current
@@ -916,10 +954,16 @@ fun <T> CompactSelect(
 		}
 		AppDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
 			for (option in options) {
-				AppMenuItem(text = label(option), isChecked = option == selected, enabled = optionEnabled(option), onClick = {
-					open = false
-					if (option != selected) onSelect(option)
-				})
+				AppMenuItem(
+					text = label(option),
+					isChecked = option == selected,
+					enabled = optionEnabled(option),
+					description = optionDescription?.invoke(option),
+					onClick = {
+						open = false
+						if (option != selected) onSelect(option)
+					},
+				)
 			}
 		}
 	}
@@ -1569,6 +1613,7 @@ fun <T> CompactDropdown(
 	modifier: Modifier = Modifier,
 	itemLabel: (T) -> String = { it.toString() },
 	itemEnabled: (T) -> Boolean = { true },
+	itemDescription: ((T) -> String?)? = null,
 	enabled: Boolean = true,
 	height: Dp = 24.dp,
 ) {
@@ -1610,6 +1655,7 @@ fun <T> CompactDropdown(
 					text = itemLabel(item),
 					isChecked = item == selectedItem,
 					enabled = isItemEnabled,
+					description = itemDescription?.invoke(item),
 					onClick = {
 						onItemSelected(item)
 						expanded = false

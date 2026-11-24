@@ -1,0 +1,77 @@
+package io.github.psd2live.core.modifier
+
+import io.github.psd2live.algorithms.binding.MouthFittedInputs
+import io.github.psd2live.algorithms.binding.ScaffoldMesh
+import io.github.psd2live.algorithms.binding.ScaffoldMeshContext
+import io.github.psd2live.core.*
+import io.github.psd2live.core.recipe.*
+import io.github.psd2live.project.WorkspaceSettingsCodec
+import kotlinx.serialization.json.*
+
+/** Source fitting and raw vertex measurements shared by fitted-mouth add-ons. */
+internal object RigFittedMouthModuleSource {
+    fun context(source: RigModifierSource, scaffold: RigModifierInstance, preceding: List<RigModifierInstance>,
+                activeModule: RigModule?, neutralScaffold: Boolean = false): Pair<PipelineConfig, RigBuilder.RigContext> {
+        if (activeModule == null && !neutralScaffold) return source.phaseContext(scaffold, preceding)
+        val native = nativeConfig(source, scaffold, preceding, activeModule)
+        return native to RigBuilder.rigContext(source.analysis, native, source.meshCache, neutralScaffold = neutralScaffold)
+    }
+
+    internal fun nativeConfig(source: RigModifierSource, scaffold: RigModifierInstance, preceding: List<RigModifierInstance>,
+                             activeModule: RigModule?): PipelineConfig {
+        val state = RigSourceBindingState(preceding)
+        val bases = state.byArea
+        val corrections = WorkspaceSettingsCodec.decodeRecipe(scaffold.config["corrections"])
+        val recipe = RigRecipe(true, bases = RigModules.areas.associate { area ->
+            val chosen = bases[area.id]?.takeUnless { it.type == RigLegacyBindings.FITTED_FACE }
+            area.id to if (chosen == null) BaseChoice(area.legacy.id, area.legacy.version)
+            else BaseChoice(chosen.type, chosen.version, RigLegacyBindings.values(chosen))
+        }, modules = RigModules.modules.associate { module ->
+            val chosen = state.byType[module.id] ?: state.byType[RigLegacyBindings.FITTED_FACE]?.takeIf { module == RigModules.FACE_DEPTH_TURN }
+            module.id to when {
+                module == activeModule -> ModuleChoice(true)
+                chosen != null -> ModuleChoice(true, chosen.version, RigLegacyBindings.values(chosen))
+                else -> ModuleChoice(false)
+            }
+        }, moves = corrections.moves, eyeParts = corrections.eyeParts)
+        return source.sourceConfig().copy(recipe = recipe, rigTuning = state.tuning,
+            mouthOutlineEnabled = state.byType.containsKey(RigModules.MOUTH_OUTLINE.id) ||
+                (MouthLipLayers.needsOutline(source.analysis.layers) && source.stack.instances.any {
+                    it.enabled && (it.type == RigModules.MOUTH_OUTLINE.id ||
+                        (it.type == "mouth" && ModifierPartConfig.enabled(it.config, "outline")))
+                }),
+            headTurnStrength = state.headStrength,
+            bodyStrength = state.bodyStrength,
+            featureDisplacementEnabled = scaffold.config["featureDisplacement"]?.jsonPrimitive?.boolean ?: false,
+            hairSimulationFront = !(scaffold.config["frontHairSway"]?.jsonPrimitive?.boolean ?: true),
+            hairSimulationBack = !(scaffold.config["backHairSway"]?.jsonPrimitive?.boolean ?: true))
+    }
+
+    fun measure(source: RigModifierSource, native: PipelineConfig, context: RigBuilder.RigContext,
+                preceding: List<RigModifierInstance>, layers: Map<String, ClassifiedLayer>): ModifierAlgorithmContext {
+        if (context.sourceMeasurementsOnly) require(context.fittedEyes(native)?.rigs?.size == 1 && context.faceTurn(native) == null) {
+            "Source skin measurements require the single-eye shell without generated face ancestry"
+        }
+        val frames = layers.mapValues { (_, layer) -> context.parentAndFrame(layer, native) }
+        val parents = frames.mapValues { it.value.first?.raw }
+        val headProvider = preceding.lastOrNull {
+            it.type in setOf("face.depth-turn", RigLegacyBindings.FITTED_FACE) ||
+                (it.type == "face" && ((it.config["mode"]?.jsonPrimitive?.content ?: "fitted") == "fitted" ||
+                    it.config["depthTurn"]?.jsonPrimitive?.booleanOrNull == true))
+        }
+        val inputs = RigFittedMouthSource.capture(context, native, parents, layers,
+            frames.mapValues { it.value.second }, layers.keys.toList(), headProvider?.id)
+        // Outline emits separate ribbon rasters and never replaces its owner's mesh. Later
+        // mouth modules must capture the same source topology as the fitted base.
+        val meshConfig = native.copy(mouthOutlineEnabled = false)
+        val vertices = ScaffoldMeshContext.capture(layers.values.distinctBy { it.source.id }.map { layer ->
+            val data = RigBuilder.fittedMouthSourceMesh(layer, context, meshConfig, source.atlas, source.meshCache)
+            ScaffoldMeshContext.Material(source.primaryByLayer.getValue(layer.source.id.raw), layer.source.id.raw,
+                ScaffoldMesh.RawMesh(data.rigPositions, data.mesh.uvs, data.mesh.indices), ScaffoldMesh.Geometry.Zero)
+        }).resources.getValue("source_meshes")
+        val targets = layers.mapValues { (id, layer) ->
+            MouthFittedInputs.SourceVertexTarget(source.primaryByLayer.getValue(layer.source.id.raw), parents.getValue(id))
+        }
+        return inputs.copy(sourceVertices = MouthFittedInputs.SourceVertices(vertices, targets)).encode()
+    }
+}

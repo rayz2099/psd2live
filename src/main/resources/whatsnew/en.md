@@ -1,3 +1,61 @@
+## v3.8.4 · 2026-11-21
+
+### Improvements and fixes
+
+- **Reload PSD** — Use **Model > Reload PSD** to refresh layer artwork from an updated PSD while keeping the existing rig, project file, and undo history. Meshes that would clip new pixels are rebuilt automatically with their forms, weights, and paths preserved. ([#97](https://github.com/tsunehimatoi/psd2live/pull/97))
+- **Full alpha pixel mesh coverage** — Added an optional mesh setting to cover every pixel with alpha > 0, keeping soft antialiased edges, faint glows, and fine hair strands intact at the mesh border. ([#96](https://github.com/tsunehimatoi/psd2live/pull/96))
+- **Deform and parameter editing** — Warp deformers can now enable vertex and Bezier editing levels together, and holding `Shift` while dragging points, handles, or the transform box constrains movement to the primary axis. Editing intermediate poses snaps parameters to their nearest keyforms with a toast hint, alongside modifier blend-shape override support and component keyform highlighting. ([#81](https://github.com/tsunehimatoi/psd2live/pull/81), [#94](https://github.com/tsunehimatoi/psd2live/pull/94), [#95](https://github.com/tsunehimatoi/psd2live/pull/95))
+- **History and layer fixes** — Undo, redo, and history checkouts now preserve the current parameter pose instead of resetting to defaults. Fixed deleted pieces of a split layer remaining in the visible layer analysis. ([#92](https://github.com/tsunehimatoi/psd2live/pull/92), [#93](https://github.com/tsunehimatoi/psd2live/pull/93))
+- **UI polish** — Unified the start hub with a collapsible rail for help and settings, refined vector icon rendering and auto-sized dropdown menus, and compacted deform tool options into dropdowns.
+
+## v3.8.3 · 2026-11-19
+
+### Improvements and fixes
+
+- **PSD import guide** — Preview and split disconnected meshes, review layer bindings, select a modifier preset, and compare head-turn styles before creating a project. Choose which workspace to open when creation finishes.
+- **Head and mouth rigging** — Head turns fit the drawn features and hair more closely. Edit generated mouth-open keyforms on the canvas and adjust the closed-mouth artwork's opacity curve independently.
+- **Simulation and weights** — Paint vertex weights and bake physics simulation directly into keyforms.
+- **VTube Studio export** — Export a model-selection icon and use the project's motion and expression names. Write `ScreenButton: -1` for unassigned hotkeys to address an Expression Editor issue with older exports. ([#90](https://github.com/tsunehimatoi/psd2live/issues/90))
+- **Desktop compatibility** — Fix packaged launcher and worker issues on Linux, encoding for Windows paths containing Chinese characters, and working-directory handling in the packaged macOS CLI.
+
+## v3.8.2 · 2026-11-18
+
+### Improvements and fixes
+
+- **Automatic mouth rigging**: improve hidden mouth artwork and cavity mask selection, refine independent upper and lower lip deformation, and reduce gaps and corner jitter when closing the mouth.
+- **Modifiers and presets**: preserve manual edits when applying modifiers and update them in dependency order. Save preset selections and edits correctly, and retain working outputs when one modifier fails.
+- **Start page and import**: reorganize the start page for creating, opening, and resuming projects, preserve import presets, and fix transparency in PSD thumbnails.
+
+## v3.8.1 · 2026-11-17
+
+### Improvements and fixes
+
+- **PSD import and plugin isolation**: handle irregular PSD input more robustly; failed modifiers retain error details and isolate dependent features while other features continue working.
+- **Brows and deformation precision**: fix composition of brow shape, blink and spring bindings, and improve inverse deformation precision on large canvases.
+- **Eye see-through masks**: preserve existing hair clipping while adding eye windows; export targets without composite masks report the feature loss.
+- **Custom plugin development**: add plugin scaffolding, builds, parameter controls and undoable code updates; fix dependency locks and reloading older build artifacts.
+- **Desktop compatibility**: improve Linux window movement and file selection, and recover from failed transparent-background sessions.
+
+## v3.8.0 · 2026-11-15
+
+### New
+
+- **Modifier menu & conflict indicators**: the preset add menu is reorganized into a progressive 3-column layout, marking hard and soft modifier conflicts in both the stack and add menu.
+- **Nested part settings & behavior preview**: collapsed part plugins expose nested sub-feature controls with live behavior preview in the inspector.
+
+### Improved
+
+- **Preset & terminology alignment**: unified "Stylized" algorithm terminology and preset names, with refined default preset options.
+- **Source PSD binding & export parity**: improved source-frame bindings for single eyes, layered mouths, and creature attachments, preserving split mesh references on `.cmo3` round-trip.
+- **Preview responsiveness & caching**: scoped build plans and bounded caches reduce redundant rebuilds and keep edited frames and save status synchronized.
+
+## v3.7.1 · 2026-11-11
+
+### New
+
+- **macOS app**: PSD2Live ships as a Mac app in a DMG for Apple silicon (arm64) and Intel (x86_64), with the system menu bar and window buttons and its own Java runtime. It is not notarized: right-click it in Applications and choose Open the first time.
+- **Side marks in layer names**: ">" marks the character's left and "<" the character's right, wherever the other side words go (full-width ＞ / ＜ too).
+
 ## v3.7.0 · 2026-10-27
 
 ### New

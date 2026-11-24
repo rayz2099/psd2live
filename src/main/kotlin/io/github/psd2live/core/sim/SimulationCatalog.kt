@@ -42,7 +42,7 @@ internal object SimulationCatalog {
         val stack = RigModifierStack.fromJson(requireNotNull(overlay.modifierStack))
         val prefix = stack.copy(instances = stack.instances.takeWhile { it.id != entry.id })
         val pipeline = io.github.psd2live.core.PSD2LivePipeline().apply { deferRuntimeBundles = true }
-        pipeline.modifierCache.snapshot = model.modifierEvaluation
+        pipeline.reuseModifierInputs(model)
         val before = pipeline.buildPreview(model.analysis.source, model.config.copy(rigEdits = overlay.copy(modifierStack = prefix.toJson())))
         val weighted = RigSimulationWeights.apply(before.rig.puppet, entry.config)
         val source = RigModifierAlgorithms.simulationOutputs(entry, RigSimEdit.fromJson(entry.config))
@@ -55,7 +55,9 @@ internal object SimulationCatalog {
     }
 
     fun stale(overlay: RigEditOverlay, model: PuppetModel, edit: RigSimEdit): Boolean {
-        val original = owner(overlay, edit.id)?.let { RigSimEdit.fromJson(it.config) }
+        val stack = overlay.modifierStack?.let(RigModifierStack::fromJson)
+        if (stack?.pendingWeightEdits?.containsKey(edit.id) == true) return true
+        val original = stack?.instances?.firstOrNull { it.type == "simulation" && it.id == edit.id }?.let { RigSimEdit.fromJson(it.config) }
         return SimBake.stale(model, if (original == null) edit else edit.copy(id = original.id))
     }
 }

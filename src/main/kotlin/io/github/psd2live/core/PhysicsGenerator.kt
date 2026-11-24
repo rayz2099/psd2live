@@ -1,5 +1,7 @@
 package io.github.psd2live.core
 
+import io.github.psd2live.algorithms.binding.BrowSpringPhysics
+
 import io.github.psd2live.i18n.tr
 
 /**
@@ -78,29 +80,9 @@ object PhysicsGenerator {
 		}
 		addAll(io.github.psd2live.core.fit.HairChain.physics(available, hairSoftness, impulses))
 		// Each hanging arm swinging a little behind the body's turn and sway.
-		for (side in listOf("L", "R")) {
-			val swing = "ParamArm${side}Swing"
-			if (swing !in available) continue
-			val inputs = listOf(PhysicsInput("ParamBodyAngleX", 60f, PhysicsSourceType.X), PhysicsInput("ParamBodyAngleZ", 40f, PhysicsSourceType.ANGLE),
-				PhysicsInput("ParamAngleX", 15f, PhysicsSourceType.X)).filter { it.parameter in available }
-			if (inputs.isEmpty()) continue
-			add(RigPhysicsEdit(id = "PhysicsArm${side}Swing", name = tr("model.physics.armSwing", side), inputs = inputs,
-				outputs = listOf(PhysicsOutput(swing, 1, 1.2f)),
-				segments = listOf(PhysicsSegment(11f, 0.88f, 1.1f, 1.0f)),
-				normalization = PhysicsNormalization(angleMin = -20f, angleMax = 20f)))
-		}
+		addAll(io.github.psd2live.algorithms.binding.ArmSwingMotion.physics(available) { tr("model.physics.armSwing", it) })
 		// Each brow's overshoot as it stops: a short springy pendulum on its height and angle.
-		for (side in listOf("L", "R")) {
-			val spring = "ParamBrow${side}Spring"
-			if (spring !in available) continue
-			val inputs = listOf(PhysicsInput("ParamBrow${side}Y", 70f, PhysicsSourceType.X), PhysicsInput("ParamBrow${side}Angle", 30f, PhysicsSourceType.X))
-				.filter { it.parameter in available }
-			if (inputs.isEmpty()) continue
-			add(RigPhysicsEdit(id = "PhysicsBrow${side}Spring", name = tr("model.physics.browSpring", side), inputs = inputs,
-				outputs = listOf(PhysicsOutput(spring, 2, 1.2f)),
-				segments = listOf(PhysicsSegment(1f, 0.92f, 0.55f, 1.6f), PhysicsSegment(1f, 0.85f, 0.45f, 1.8f)),
-				normalization = PhysicsNormalization(-1f, 0f, 1f, -10f, 0f, 10f)))
-		}
+		addAll(BrowSpringPhysics.rules(available) { tr("model.physics.browSpring", it) })
 		// The chest settling after the body moves and lifting with the breath: up and down on the nod, the lean and the
 		// breath, side to side on the body's turn and sway.
 		if ("ParamBustY" in available) add(RigPhysicsEdit(id = "PhysicsBustY", name = tr("model.physics.bust", "Y"),
@@ -180,35 +162,8 @@ object PhysicsGenerator {
 	 * take the hair inputs. A rigid pendulum hanging straight down ignores vertical travel, so up/down swings
 	 * feed head and body pitch in as sideways travel, and the resulting angle drives the up/down forms.
 	 */
-	internal fun swingRules(swings: List<RigSwingEdit>, available: Set<String>): List<RigPhysicsEdit> = swings.flatMap { swing ->
-		if (swing.parameterIds.any { it !in available }) return@flatMap emptyList()
-		swing.motions.mapNotNull { motion ->
-			val physics = motion.physics ?: return@mapNotNull null
-			val inputs = when (motion.kind) {
-				SwingKind.LATERAL -> headAndBodyInputs(null)
-				SwingKind.VERTICAL -> listOf(
-					PhysicsInput("ParamAngleY", 60f, PhysicsSourceType.X),
-					PhysicsInput("ParamBodyAngleY", 40f, PhysicsSourceType.X),
-					PhysicsInput("ParamAngleZ", 20f, PhysicsSourceType.ANGLE),
-				)
-			}.filter { it.parameter in available && it.parameter !in swing.parameterIds }
-			if (inputs.isEmpty()) return@mapNotNull null
-			val id = swingPhysicsId(swing, motion.kind)
-			val segment = PhysicsSegment(physics.length / motion.segments, physics.mobility, physics.delay, physics.acceleration)
-			RigPhysicsEdit(
-				id = id,
-				name = if (swing.motions.size == 1) swing.name else "${swing.name} ${id.substringAfterLast('_')}",
-				inputs = inputs,
-				outputs = motion.parameterIds.mapIndexed { k, parameter -> PhysicsOutput(parameter, k + 1, physics.outputScale) },
-				segments = List(motion.segments) { segment },
-				normalization = PhysicsNormalization(angleMin = -30f, angleMax = 30f),
-			)
-		}
-	}
-
-	/** `PhysicsSwing_<id>` for a swing in one direction; with both, suffixed `_X` (left/right) or `_Y` (up/down). */
-	internal fun swingPhysicsId(swing: RigSwingEdit, kind: SwingKind = swing.motions.first().kind): String =
-		"PhysicsSwing_${swing.id}" + if (swing.motions.size == 1) "" else if (kind == SwingKind.LATERAL) "_X" else "_Y"
+    internal fun swingRules(swings: List<RigSwingEdit>, available: Set<String>): List<RigPhysicsEdit> = SwingPhysicsRules.rules(swings, available)
+    internal fun swingPhysicsId(swing: RigSwingEdit, kind: SwingKind = swing.motions.first().kind): String = SwingPhysicsRules.id(swing, kind)
 
 	/** The swing a generated group belongs to, if it is a swing pendulum. */
 	fun swingOf(groupId: String, swings: List<RigSwingEdit>): RigSwingEdit? =

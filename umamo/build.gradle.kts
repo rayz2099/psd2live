@@ -26,21 +26,23 @@ dependencies {
 	testImplementation("net.java.dev.jna:jna:5.18.0")
 }
 
-tasks.withType<Test>().configureEach {
-	useJUnitPlatform()
-	maxHeapSize = "2g"
-	// `--tests` names one class from either module; the other module simply has nothing to run.
-	filter.isFailOnNoMatchingTests = false
-	testLogging {
-		events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
-		exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
-		showStackTraces = true
-	}
+// The application needs several precisions of one trace. Keep this extension out of pinned worker JARs.
+val contourVariants = sourceSets.create("contourVariants")
+kotlin.target.compilations.named(contourVariants.name) {
+	associateWith(kotlin.target.compilations.getByName("main"))
 }
+val contourVariantsJar = tasks.register<Jar>("contourVariantsJar") {
+	archiveClassifier.set("contour-variants")
+	isPreserveFileTimestamps = false
+	isReproducibleFileOrder = true
+	from(contourVariants.output)
+}
+val contourVariantsElements = configurations.create("contourVariantsElements") {
+	isCanBeConsumed = true
+	isCanBeResolved = false
+}
+artifacts.add(contourVariantsElements.name, contourVariantsJar)
 
-// Every engine test is quick.
-tasks.register("quickTest") {
-	group = "verification"
-	description = "Runs the engine tests."
-	dependsOn(tasks.test)
+tasks.withType<Test>().configureEach {
+	maxHeapSize = "2g"
 }

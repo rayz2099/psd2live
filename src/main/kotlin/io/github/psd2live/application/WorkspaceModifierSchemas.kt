@@ -10,6 +10,12 @@ import kotlinx.serialization.json.*
 /** Native generator configurations, shared by insertion, update and captured-stack observations. */
 internal object WorkspaceModifierSchemas {
     private val s = WorkspaceResultSchema
+    val applyPlan = s.obj(s.identity + mapOf("revision" to s.handle(), "through" to s.handle(), "mode" to s.choices("prefix", "selected"),
+        "consumed" to s.array(s.handle()), "materialized" to s.array(s.handle()), "disabled" to s.array(s.handle()),
+        "retained" to s.array(s.handle()), "baked_overrides" to s.integer(0), "dormant_overrides" to s.integer(0),
+        "dependencies" to s.array(s.obj(mapOf("provider" to s.handle(), "consumer" to s.handle(), "reason" to s.handle()))),
+        "blockers" to s.array(s.obj(mapOf("id" to s.handle(), "reason" to s.handle()))),
+        "fixed_conflicts" to s.integer(0), "can_apply" to s.boolean(), "requires_result_validation" to s.constant(true)))
     val target = s.obj(mapOf("kind" to s.choices("mesh", "deformer", "part", "layer"), "id" to s.handle()))
     private val range = s.obj(listOf("min", "default", "max").associateWith { s.number() })
     private val input = s.obj(mapOf("parameter" to s.handle(), "weight" to s.number(0, 100),
@@ -21,12 +27,15 @@ internal object WorkspaceModifierSchemas {
         "segments" to s.array(segment, 1, RigPhysicsEdit.MAX_SEGMENTS), "normalization" to s.obj(mapOf("position" to range, "angle" to range))),
         setOf("id", "name", "inputs", "outputs", "segments"))
     private val axis = s.obj(mapOf("parameter" to s.handle(), "keys" to s.array(s.number(), 2, 256),
-        "offsets" to s.dictionary(s.array(s.array(s.number())))))
+        "offsets" to s.dictionary(s.array(s.array(s.number()))),
+        "limits" to s.dictionary(s.array(s.vector(2))), "normal_weight" to s.number(0, 1)),
+        setOf("parameter", "keys", "offsets"))
     private val bakeInput = s.obj(mapOf("parameter" to s.handle(), "motion_px" to s.number(), "rigid" to s.boolean(),
         "group" to s.choices("sideways", "vertical"), "dropped" to s.constant(true), "forced" to s.constant(true)),
         setOf("parameter", "motion_px", "rigid"))
     private val bakeFields = mapOf("fingerprint" to s.handle(), "vertex_counts" to s.dictionary(s.integer(0)),
-        "statics" to s.array(axis), "modes" to s.array(s.obj(mapOf("axis" to axis, "amplitude_px" to s.number(), "energy" to s.number()))),
+        "statics" to s.array(axis), "modes" to s.array(s.obj(mapOf("axis" to axis, "amplitude_px" to s.number(), "energy" to s.number(),
+            "motion" to WorkspaceSimulationResultSchemas.motion), setOf("axis", "amplitude_px", "energy"))),
         "physics" to physics, "extra_physics" to s.array(physics), "inputs" to s.array(bakeInput),
         "visual" to s.array(WorkspaceSimulationChecks.motion), "method" to s.handle()) +
         listOf("fit", "max_error_px", "peak", "clipped", "jerk").associateWith { s.number() }
@@ -47,14 +56,19 @@ internal object WorkspaceModifierSchemas {
         "force_inputs" to s.array(s.handle()), "training_clips" to s.dictionary(s.number(0, 1)))
     private val simRequired = setOf("id", "name", "kind", "targets", "material", "inputs")
     private val simulation = s.obj(simFields + ("bake" to bake), simRequired)
-    private fun configuration(type: String, summary: Boolean = false): JsonObject = when (type) {
+    internal fun configuration(type: String, summary: Boolean = false): JsonObject = when (type) {
         "rig.scaffold" -> s.obj(mapOf("featureDisplacement" to s.boolean(), "frontHairSway" to s.boolean(), "backHairSway" to s.boolean(), "corrections" to
             s.obj(RigModuleSchemas.stored.getValue("properties").jsonObject.filterKeys { it in setOf("moves", "eyeParts") }
                 .mapValues { it.value.jsonObject }, emptySet())), emptySet())
         "physics" -> physics
         "motion" -> WorkspaceAnimationResultSchemas.motion
         "swing" -> WorkspaceInspectionResultSchemas.swing
+        "mesh.split" -> s.obj(mapOf(
+            "pieceIds" to s.array(s.handle(), 1, 256),
+            "names" to s.array(s.handle(), 1, 256),
+        ), emptySet())
         "simulation" -> if (summary) s.obj(simFields, simRequired) else simulation
+        "eye", "brow", "mouth", "face", "body", "hair" -> partConfiguration(type)
         else -> RigLegacyBindings.find(type)?.let { spec -> s.obj(mapOf("scaffold" to s.handle(),
             "tuning" to s.obj(spec.fields.associate { it.id to s.number(it.range.start, it.range.endInclusive) }, emptySet())) +
             (if (spec.module?.base != null) mapOf("base" to s.handle()) else emptyMap()) +
@@ -63,27 +77,86 @@ internal object WorkspaceModifierSchemas {
                 else s.obj(spec.module!!.physicsGroups.associateWith { physics }, emptySet())) else emptyMap()) +
             (if (spec.strength) mapOf("strength" to s.number(0, 4)) else emptyMap()) +
             (if (spec.mouthOutline) mapOf("color" to s.integer(0, 0xffffff)) else emptyMap()) +
+            (if (spec.type == "mouth/fitted") mapOf("closedMouthVisibility" to s.array(s.vector(2), 2, 128)) else emptyMap()) +
             (if (spec.knobs.isNotEmpty()) mapOf("values" to s.obj(spec.knobs.associate { it.id to s.number(it.range.start, it.range.endInclusive) }, emptySet())) else emptyMap()), setOf("scaffold") + (if (spec.module?.base != null) setOf("base") else emptySet()) + (if (spec.related.isNotEmpty()) setOf("dependencies") else emptySet())) }
             ?: error("No modifier configuration schema: $type")
     }
 
-    val types get() = RigModifierAlgorithms.registry.definitions.map { it.type }.distinct()
-    private fun fields(type: String, summary: Boolean = false) = linkedMapOf("type" to s.constant(type), "config" to configuration(type, summary))
+    private val partBases = mapOf(
+        "eye" to listOf("eye/fitted", "eye/legacy"), "brow" to listOf("brow/fitted", "brow/legacy"),
+        "mouth" to listOf("mouth/fitted", "mouth/legacy"), "face" to listOf("face/fitted", "face/legacy"),
+        "body" to listOf("body/legacy"), "hair" to listOf("hair/chains", "hair/legacy"),
+    )
+
+    private fun partConfiguration(type: String): JsonObject {
+        // Reuse the real binding field constraints; only the part envelope is new.
+        val fields = linkedMapOf<String, JsonObject>()
+        for (base in partBases.getValue(type)) {
+            for ((key, value) in configuration(base).getValue("properties").jsonObject) {
+                val next = value.jsonObject
+                val previous = fields[key]
+                fields[key] = if (previous?.containsKey("properties") == true && next.containsKey("properties")) {
+                    s.obj((previous.getValue("properties").jsonObject + next.getValue("properties").jsonObject)
+                        .mapValues { it.value.jsonObject }, emptySet())
+                } else next
+            }
+        }
+        fields["mode"] = when (type) {
+            "hair" -> s.choices("chains", "legacy")
+            "body" -> s.choices("legacy")
+            else -> s.choices("fitted", "legacy")
+        }
+        val flags = io.github.psd2live.core.modifier.ModifierPartConfig.features[type].orEmpty()
+        flags.keys.forEach { fields[it] = s.boolean() }
+        val related = (partBases.getValue(type) + flags.values).flatMap { RigLegacyBindings.spec(it).related }.toSet()
+        if (related.isNotEmpty()) fields["dependencies"] = s.obj(related.associateWith { s.handle() }, emptySet())
+        if (type == "brow") {
+            fields["lid"] = s.boolean() // Historical spelling, canonical lidCoupling wins.
+            fields["physicsEnabled"] = s.boolean()
+        }
+        if (type == "mouth") fields["color"] = s.integer(0, 0xffffff)
+        if (flags.isNotEmpty()) fields["subConfigs"] = s.obj(flags.values.associateWith { child ->
+            val properties = configuration(child).getValue("properties").jsonObject.mapValues { it.value.jsonObject }
+            s.obj(properties + mapOf(
+                "targets" to s.array(target, 1, 4096), "id" to s.handle(), "version" to s.integer(1, 1),
+                "outputAliases" to s.dictionary(s.handle()),
+            ), emptySet())
+        }, emptySet())
+        return s.obj(fields, setOf("scaffold"))
+    }
+
+    val types get() = RigModifierAlgorithms.registry.definitions.filter { it.pluginReference == null }.map { it.type }.distinct()
+    private fun fields(type: String, summary: Boolean = false) = linkedMapOf("type" to s.constant(type), "config" to configuration(type, summary), "plugin" to pluginIdentity)
     private fun addition(type: String) = s.obj(fields(type) + mapOf("id" to s.handle(), "version" to s.integer(1), "targets" to s.array(target, 1, 4096),
         "group" to s.handle(), "index" to s.integer(0)), setOf("type", "config", "targets"))
-    val addition: JsonObject get() = s.union(types.map(::addition))
+    private val pluginIdentity = s.obj(mapOf("id" to s.handle(), "version" to s.handle(), "digest" to s.handle(), "dependencyDigests" to s.dictionary(s.handle())), setOf("id", "version", "digest"))
+    private val pluginType get() = JsonObject(s.handle() + ("pattern" to JsonPrimitive("^(?!(?:" + types.joinToString("|") { it.replace(".", "\\.") } + ")$)[a-zA-Z0-9][a-zA-Z0-9._-]*/.+$")))
+    private val pluginFields get() = mapOf("type" to pluginType, "config" to s.dictionary(JsonObject(emptyMap())), "plugin" to pluginIdentity)
+    private val pluginAddition get() = s.obj(pluginFields + mapOf("id" to s.handle(), "version" to s.integer(1), "targets" to s.array(target, 1, 4096), "group" to s.handle(), "index" to s.integer(0)), setOf("type", "config", "targets"))
+    val addition: JsonObject get() = s.union(types.map(::addition) + pluginAddition)
     val organization = s.array(s.obj(mapOf("id" to s.handle(), "parent" to s.nullable(s.handle()), "name" to s.nullable(s.handle()))), 0, 8192)
+    private val initialPreset = s.obj(
+        listOf("headStrength", "bodyStrength").associateWith { s.number(0, 4) } +
+            listOf("featureDisplacement", "mouthOutline", "motionBasic", "motionSkeleton", "clothing", "eyeJelly").associateWith { s.boolean() } +
+            listOf("frontHair", "backHair").associateWith { s.choices("CLASSIC", "SIMULATION", "OFF") }, emptySet())
     fun request(id: String): JsonObject {
         val business = when (id) {
             "modifier_add" -> addition
             "modifier_add_group" -> s.obj(mapOf("group" to s.handle(), "entries" to s.array(addition, 1, 128)))
-            "modifier_update" -> s.union(types.map { type -> s.obj(fields(type) + ("id" to s.handle())) })
+            "modifier_update" -> s.union(types.map { type -> s.obj(fields(type) + ("id" to s.handle()), setOf("id", "type", "config")) } + s.obj(pluginFields + ("id" to s.handle()), setOf("id", "type", "config")))
             "modifier_enable" -> s.obj(mapOf("id" to s.handle(), "enabled" to s.boolean()))
             "modifier_organize" -> s.obj(mapOf("nodes" to organization))
             "modifier_move" -> s.obj(mapOf("id" to s.handle(), "index" to s.integer(0)))
             "modifier_convert" -> s.obj(emptyMap())
-            "modifier_switch" -> s.obj(mapOf("group" to s.handle()))
-            "modifier_remove", "modifier_apply" -> s.obj(mapOf("id" to s.handle()))
+            "modifier_initialize" -> s.obj(mapOf(
+                "modifiers" to s.choices(*WorkspaceInitialModifiers.entries.map { it.name.lowercase() }.toTypedArray()),
+                "preset" to initialPreset), setOf("modifiers"))
+            "modifier_switch" -> s.obj(mapOf(
+                "group" to s.handle(),
+                "richness" to s.choices("base", "minimal", "standard", "full"),
+            ), setOf("group"))
+            "modifier_remove" -> s.obj(mapOf("id" to s.handle()))
+            "modifier_apply" -> s.obj(mapOf("id" to s.handle(), "scope" to s.choices("prefix", "selected")), setOf("id"))
             else -> error("Unknown modifier operation $id")
         }
         fun contextual(schema: JsonObject): JsonObject {
@@ -98,22 +171,23 @@ internal object WorkspaceModifierSchemas {
     private val contribution = s.obj(mapOf("kind" to s.handle(), "id" to s.handle(), "change" to s.choices("added", "modified", "removed", "reused"), "name" to s.string(), "physics_slot" to s.handle(),
         "mask" to s.obj(mapOf("target" to s.handle(), "before" to s.array(s.handle()), "after" to s.array(s.handle()),
             "before_inverted" to s.boolean(), "after_inverted" to s.boolean()))), setOf("kind", "id", "change"))
-    private val ownedKeyform = s.obj(mapOf("kind" to s.choices("warp", "mesh"), "id" to s.handle(), "parameter" to s.handle(),
+    private val ownedKeyform = s.obj(mapOf("kind" to s.choices("warp", "mesh", "rotation"), "id" to s.handle(), "parameter" to s.string(),
         "channel" to s.handle(), "key" to s.dictionary(s.number()), "object_name" to s.string(), "parameter_name" to s.string()), setOf("kind", "id", "parameter"))
     private val overrideIssue = s.obj(mapOf("kind" to s.choices("orphaned", "conflict"), "target" to s.handle(),
         "key" to s.dictionary(s.number()), "points" to s.integer(0), "total" to s.integer(0),
         "reason" to s.nullable(s.choices("missing_keyform", "shape_mismatch", "superseded")), "channel" to s.nullable(s.handle())))
     private val observedFields = mapOf("id" to s.handle(), "version" to s.integer(1), "enabled" to s.boolean(),
-        "targets" to s.array(target, 1, 4096), "status" to s.choices("active", "disabled", "missing_dependency"),
+        "targets" to s.array(target, 1, 4096), "status" to s.choices("active", "disabled", "failed", "missing_dependency", "missing_plugin"),
+        "effective_enabled" to s.boolean(), "error" to s.string(),
         "parameter_providers" to s.dictionary(s.handle()), "missing_dependencies" to s.array(s.handle()), "contributions" to s.array(contribution), "group" to s.handle(),
         "owned_keyforms" to s.array(ownedKeyform), "override_issues" to s.array(overrideIssue))
     /** Candidate observations, without configuration or geometry payloads, for the shared dry-run result. */
-    val reportEntries: JsonObject get() = s.array(s.obj(observedFields - "group" + ("type" to s.choices(*types.toTypedArray()))))
+    val reportEntries: JsonObject get() = s.array(s.obj(observedFields - "group" + ("type" to s.handle()), observedFields.keys - "group" - "error" + "type"))
     val stack: JsonObject get() = s.obj(s.identity + mapOf("revision" to s.handle(), "legacy" to s.boolean(),
         "entries" to s.array(s.union(types.map { type ->
-            val fields = fields(type, summary = true) + observedFields + if (type == "simulation") mapOf("bake" to WorkspaceSimulationResultSchemas.bakeSummary) else emptyMap()
-            s.obj(fields, fields.keys - "group" - "bake")
-        })), "retired_ids" to s.array(s.handle()), "next_id" to s.integer(1), "organization" to organization))
+            val fields = fields(type, summary = true) + observedFields + mapOf("applied" to s.boolean()) + if (type == "simulation") mapOf("bake" to WorkspaceSimulationResultSchemas.bakeSummary) else emptyMap()
+            s.obj(fields, fields.keys - "group" - "bake" - "plugin" - "error")
+        } + s.obj(pluginFields + observedFields + mapOf("applied" to s.boolean()), (pluginFields.keys + observedFields.keys + "applied") - "group" - "plugin" - "error"))), "retired_ids" to s.array(s.handle()), "next_id" to s.integer(1), "organization" to organization))
     val planRequest: JsonObject get() = s.union(listOf(
         s.obj(mapOf("type" to s.choices(*WorkspaceModifierPlan.sourceTypes.toTypedArray()), "targets" to s.array(target, 1, 4096))),
         s.obj(mapOf("group" to s.choices(*WorkspaceModifierPlan.groups.keys.toTypedArray()), "targets" to s.array(target, 1, 4096)))) +
@@ -124,7 +198,8 @@ internal object WorkspaceModifierSchemas {
             s.obj(mapOf("type" to s.constant("simulation"), "targets" to s.array(target, 1, 4096),
                 "preset" to s.choices("clothing", "front_hair", "back_hair"))),
             s.obj(mapOf("type" to s.constant("physics"), "targets" to s.array(target, 1, 4096),
-                "preset" to s.choices(*io.github.psd2live.core.PhysicsGenerator.presetIds.toTypedArray())))))
+                "preset" to s.choices(*io.github.psd2live.core.PhysicsGenerator.presetIds.toTypedArray()))),
+            s.obj(mapOf("type" to pluginType, "targets" to s.array(target, 1, 4096), "config" to s.dictionary(JsonObject(emptyMap()))), setOf("type", "targets"))))
     val plan: JsonObject get() = s.obj(s.identity + mapOf("revision" to s.handle(), "group" to s.handle(), "entries" to s.array(addition, 0, 128),
         "plan" to s.array(s.obj(mapOf("id" to s.handle(), "type" to s.handle(), "version" to s.integer(1),
             "targets" to s.array(target, 1, 4096), "disposition" to s.choices("added", "reused", "applied"))))))

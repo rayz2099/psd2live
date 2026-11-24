@@ -1071,7 +1071,9 @@ internal class CanvasEditor(
             if (value != EditHierarchyMode.SELECT) lastWorkMode = value
             viewModel.switchHierarchyModeView(value, canvasId, workspaceId)
         }
-    var editLevel by mutableStateOf(2) // Level 1 (grid), Level 2 (bezier), Level 3 (macro)
+    /** A warp's deform levels switched on, at least one: 1 its lattice points, 2 its Bezier anchors and handles over them. */
+    var editLevels by mutableStateOf(setOf(2))
+        private set
 
     /** The mode Tab returns to from object mode: the last mode other than Select the canvas was in or asked for. */
     private var lastWorkMode = EditHierarchyMode.DEFORM
@@ -1113,7 +1115,7 @@ internal class CanvasEditor(
         if (busy) return CanvasStatusMessage(tr("editor.saving"), CanvasStatusTone.NORMAL)
         // Status bar is always composed; model may still be absent before any PSD is loaded. The document's puppet, not
         // the drag's preview: the hint depends only on what is selected, and reading the preview recomposes every frame.
-        val source = state.previewModel?.rig?.puppet
+        val source = editSource
         val target = source?.let { target(it, selectedLayerId, selectedDeformerId) }
         val hintKey = when {
             tool == CanvasTool.MESH_POINT -> meshPointMode.hintKey
@@ -1441,6 +1443,7 @@ internal class CanvasEditor(
     var bezierState by mutableStateOf<BezierDeformerState?>(null)
     var activeBezierAnchor by mutableStateOf<Pair<Int, Int>?>(null)
     var activeBezierHandle by mutableStateOf<Triple<Int, Int, BezierHandleDir>?>(null)
+    private var activeBezierHandleStart: Offset? = null
     var hoveredBezierAnchor by mutableStateOf<Pair<Int, Int>?>(null)
     var hoveredBezierHandle by mutableStateOf<Triple<Int, Int, BezierHandleDir>?>(null)
 
@@ -1589,6 +1592,64 @@ internal class CanvasEditor(
     var space by mutableStateOf(false)
     var axis by mutableStateOf<String?>(null)
     private var deformationParameters by mutableStateOf<List<String>>(emptyList())
+    var snapDeformationToKeys by mutableStateOf(true)
+    var geometryEditStage by mutableStateOf("auto")
+        private set
+    private var capturedEditStage: String? = null
+    private var stageSourceOwner: RigPreviewModel? = null
+    private var stageSourceKey: String? = null
+    private var stageSourcePuppet: PuppetModel? = null
+    private val effectiveEditStage get() = if (hierarchyMode == EditHierarchyMode.DEFORM) capturedEditStage ?: geometryEditStage else "auto"
+    internal val editSource: PuppetModel?
+        get() {
+            val current = state.previewModel ?: return null
+            val stage = effectiveEditStage
+            if (stage == "auto") return current.rig.puppet
+            if (stageSourceOwner !== current || stageSourceKey != stage) {
+                stageSourceOwner = current; stageSourceKey = stage
+                stageSourcePuppet = runCatching { GeometryEditStages.resolve(current, stage).puppet }.getOrNull()
+            }
+            return stageSourcePuppet
+        }
+    /** The renderer and tools use the same selected stage, including while no gesture is active. */
+    val displayPuppet: PuppetModel? get() = preview ?: if (effectiveEditStage != "auto") editSource else null
+    fun geometryEditStages(): List<String> = if (state.previewModel?.modifierEvaluation == null) listOf("auto") else
+        listOf("auto", "base", "final") + state.previewModel!!.modifierEvaluation!!.entries
+            .filter { it.status == io.github.psd2live.core.modifier.ModifierStatus.ACTIVE }.map { "modifier:${it.instance.id}" }
+    fun geometryEditStageLabel(stage: String): String = if (!stage.startsWith("modifier:")) tr("editor.deformation.stage.$stage") else {
+        val entry = state.previewModel?.modifierEvaluation?.entries?.firstOrNull { it.instance.id == stage.removePrefix("modifier:") }
+        val name = entry?.instance?.config?.get("name")?.jsonPrimitive?.contentOrNull ?: entry?.instance?.type ?: stage
+        tr("editor.deformation.stage.after", name, stage.removePrefix("modifier:"))
+    }
+    fun geometryEditStageDescription(stage: String): String = if (!stage.startsWith("modifier:")) tr("editor.deformation.stage.$stage.desc") else {
+        val entry = state.previewModel?.modifierEvaluation?.entries?.firstOrNull { it.instance.id == stage.removePrefix("modifier:") }
+        val name = entry?.instance?.config?.get("name")?.jsonPrimitive?.contentOrNull ?: entry?.instance?.type ?: stage
+        tr("editor.deformation.stage.after.desc", name, stage.removePrefix("modifier:"))
+    }
+    fun changeGeometryEditStage(stage: String) {
+        if (busy || dragging) return
+        try {
+            GeometryEditStages.resolve(requireNotNull(state.previewModel), stage)
+            cancel(); geometryEditStage = stage
+            vertices = emptySet(); selectedEdges = emptySet(); selectedFaces = emptySet()
+            error = null
+        } catch (failure: IllegalArgumentException) { error = failure.message }
+    }
+    private fun editStageCommand(command: JsonObject): JsonObject =
+        GeometryEditStages.withStage(GeometryEditIntent.withMode(command, capturedCorrectionMode ?: geometryCorrectionMode), effectiveEditStage)
+    private fun snapEditToNearestKeys(kind: String, id: String, onReady: () -> Unit): Boolean =
+        snapEditTargetsToNearestKeys(listOf(kind to id), onReady)
+    private fun snapEditTargetsToNearestKeys(targets: List<Pair<String, String>>, onReady: () -> Unit): Boolean {
+        val source = editSource ?: return true
+        val targetAxes = targets.flatMap { (kind, id) -> source.keyformAxesFor(kind, id) }
+        val parameterAxes = source.parameterKeyMarks().mapNotNull { (parameterId, marks) ->
+            val keys = marks.allKeys
+            if (keys.isEmpty()) null else KeyformAxis(parameterId, keys.toFloatArray())
+        }
+        return viewModel.snapAxesToNearestKeysOnModel(targetAxes + parameterAxes, source, onReady)
+    }
+    var geometryCorrectionMode by mutableStateOf("delta")
+    private var capturedCorrectionMode: String? = null
     var parameter: String?
         get() = deformationParameters.firstOrNull()
         set(value) { deformationParameters = listOfNotNull(value) }
@@ -1621,6 +1682,13 @@ internal class CanvasEditor(
             (candidates.minByOrNull { (it - start).getDistance() } ?: start).also { snapAnchor = it }
         }
         return start + (snap(anchor + (pos - start)) - anchor)
+    }
+
+    /** With [shift], the drag keeps only the larger of its two screen components, as Cubism's Shift drag does. */
+    private fun straightened(pos: Offset, shift: Boolean): Offset {
+        if (!shift) return pos
+        val d = pos - start
+        return if (abs(d.x) >= abs(d.y)) Offset(pos.x, start.y) else Offset(start.x, pos.y)
     }
 
     /** Whether the pointer is over one of the editor's own handles, which a press takes before a guide. */
@@ -1812,7 +1880,14 @@ internal class CanvasEditor(
     private var original: PuppetModel? = null
 
     private var pending: JsonObject? = null
+    /** Shared by geometry editing tools; retained until the document transaction commits or cancels. */
+    internal var capturedEditPose: Map<ParameterId, Float>? by mutableStateOf<Map<ParameterId, Float>?>(null)
+        private set
     private var gestureState: String? = null
+        set(value) {
+            field = value
+            if (value == null) { capturedEditPose = null; capturedCorrectionMode = null; capturedEditStage = null }
+        }
     private var moved = false
     private var additive = false
     private var subtractive = false
@@ -1831,7 +1906,17 @@ internal class CanvasEditor(
     /** When the painted bitmap was last republished, in [System.nanoTime] units. */
     private var lastPaintBitmapAt = 0L
     /** State, so chrome that lasts only as long as the gesture (the drag guide) leaves on the release itself. */
-    private var dragging by mutableStateOf(false)
+    private var draggingState by mutableStateOf(false)
+    private var dragging: Boolean
+        get() = draggingState
+        set(value) {
+            if (value && !draggingState && hierarchyMode == EditHierarchyMode.DEFORM && !posing() && capturedEditPose == null) {
+                capturedEditPose = pose.mapKeys { ParameterId(it.key) }.toMap()
+                capturedCorrectionMode = geometryCorrectionMode
+                capturedEditStage = if (geometryEditStage == "final") GeometryEditStages.resolve(requireNotNull(state.previewModel), "final").generator ?: "base" else geometryEditStage
+            }
+            draggingState = value
+        }
     private var ctrlAtPress = false
 
     /** Active brush deformation vertex weights [0f..1f] for target points; non-null while a brush stroke is live. */
@@ -1856,7 +1941,7 @@ internal class CanvasEditor(
     private val targetCaches = ArrayDeque<TargetCache>(2)
 
     private fun targetCache(source: PuppetModel): TargetCache {
-        val pose = state.parameterValues
+        val pose = pose.mapKeys { ParameterId(it.key) }
         targetCaches.firstOrNull { it.source === source && it.pose == pose }?.let { return it }
         val defaults = source.parameters.associate { it.id to it.default }
         val made = TargetCache(source, pose, buildDeformerWorlds(source.deformers, { p -> pose[p] ?: defaults[p] ?: 0f }, { defaults[it] ?: 0f }))
@@ -1867,7 +1952,7 @@ internal class CanvasEditor(
     }
 
     val inGesture get() = dragging
-    val model get() = preview ?: state.previewModel!!.rig.puppet
+    val model get() = preview ?: requireNotNull(editSource)
     val pose get() = viewModel.canvasPose(state).mapKeys { it.key.raw }
 
     /** Only the transform tool owns the box and its handles. */
@@ -1906,15 +1991,15 @@ internal class CanvasEditor(
             val t = target() ?: return false
             return t.kind == "rotation" || vertices.any { it in 0 until t.count }
         }
-    val editable get() = !busy && !state.workspaceEditBusy && !state.isGenerating && !state.isAnalyzing && state.historySnapshot != null
+    val editable get() = editSource != null && !busy && !state.workspaceEditBusy && !state.isGenerating && !state.isAnalyzing && state.historySnapshot != null
 
     /**
      * The selection's target on the document's puppet, without the gesture in progress: for what shows what is selected
      * (status bar, tool options), which then does not read the preview a drag replaces every frame and recompose with it.
      */
-    fun selectionTarget(): CanvasTarget? = target(state.previewModel?.rig?.puppet)
+    fun selectionTarget(): CanvasTarget? = target(editSource)
 
-    fun target(source: PuppetModel? = preview ?: state.previewModel?.rig?.puppet, layerId: String? = state.selectedLayerId, deformerId: String? = state.selectedDeformerId): CanvasTarget? {
+    fun target(source: PuppetModel? = preview ?: editSource, layerId: String? = state.selectedLayerId, deformerId: String? = state.selectedDeformerId): CanvasTarget? {
         // Panels can be composed before a project is loaded or while it is closing.
         val resolvedSource = source ?: return null
         val rig = state.previewModel?.rig ?: return null
@@ -1952,7 +2037,7 @@ internal class CanvasEditor(
 
     /** Pose keys the current puppet does not have, or values outside its range, must not reach geometry(). */
     private fun sanitizedPose(model: PuppetModel): Map<String, Float> {
-        val raw = state.parameterValues
+        val raw = pose.mapKeys { ParameterId(it.key) }
         if (raw.isEmpty()) return emptyMap()
         val byId = model.parameters.associateBy { it.id.raw }
         val out = LinkedHashMap<String, Float>(raw.size)
@@ -2098,18 +2183,21 @@ internal class CanvasEditor(
      */
     fun reconcileWithDocument() {
         if (busy || dragging) return
+        if (geometryEditStage !in geometryEditStages()) {
+            geometryEditStage = "auto"; error = tr("editor.deformation.stage.unavailable")
+        }
         val layerIds = state.previewModel?.analysis?.layers?.mapTo(HashSet()) { it.source.id.raw }
         if (layerIds != null) {
             val nextObjects = objects.filterTo(LinkedHashSet()) { it in layerIds }
             if (nextObjects.size != objects.size) objects = nextObjects
         }
-        val paths = state.previewModel?.rig?.puppet?.deformPaths?.mapTo(HashSet()) { it.id }
+        val paths = editSource?.deformPaths?.mapTo(HashSet()) { it.id }
         if (paths != null && activePath != null && activePath !in paths) {
             activePath = null
             pathPoint = -1
         }
         val t = target()
-        val counts = (preview ?: state.previewModel?.rig?.puppet)?.drawables.orEmpty()
+        val counts = (preview ?: editSource)?.drawables.orEmpty()
             .associate { it.id.raw to (it.mesh?.vertexCount ?: 0) }
         val nextSelection = selection.mapValues { (id, set) ->
             val count = if (id == t?.id) t.count else counts[id] ?: 0
@@ -2795,7 +2883,7 @@ internal class CanvasEditor(
         glueStrokeA = emptySet()
         glueStrokeB = emptySet()
         poseDrag = null
-        activeBezierAnchor = null; activeBezierHandle = null
+        activeBezierAnchor = null; activeBezierHandle = null; activeBezierHandleStart = null
         activeBrushWeights = null; activeBrushCenter = null; endMeshStroke()
         marquee = emptyList(); draft = emptyList(); draftPathId = null; drawingPath = false
         pathDragging = false
@@ -3722,7 +3810,7 @@ internal class CanvasEditor(
         } else if (next == EditHierarchyMode.SELECT) {
             selection = emptyMap()
         } else if (next == EditHierarchyMode.DEFORM) {
-            if (editLevel == 2) ensureBezierState()
+            if (2 in editLevels) ensureBezierState()
         }
         if (tool !in palette()) {
             tool = if (next == EditHierarchyMode.SKELETON && committedSkeleton?.enabled != true) CanvasTool.SKELETON_EDIT else palette().first()
@@ -3734,17 +3822,24 @@ internal class CanvasEditor(
 
     /**
      * Whether the deform levels apply to the target in hand: only a warp has a lattice of its own for each, its grid
-     * points at level 1 and its Bezier handles at level 2; everything else deforms alike at either.
+     * points at level 1 and its Bezier handles over them at level 2, either alone or both together; everything else
+     * deforms alike at any.
      */
     fun deformLevelsShown(): Boolean = hierarchyMode == EditHierarchyMode.DEFORM && target()?.kind == "warp"
 
-    @JvmName("changeEditLevel")
-    fun setEditLevel(level: Int) {
-        editLevel = level
-        // The lattice's points take no edits at the Bezier level, so a selection of them would only be moved by
+    /** Switches to [level] alone, as the number keys do. */
+    fun setEditLevel(level: Int) = switchEditLevels(setOf(level))
+
+    /** Switches [level] on or off beside the other, as its button does; the last one on stays on. */
+    fun toggleEditLevel(level: Int) = switchEditLevels(if (level in editLevels) editLevels - level else editLevels + level)
+
+    private fun switchEditLevels(levels: Set<Int>) {
+        if (levels.isEmpty()) return
+        editLevels = levels
+        // The lattice's points take no edits without the vertex level, so a selection of them would only be moved by
         // the transform box unseen.
-        if (level == 2 && target()?.kind == "warp") selection = emptyMap()
-        if (level == 2 && hierarchyMode == EditHierarchyMode.DEFORM) {
+        if (1 !in levels && target()?.kind == "warp") selection = emptyMap()
+        if (2 in levels && hierarchyMode == EditHierarchyMode.DEFORM) {
             ensureBezierState()
         }
         clearHover()
@@ -3926,7 +4021,7 @@ internal class CanvasEditor(
 
     /** The rig the canvas is drawing right now: the gesture's preview when one is live, else the rig. */
     private val drawnPreview: RigPreviewModel?
-        get() = state.previewModel?.let { source -> preview?.let { source.copy(rig = source.rig.copy(puppet = it)) } ?: source }
+        get() = state.previewModel?.let { source -> displayPuppet?.let { source.copy(rig = source.rig.copy(puppet = it)) } ?: source }
 
     /**
      * The pose, evaluated once per (rig, pose) rather than once per caller.
@@ -4032,11 +4127,12 @@ internal class CanvasEditor(
      * the pointer asks on every move.
      */
     private fun warpOutlinePoints(source: PuppetModel, ids: Set<String>): Map<String, FloatArray> {
-        if (warpOutlineSource !== source || warpOutlinePose != state.parameterValues || warpOutlineIds != ids) {
+        val shownPose = viewModel.canvasPose(state)
+        if (warpOutlineSource !== source || warpOutlinePose != shownPose || warpOutlineIds != ids) {
             warpOutlineSource = source
-            warpOutlinePose = state.parameterValues
+            warpOutlinePose = shownPose
             warpOutlineIds = ids
-            warpOutlinePoints = RigInformationOverlay.warpPoints(source, state.parameterValues, ids)
+            warpOutlinePoints = RigInformationOverlay.warpPoints(source, shownPose, ids)
         }
         return warpOutlinePoints
     }
@@ -4142,7 +4238,7 @@ internal class CanvasEditor(
 
         if (hierarchyMode == EditHierarchyMode.DEFORM) {
             if (t.kind == "warp") {
-                if (editLevel == 2) {
+                if (2 in editLevels) {
                     ensureBezierState()
                     val bState = bezierState
                     if (bState != null) {
@@ -4176,7 +4272,9 @@ internal class CanvasEditor(
                             return
                         }
                     }
-                    if (tool == CanvasTool.SELECT) {
+                    // Under the anchors and handles, the lattice points when the vertex level is on too.
+                    if (1 in editLevels) updatePointHover(pos, viewport, t)
+                    else if (tool == CanvasTool.SELECT) {
                         val frame = transformFrame(viewport)
                         hoveredHandle = if (frame != null) transformHandleAt(pos, frame) else BoundingHandle.NONE
                     }
@@ -4351,7 +4449,7 @@ internal class CanvasEditor(
         val expected = gestureState ?: viewModel.currentWorkspaceState()
         if (expected == null) { endTransformBox(); return false }
         try {
-            val result = RigAuthoringJournal.compile(state.previewModel!!.rig.puppet, JsonArray(commands))
+            val result = RigAuthoringJournal.compile(requireNotNull(editSource), JsonArray(commands))
             // A gesture that ends where it started compiles to nothing: dragging a vertex back onto
             // itself, or a numeric transform applied with its identity values. Dispatching that would ask
             // the workspace for an edit that cannot change anything, so drop it here and let the caller's
@@ -4361,7 +4459,7 @@ internal class CanvasEditor(
             preview = result.first; busy = true; error = null
             // The pending edit is only settled here, so this is where the box a drag was holding gives
             // way to one computed from what the model actually became.
-            viewModel.saveAuthoringEdits(expected, JsonArray(result.second)) { failure ->
+            viewModel.saveAuthoringEdits(expected, JsonArray(result.second.map { editStageCommand(it) })) { failure ->
                 busy = false; preview = null; pending = null; gestureState = null; error = failure
                 endTransformBox()
                 if (failure == null) onSuccess?.invoke()
@@ -4399,7 +4497,7 @@ internal class CanvasEditor(
      */
     internal fun keyformMirrorPlan(action: KeyformMirrorAction): KeyformMirrorPlan? {
         if (hierarchyMode != EditHierarchyMode.DEFORM) return null
-        val source = state.previewModel?.rig?.puppet ?: return null
+        val source = editSource ?: return null
         val primary = target(source) ?: return null
         val layers = LinkedHashSet(objects).apply { state.selectedLayerId?.let(::add) }
         val targets = (listOf(primary) + if (primary.kind == "mesh") layers.mapNotNull { target(source, it, null)?.takeIf { t -> t.kind == "mesh" } } else emptyList())
@@ -4476,7 +4574,7 @@ internal class CanvasEditor(
      */
     fun mirrorKeyform(action: KeyformMirrorAction) {
         val plan = keyformMirrorPlan(action) ?: return
-        val source = state.previewModel?.rig?.puppet ?: return
+        val source = editSource ?: return
         var failure: String? = null
         val commands = plan.commands.filter { command ->
             runCatching { KeyformMirror.compile(source, command).isNotEmpty() }.onFailure { failure = it.message }.getOrDefault(false)
@@ -4518,7 +4616,7 @@ internal class CanvasEditor(
      */
     private fun keyformTargets(): List<Pair<CanvasTarget, Map<String, Float>>> {
         if (hierarchyMode != EditHierarchyMode.DEFORM) return emptyList()
-        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        val source = editSource ?: return emptyList()
         val primary = target(source)?.takeIf { it.kind in setOf("mesh", "warp", "rotation") } ?: return emptyList()
         val layers = LinkedHashSet(objects).apply { state.selectedLayerId?.let(::add) }
         val others = if (primary.kind == "mesh") layers.mapNotNull { target(source, it, null)?.takeIf { t -> t.kind == "mesh" } } else emptyList()
@@ -4551,9 +4649,9 @@ internal class CanvasEditor(
         }
     }
 
-    /** The points a keyform tool keeps to: the picked ones, but none of a warp's at the Bezier level or of a rotation. */
+    /** The points a keyform tool keeps to: the picked ones, but none of a warp's without the vertex level or of a rotation. */
     private fun keyformPoints(t: CanvasTarget): Set<Int> =
-        if (t.kind == "rotation" || (t.kind == "warp" && editLevel != 1)) emptySet() else vertices
+        if (t.kind == "rotation" || (t.kind == "warp" && 1 !in editLevels)) emptySet() else vertices
 
     /** How many points the keyform tools would keep to: 0 when they write the whole shape. */
     fun keyformPointCount(): Int = keyformTarget()?.first?.let { keyformPoints(it).size } ?: 0
@@ -4564,7 +4662,7 @@ internal class CanvasEditor(
      */
     fun keyformInterpolationAxes(): List<String> {
         val (t, key) = keyedTarget() ?: return emptyList()
-        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        val source = editSource ?: return emptyList()
         return t.geometry.axes.filter { axis ->
             val value = key.getValue(axis.parameterId.raw)
             source.parameters.firstOrNull { it.id == axis.parameterId }?.kind == ParameterKind.NORMAL &&
@@ -4573,10 +4671,10 @@ internal class CanvasEditor(
     }
 
     /** A parameter's display name. */
-    fun parameterLabel(id: String): String = (preview ?: state.previewModel?.rig?.puppet)?.parameters?.firstOrNull { it.id.raw == id }?.name?.ifBlank { null } ?: id
+    fun parameterLabel(id: String): String = (preview ?: editSource)?.parameters?.firstOrNull { it.id.raw == id }?.name?.ifBlank { null } ?: id
 
     /** An object's display name. */
-    fun objectLabel(id: String): String = (preview ?: state.previewModel?.rig?.puppet)?.let { source ->
+    fun objectLabel(id: String): String = (preview ?: editSource)?.let { source ->
         source.drawables.firstOrNull { it.id.raw == id }?.name ?: source.deformers.firstOrNull { it.id.raw == id }?.name
     } ?: id
 
@@ -4584,7 +4682,7 @@ internal class CanvasEditor(
 
     /** Copies the shape and look of each object in hand at the key the canvas shows it at, for [KeyformToolAction.PASTE]. */
     fun copyKeyform() {
-        val source = state.previewModel?.rig?.puppet ?: return
+        val source = editSource ?: return
         keyformClipboard = keyformTargets().mapNotNull { (t, key) ->
             val snapshot = runCatching { KeyformTools.snapshot(source, "${t.kind}:${t.id}", key) }.getOrNull() ?: return@mapNotNull null
             val name = objectLabel(t.id)
@@ -4604,7 +4702,7 @@ internal class CanvasEditor(
      * kind with the same points under the same parent ([KeyformTools.misfit]); a draw order only onto a mesh.
      */
     fun keyformPasteFits(clip: KeyformClip, destination: String, channels: Set<String> = setOf("geometry")): Boolean {
-        val source = state.previewModel?.rig?.puppet ?: return false
+        val source = editSource ?: return false
         val t = keyformTargets().firstOrNull { it.first.id == destination }?.first ?: return false
         if ("geometry" in channels && KeyformTools.misfit(source, clip.snapshot, "${t.kind}:${t.id}") != null) return false
         return "drawOrder" !in channels || t.kind == "mesh"
@@ -4634,7 +4732,7 @@ internal class CanvasEditor(
     internal fun keyformPasteCommands(pairs: List<Pair<KeyformClip, String?>> = keyformPastePairs(),
                                       options: KeyformPasteOptions = KeyformPasteOptions()): List<JsonObject> {
         if (options.channels.isEmpty()) return emptyList()
-        val source = state.previewModel?.rig?.puppet ?: return emptyList()
+        val source = editSource ?: return emptyList()
         val targets = keyformTargets().filter { (t, key) -> onKey(t, key) }.associateBy { it.first.id }
         val primary = keyformTarget()?.first?.id
         var problem: String? = null
@@ -4696,7 +4794,7 @@ internal class CanvasEditor(
 
     /** Each parameter the keyforms of [targets] sit on, with its key values. */
     fun multiKeyAxes(targets: List<String> = multiKeyTargets()): Map<String, List<Float>> {
-        val source = state.previewModel?.rig?.puppet ?: return emptyMap()
+        val source = editSource ?: return emptyMap()
         val axes = LinkedHashMap<String, MutableSet<Float>>()
         for (ref in targets) for (key in KeyformTools.keyformKeys(source, RigAuthoringJournal.target(source, ref)))
             for ((id, value) in key) axes.getOrPut(id) { sortedSetOf() } += value
@@ -4705,7 +4803,7 @@ internal class CanvasEditor(
 
     /** How many keyforms of [targets] lie in [ranges] (per parameter, the values allowed). */
     fun multiKeyCount(targets: List<String>, ranges: Map<String, Set<Float>>): Int {
-        val source = state.previewModel?.rig?.puppet ?: return 0
+        val source = editSource ?: return 0
         return targets.sumOf { ref ->
             KeyformTools.keyformKeys(source, RigAuthoringJournal.target(source, ref)).count { key ->
                 ranges.all { (id, values) -> key[id]?.let { k -> values.any { abs(it - k) <= org.umamo.runtime.eval.EPS_KEY } } ?: true }
@@ -4745,13 +4843,13 @@ internal class CanvasEditor(
     private var temporaryWarpPressWorld: FloatArray? = null
 
     fun canBeginTemporaryWarp(): Boolean = hierarchyMode == EditHierarchyMode.DEFORM &&
-        target()?.let { it.kind == "mesh" || (it.kind == "warp" && editLevel == 1) } == true
+        target()?.let { it.kind == "mesh" || (it.kind == "warp" && 1 in editLevels) } == true
 
     /** Lays a [temporaryWarpDivisions] lattice over [carried] points of the target in hand (default the picked ones, or all). */
     fun beginTemporaryWarp(carried: Collection<Int>? = null) {
         if (!canBeginTemporaryWarp()) return
         val t = target() ?: return
-        val source = state.previewModel?.rig?.puppet ?: return
+        val source = editSource ?: return
         val world = t.mapping.localToWorld(t.geometry.points)
         val points = (carried ?: vertices).filter { it < t.count }.ifEmpty { (0 until t.count).toList() }
         val xs = points.map { world[it * 2] }; val ys = points.map { world[it * 2 + 1] }
@@ -4804,8 +4902,8 @@ internal class CanvasEditor(
         val points = temporaryWarpScreen(viewport)
         val hit = points.indices.minByOrNull { (points[it] - pos).getDistance() }?.takeIf { (points[it] - pos).getDistance() <= 10f } ?: return true
         val t = target() ?: return true
-        if (viewModel.snapToNearestKeys(t.kind, t.id) { press(pos, viewport, shift, alt, ctrl) }) return true
-        val source = state.previewModel?.rig?.puppet ?: return true
+        if (snapDeformationToKeys && snapEditToNearestKeys(t.kind, t.id) { press(pos, viewport, shift, alt, ctrl) }) return true
+        val source = editSource ?: return true
         val key = canvasDeformationCoordinate(source, t.geometry.axes, pose, deformationParameters)
         if (key != warp.key || viewModel.currentWorkspaceState() != warp.state) {
             beginTemporaryWarp(warp.uv.keys)
@@ -4858,8 +4956,8 @@ internal class CanvasEditor(
     /** Whether a drag of picked points carries the points around them: Deform's point tools with [softSelection] on. */
     fun softSelectionActive(): Boolean = softSelection && hierarchyMode == EditHierarchyMode.DEFORM &&
         (tool in SELECTION_TOOLS || tool == CanvasTool.TRANSFORM) &&
-        // A warp's lattice points are what it picks only at the vertex level; its Bezier handles take no soft drag.
-        target()?.let { it.kind != "warp" || editLevel == 1 } != false
+        // A warp's lattice points are what it picks only with the vertex level on; its Bezier handles take no soft drag.
+        target()?.let { it.kind != "warp" || 1 in editLevels } != false
 
     private var softReachKey: List<Any?>? = null
     private var softReach: Map<String, FloatArray> = emptyMap()
@@ -4874,7 +4972,7 @@ internal class CanvasEditor(
         val t = target()?.takeIf { it.kind != "rotation" } ?: return emptyMap()
         val picked = vertices
         if (picked.isEmpty()) return emptyMap()
-        val key = listOf(state.previewModel?.rig?.puppet, pose, viewport, softRadius, brushFalloff, picked, t.id, editLevel)
+        val key = listOf(editSource, pose, viewport, softRadius, brushFalloff, picked, t.id, editLevels)
         if (key != softReachKey) {
             softReach = mapOf(t.id to softSelectionWeights(screen(t.geometry.points, t, viewport), picked, (softRadius * viewport.scale).toFloat(), brushFalloff))
             softReachKey = key
@@ -4930,17 +5028,17 @@ internal class CanvasEditor(
         } else emptySet()
         // Against state.previewModel, which is what commitBatch compiles against - not `model`, which
         // prefers the in-flight `preview` and would disagree with the reducer mid-drag.
-        val mesh = state.previewModel?.rig?.puppet?.drawables?.firstOrNull { it.id.raw == t.id }?.mesh
+        val mesh = editSource?.drawables?.firstOrNull { it.id.raw == t.id }?.mesh
         // The pre-check runs here, on the UI thread, so a mesh too large to answer at once skips it: the reducer still
         // refuses what does not apply, and the selection afterwards is simply empty.
-        val source = state.previewModel?.rig?.puppet
+        val source = editSource
         val prejudged = mesh != null && (action !in MANUAL_TOPOLOGY || mesh.triangleCount <= PREJUDGE_TRIANGLES)
         val outcome = if (!prejudged || mesh == null) null else runCatching {
             CanvasTopology.build(mesh, action, selected, anchors, chosenEdges) { source?.let { CanvasTopology.shapes(it, DrawableId(t.id)) } ?: MeshShapes() }
         }.getOrNull()
         // Refused before it is sent, so the notice names the op instead of the reducer's failure.
         if (prejudged && outcome == null && action in MANUAL_TOPOLOGY) {
-            error = tr("editor.topologyRefused.$action")
+            error = tr(CanvasTopology.refusalKey(requireNotNull(mesh), action, selected))
             return
         }
         commitBatch(listOf(buildJsonObject { put("op", "canvas_topology"); put("id", t.id); put("action", action); put("vertices", JsonArray(selected.map(::JsonPrimitive)))
@@ -5018,7 +5116,7 @@ internal class CanvasEditor(
                 vertices = if (shift) vertices + spot.index else if (spot.index in vertices) vertices else setOf(spot.index)
                 selectedEdges = emptySet(); selectedFaces = emptySet()
                 if (shift) return
-                val source = state.previewModel?.rig?.puppet ?: return
+                val source = editSource ?: return
                 // The select tool's grab: glued partners move with the point instead of tearing off.
                 beginTransformDrag(source, transformTargets(source), BoundingHandle.BODY,
                     if (editsMeshes()) selectionFrame(viewport) else transformFrame(viewport), viewport)
@@ -5367,7 +5465,7 @@ internal class CanvasEditor(
             deferredMode = null
             hierarchyMode = returnMode
             if (returnMode == EditHierarchyMode.DEFORM) {
-                if (editLevel == 2) ensureBezierState()
+                if (2 in editLevels) ensureBezierState()
             }
         }
         tool = CanvasTool.SELECT
@@ -5423,7 +5521,7 @@ internal class CanvasEditor(
     }
 
     private fun meshDrawableId(layerOrDrawableId: String): String? {
-        val puppet = preview ?: state.previewModel?.rig?.puppet ?: return null
+        val puppet = preview ?: editSource ?: return null
         val rig = state.previewModel?.rig ?: return null
         val byLayer = puppet.drawables.firstOrNull { rig.ownLayerIdByDrawableId[it.id.raw] == layerOrDrawableId && it.mesh != null }
         if (byLayer != null) return byLayer.id.raw
@@ -5436,7 +5534,7 @@ internal class CanvasEditor(
      * The meshes Edit mode is editing: every selected layer that resolves to a mesh, primary included,
      * in selection order. Empty outside Edit, and when the primary target is a deformer.
      */
-    fun editMeshTargets(source: PuppetModel? = preview ?: state.previewModel?.rig?.puppet): List<CanvasTarget> {
+    fun editMeshTargets(source: PuppetModel? = preview ?: editSource): List<CanvasTarget> {
         if (hierarchyMode != EditHierarchyMode.EDIT && hierarchyMode != EditHierarchyMode.SIMULATE) return emptyList()
         val primary = target(source) ?: return emptyList()
         if (primary.kind != "mesh") return emptyList()
@@ -5471,7 +5569,7 @@ internal class CanvasEditor(
 
     /** The model's glued points, one group per point. */
     fun weldGroups(): WeldGroups {
-        val source = preview ?: state.previewModel?.rig?.puppet ?: return WeldGroups.EMPTY
+        val source = preview ?: editSource ?: return WeldGroups.EMPTY
         if (weldSource !== source.glues) {
             val counts = source.drawables.associate { it.id.raw to (it.mesh?.vertexCount ?: 0) }
             weldCached = WeldGroups.of(source.glues) { it.index in 0 until (counts[it.mesh] ?: 0) }
@@ -5566,7 +5664,7 @@ internal class CanvasEditor(
 
     fun brushPreviewWeights(viewport: CanvasViewport): Map<String, FloatArray> {
         val center = cursor ?: return emptyMap()
-        val source = state.previewModel?.rig?.puppet ?: return emptyMap()
+        val source = editSource ?: return emptyMap()
         val edited = editsMeshes()
         val targets = if (edited) editMeshTargets(source) else listOfNotNull(target(source)?.takeIf { it.kind != "rotation" })
         if (targets.isEmpty() || tool !in DEFORM_BRUSH_TOOLS) return emptyMap()
@@ -5589,7 +5687,7 @@ internal class CanvasEditor(
      */
     fun brushHoverReach(viewport: CanvasViewport): Map<String, FloatArray> {
         if (tool !in DEFORM_BRUSH_TOOLS || dragging || adjustingBrush || meshStroke != null || cursor == null) return emptyMap()
-        val key = listOf(cursor, viewport, state.previewModel?.rig?.puppet, pose, radius, hardness, brushShape, brushAngle,
+        val key = listOf(cursor, viewport, editSource, pose, radius, hardness, brushShape, brushAngle,
             brushAspect, brushFalloff, strength, connectedOnly, tool, hierarchyMode, selection, vertices, target()?.id)
         if (key != hoverReachKey) {
             hoverReach = runCatching { brushPreviewWeights(viewport) }.getOrDefault(emptyMap()).filterValues { w -> w.any { it > 0.0001f } }
@@ -5630,7 +5728,7 @@ internal class CanvasEditor(
             session.cancel(); preview = null; gestureState = null; endTransformBox()
             return
         }
-        val operation = io.github.psd2live.application.WorkspaceCanvasDeformEdits.operation(session)
+        val operation = io.github.psd2live.application.WorkspaceCanvasDeformEdits.operation(session, capturedCorrectionMode ?: geometryCorrectionMode, effectiveEditStage)
         busy = true; error = null
         viewModel.saveDocumentEdits(expected, "Deformed canvas geometry", listOf(operation)) { failure ->
             busy = false; preview = null; gestureState = null; error = failure
@@ -5745,22 +5843,22 @@ internal class CanvasEditor(
             put("hits_a", JsonArray(hitsA.sorted().map(::JsonPrimitive)))
             put("hits_b", JsonArray(hitsB.sorted().map(::JsonPrimitive)))
         }
-        commitWeightOperations(listOf(io.github.psd2live.application.WorkspaceDocumentOperation("canvas_glue_edit", cmd)))
+        commitWeightOperation(io.github.psd2live.application.WorkspaceDocumentOperation("canvas_glue_edit", cmd))
     }
 
-    /** Preview neutral requests locally; their final materialization uses the captured candidate. */
-    private fun commitWeightOperations(operations: List<io.github.psd2live.application.WorkspaceDocumentOperation>) {
-        if (!editable || operations.isEmpty()) return
+    private fun commitWeightOperation(operation: io.github.psd2live.application.WorkspaceDocumentOperation, localPreview: PuppetModel? = null) {
+        if (!editable) return
         val expected = gestureState ?: viewModel.currentWorkspaceState() ?: return
+        val base = editSource ?: return
+        val generation = state.projectOpenGeneration
         try {
-            val base = state.previewModel?.rig?.puppet ?: return
-            var evaluated = base
-            for (operation in operations) {
-                val commands = io.github.psd2live.application.WorkspaceCanvasWeightEdits.commands(evaluated, operation)
-                evaluated = RigAuthoringJournal.compile(evaluated, commands).first
-            }
-            preview = evaluated; busy = true; error = null
-            viewModel.saveDocumentEdits(expected, "Edited canvas weights", operations) { failure ->
+            preview = localPreview ?: RigAuthoringJournal.compile(base,
+                io.github.psd2live.application.WorkspaceCanvasWeightEdits.commands(base, operation)).first
+            busy = true; error = null
+            val submitted = if (operation.operation == "vertex_group_paint") operation.copy(request =
+                JsonObject(operation.request + ("auto_bake" to JsonPrimitive(viewModel.simulationAutoBake.value)))) else operation
+            viewModel.saveDocumentEdits(expected, "Edited canvas weights", listOf(submitted)) { failure ->
+                if (state.projectOpenGeneration != generation) return@saveDocumentEdits
                 busy = false; preview = null; pending = null; gestureState = null; error = failure
                 endTransformBox()
             }
@@ -5852,7 +5950,7 @@ internal class CanvasEditor(
     private fun weightReach(from: Offset, to: Offset, viewport: CanvasViewport): Map<String, FloatArray> {
         val targets = editMeshTargets()
         if (targets.isEmpty()) return emptyMap()
-        val source = preview ?: state.previewModel?.rig?.puppet ?: return emptyMap()
+        val source = preview ?: editSource ?: return emptyMap()
         val surfaces = io.github.psd2live.core.CanvasWeightAuthoring.surfaces(source,
             targets.map { DrawableId(it.id) }, weightPose(source), connectedOnly)
         val reached = io.github.psd2live.core.canvasBrushWeights(surfaces, weightCanvasPoint(from, viewport),
@@ -5917,7 +6015,7 @@ internal class CanvasEditor(
         }
         weightGradient = gradient.first to to
         val targets = editMeshTargets()
-        val source = preview ?: state.previewModel?.rig?.puppet ?: return
+        val source = preview ?: editSource ?: return
         val surfaces = io.github.psd2live.core.CanvasWeightAuthoring.surfaces(source,
             targets.map { DrawableId(it.id) }, weightPose(source), connected = false)
         weightStroke = targets.indices.associate { at ->
@@ -5929,7 +6027,8 @@ internal class CanvasEditor(
 
     private fun accumulateWeightStroke(from: Offset, to: Offset, viewport: CanvasViewport) {
         if (weightStrokePoints.isEmpty()) weightStrokePoints += weightCanvasPoint(from, viewport)
-        weightStrokePoints += weightCanvasPoint(to, viewport)
+        val nextPoint = weightCanvasPoint(to, viewport)
+        if (weightStrokePoints.size == 1 || weightStrokePoints.last() != nextPoint) weightStrokePoints += nextPoint
         val reached = weightReach(from, to, viewport)
         val next = weightStroke.toMutableMap()
         for ((id, w) in reached) {
@@ -5954,17 +6053,26 @@ internal class CanvasEditor(
             put("pose", JsonObject(strokePose.mapValues { JsonPrimitive(it.value) }))
             fun point(p: io.github.psd2live.core.CanvasBrushPoint) = JsonArray(listOf(JsonPrimitive(p.x), JsonPrimitive(p.y)))
             if (gradient == null) {
-                put("points", JsonArray(points.map(::point))); put("radius", radius); put("hardness", hardness)
+                val (field, batches) = io.github.psd2live.core.CanvasWeightStroke.encode(points)
+                put(field, batches); put("radius", radius); put("hardness", hardness)
                 put("shape", brushShape.name.lowercase()); put("angle", brushAngle); put("aspect", brushAspect)
                 put("falloff", brushFalloff.name.lowercase()); put("connected_only", connectedOnly)
             } else { put("from", point(weightCanvasPoint(gradient.first, vp))); put("to", point(weightCanvasPoint(gradient.second, vp))) }
+        }
+        // The live gesture already computed coverage. Keep its materialized preview while the
+        // background transaction validates/replays the request against the captured workspace state.
+        val local = targets.fold(model) { current, id ->
+            val values = paintedWeights(id) ?: return@fold current
+            if (paintedGroup(id) == null && values.none { it > 0f }) return@fold current
+            val group = VertexGroup(paintedGroupName(id), DrawableId(id), weightGroupKind, values)
+            VertexGroupJournal.apply(current, VertexGroupJournal.encode(group))
         }
         weightStroke = emptyMap()
         weightGradient = null
         weightStrokePoints.clear()
         weightStrokePose = null
         if (targets.isEmpty() || (gradient == null && points.isEmpty())) return
-        commitWeightOperations(listOf(io.github.psd2live.application.WorkspaceDocumentOperation("vertex_group_paint", buildJsonObject { put("edit", request) })))
+        commitWeightOperation(io.github.psd2live.application.WorkspaceDocumentOperation("vertex_group_paint", buildJsonObject { put("edit", request) }), local)
     }
 
     /** Fills or clears the brushed group on every edited mesh at once. */
@@ -5982,9 +6090,9 @@ internal class CanvasEditor(
     fun invertVertexGroup() {
         val targets = editMeshTargets().map { it.id }
         if (targets.isEmpty()) return
-        commitWeightOperations(listOf(io.github.psd2live.application.WorkspaceDocumentOperation("vertex_group_paint", buildJsonObject { put("edit", buildJsonObject {
+        commitWeightOperation(io.github.psd2live.application.WorkspaceDocumentOperation("vertex_group_paint", buildJsonObject { put("edit", buildJsonObject {
             put("action", "invert"); put("targets", JsonArray(targets.map(::JsonPrimitive))); put("kind", weightGroupKind.jsonName)
-        }) })))
+        }) }))
     }
 
     /** Removes the brushed group from every edited mesh that has it. */
@@ -6419,14 +6527,15 @@ internal class CanvasEditor(
         }
 
         // 2. Level 2 Bezier Deformer in DEFORM mode
-        if (hierarchyMode == EditHierarchyMode.DEFORM && editLevel == 2) {
+        if (hierarchyMode == EditHierarchyMode.DEFORM && 2 in editLevels) {
             val t = target()
             if (t != null && t.kind == "warp") {
                 if (hoveredBezierHandle != null || hoveredBezierAnchor != null) {
-                    if (viewModel.snapToNearestKeys(t.kind, t.id) { press(pos, viewport, shift, alt, ctrl) }) return true
+                    if (snapDeformationToKeys && snapEditToNearestKeys(t.kind, t.id) { press(pos, viewport, shift, alt, ctrl) }) return true
                 }
                 if (hoveredBezierHandle != null) {
                     activeBezierHandle = hoveredBezierHandle
+                    activeBezierHandleStart = bezierState?.handles?.get(hoveredBezierHandle)?.let { screen(floatArrayOf(it.x, it.y), t, viewport)[0] }
                     targetAtPress = t
                     original = model
                     dragging = true
@@ -6441,9 +6550,9 @@ internal class CanvasEditor(
                 }
             }
         }
-        // At the Bezier level a warp is edited through its anchors and handles alone; the lattice under them is
+        // Without the vertex level a warp is edited through its anchors and handles alone; the lattice under them is
         // shown for reference and takes no edits.
-        val bezierOnly = hierarchyMode == EditHierarchyMode.DEFORM && editLevel == 2 && target()?.kind == "warp" &&
+        val bezierOnly = hierarchyMode == EditHierarchyMode.DEFORM && 1 !in editLevels && target()?.kind == "warp" &&
             tool !in CREATION_TOOLS
 
         // 2b. A corner badge picks the deformer it belongs to, in every mode.
@@ -6520,10 +6629,10 @@ internal class CanvasEditor(
                 dragging = true
                 return true
             }
-            val source = state.previewModel?.rig?.puppet ?: return true
+            val source = editSource ?: return true
             val targets = transformTargets(source)
-            if (!objectMode && hierarchyMode == EditHierarchyMode.DEFORM &&
-                viewModel.snapTargetsToNearestKeys(targets.map { it.kind to it.id }) {
+            if (!objectMode && hierarchyMode == EditHierarchyMode.DEFORM && snapDeformationToKeys &&
+                snapEditTargetsToNearestKeys(targets.map { it.kind to it.id }) {
                     press(pos, viewport, shift, alt, ctrl)
                 }) return true
             beginTransformDrag(source, targets, handle, frame, viewport)
@@ -6558,8 +6667,8 @@ internal class CanvasEditor(
         if (hierarchyMode == EditHierarchyMode.DEFORM || hierarchyMode == EditHierarchyMode.EDIT) {
             val pathTarget = target()?.takeIf { it.kind == "mesh" && paths().isNotEmpty() }
             if (pathTarget != null) {
-                if (hierarchyMode == EditHierarchyMode.DEFORM) {
-                    if (viewModel.snapToNearestKeys(pathTarget.kind, pathTarget.id) {
+                if (hierarchyMode == EditHierarchyMode.DEFORM && snapDeformationToKeys) {
+                    if (snapEditToNearestKeys(pathTarget.kind, pathTarget.id) {
                         press(pos, viewport, shift, alt, ctrl)
                     }) return true
                 }
@@ -6576,8 +6685,8 @@ internal class CanvasEditor(
         // Mesh / topology gestures are separate from path handles — drop any lingering path-point grab.
         clearPathPointSelection()
         val brush = tool in DEFORM_BRUSH_TOOLS
-        if (hierarchyMode == EditHierarchyMode.DEFORM && (brush || selects)) {
-            if (viewModel.snapToNearestKeys(editTarget.kind, editTarget.id) {
+        if (hierarchyMode == EditHierarchyMode.DEFORM && (selects || brush) && snapDeformationToKeys) {
+            if (snapEditToNearestKeys(editTarget.kind, editTarget.id) {
                 press(pos, viewport, shift, alt, ctrl)
             }) return true
         }
@@ -6636,7 +6745,7 @@ internal class CanvasEditor(
         // Edge and face picks on a rest mesh drag through the transform gesture too, which is what moves
         // the glued partners of the vertices they cover instead of tearing them off.
         if (selects && picked.isNotEmpty() && !alt && editsMeshGeometry()) {
-            val source = state.previewModel?.rig?.puppet ?: return true
+            val source = editSource ?: return true
             beginTransformDrag(source, transformTargets(source), BoundingHandle.BODY, transformFrame(viewport), viewport)
         }
         return true
@@ -6647,7 +6756,7 @@ internal class CanvasEditor(
      * mesh are picked alike, and a glued point is always picked, framed and moved as one.
      */
     private fun pressEditMeshes(pos: Offset, viewport: CanvasViewport, shift: Boolean, alt: Boolean): Boolean {
-        val source = state.previewModel?.rig?.puppet ?: return true
+        val source = editSource ?: return true
         if (tool in DEFORM_BRUSH_TOOLS) {
             shrinkAtPress = inflateInvert xor alt
             try { beginMeshStroke(pos, viewport, source) } catch (failure: Exception) {
@@ -6761,7 +6870,8 @@ internal class CanvasEditor(
         if (activeBezierHandle != null) {
             val (br, bc, dir) = activeBezierHandle!!
             val t = targetAtPress ?: return; val source = original ?: return
-            val (lx, ly) = local(pos, t, viewport)
+            val handleStart = activeBezierHandleStart ?: start
+            val (lx, ly) = local(handleStart + (straightened(pos, shift) - start), t, viewport)
             bezierState?.moveHandle(br, bc, dir, lx, ly, smooth = !alt)
             val warp = source.deformers.filterIsInstance<Deformer.Warp>().firstOrNull { it.id.raw == t.id } ?: return
             val evaluated = bezierState?.evaluateLattice(warp.rows, warp.columns)?.also { points ->
@@ -6779,7 +6889,8 @@ internal class CanvasEditor(
         if (activeBezierAnchor != null) {
             val (br, bc) = activeBezierAnchor!!
             val t = targetAtPress ?: return; val source = original ?: return
-            val (lx, ly) = local(pos, t, viewport)
+            val at = straightened(pos, shift)
+            val (lx, ly) = local(at, t, viewport)
             val (prevLx, prevLy) = local(previous, t, viewport)
             bezierState?.moveAnchor(br, bc, lx - prevLx, ly - prevLy)
             val warp = source.deformers.filterIsInstance<Deformer.Warp>().firstOrNull { it.id.raw == t.id } ?: return
@@ -6789,7 +6900,8 @@ internal class CanvasEditor(
             bezierSourcePoints = evaluated.copyOf()
             val cmd = RigBezierJournal.materialize(source, t.id, coordinate(t), pose,
                 RigBezierJournal.Controls(requireNotNull(bezierState), bezierResidual), preserveChildren = effectiveCtrl)
-            preview = RigAuthoringJournal.apply(source, cmd); pending = cmd; previous = pos
+            // The anchor moves by steps from the last point, so that point is the straightened one.
+            preview = RigAuthoringJournal.apply(source, cmd); pending = cmd; previous = at
             return
         }
 
@@ -6826,7 +6938,9 @@ internal class CanvasEditor(
         }
 
         val t = targetAtPress ?: return; val source = original ?: return
-        @Suppress("NAME_SHADOWING") val pos = snappedDrag(pos, t, viewport)
+        // Shift keeps a move straight; a box's scale and a rotation's arm already give it a meaning of their own.
+        val straight = shift && if (boxDrag) activeHandle == BoundingHandle.BODY else !(t.kind == "rotation" && vertices == setOf(1))
+        @Suppress("NAME_SHADOWING") val pos = snappedDrag(pos, t, viewport).let { if (straight) straightened(it, true) else it }
 
         try {
             if (boxDrag) {
@@ -6958,6 +7072,11 @@ internal class CanvasEditor(
     }
 
     fun release() {
+        try { releaseGesture() }
+        finally { if (!busy) { capturedEditPose = null; capturedCorrectionMode = null; capturedEditStage = null } }
+    }
+
+    private fun releaseGesture() {
         if (!dragging) return
         if (anchorDragging) {
             anchorDragging = false
@@ -7118,6 +7237,7 @@ internal class CanvasEditor(
         if (activeBezierAnchor != null || activeBezierHandle != null) {
             activeBezierAnchor = null
             activeBezierHandle = null
+            activeBezierHandleStart = null
             val cmd = pending
             if (moved && cmd != null) {
                 commit(cmd)

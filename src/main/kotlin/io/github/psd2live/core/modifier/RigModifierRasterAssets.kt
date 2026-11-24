@@ -1,17 +1,15 @@
 package io.github.psd2live.core.modifier
 
 import io.github.psd2live.core.*
-import io.github.psd2live.project.WorkspaceSourceLayer
+import io.github.psd2live.document.WorkspaceSourceLayer
 import io.github.psd2live.format.model.Bytes
 import io.github.psd2live.format.model.RigIR
 import io.github.psd2live.format.model.TexturePage
 import io.github.psd2live.format.model.TileArt
-import io.github.psd2live.targets.cubism.PuppetIr
-import org.umamo.runtime.model.AtlasPage
+import io.github.psd2live.bridge.PuppetIr
 import org.umamo.runtime.model.DeformPath
 import org.umamo.runtime.model.Drawable
 import org.umamo.runtime.model.DrawableId
-import org.umamo.runtime.model.OrgChild
 import org.umamo.runtime.model.PuppetModel
 import org.umamo.runtime.model.withDerivedRenderRoot
 import kotlinx.serialization.json.jsonObject
@@ -19,6 +17,22 @@ import org.umamo.format.art.*
 
 /** Restore independent raster assets before rebinding the authored checkpoint onto the live atlas. */
 internal object RigModifierRasterAssets {
+    fun resolve(input: RigIR, outputs: List<ModifierRasterOutput>, checkpoint: () -> Unit): RigIR =
+        attach(input, outputs, PipelineConfig(), checkpoint)
+
+    fun arranged(assets: List<ClassifiedLayer>, config: PipelineConfig): Boolean {
+        val tiles = config.atlasArrangement?.tiles ?: return false
+        return assets.any { it.source.id.raw in tiles }
+    }
+
+    fun sourceOrder(base: List<ClassifiedLayer>, assets: List<ClassifiedLayer>): List<ClassifiedLayer> {
+        val ids = base.mapTo(HashSet()) { it.source.id.raw }
+        val ribbons = assets.filter { MouthLipLayer.isLipId(it.source.id.raw) && it.source.id.raw.substringBeforeLast("::mouth-lip-") in ids }
+        val byOwner = ribbons.groupBy { it.source.id.raw.substringBeforeLast("::mouth-lip-") }
+        return base.flatMap { byOwner[it.source.id.raw].orEmpty().sortedBy { lip -> lip.source.id.raw } + it } +
+            (assets - ribbons.toSet())
+    }
+
     fun restored(config: PipelineConfig): List<ClassifiedLayer> {
         val overlay = config.rigEdits
         if (overlay.checkpointIndex < 0) return emptyList()
@@ -47,44 +61,118 @@ internal object RigModifierRasterAssets {
 
     data class Ribbon(val owner: DrawableId, val drawable: Drawable, val asset: ClassifiedLayer, val paths: List<DeformPath>)
 
-    fun attach(rig: RigIR, model: PuppetModel, ribbons: List<Ribbon>, analysis: PipelineAnalysis, config: PipelineConfig): RigIR {
+    fun attachRibbons(rig: RigIR, ribbons: List<Ribbon>, config: PipelineConfig): RigIR {
         if (ribbons.isEmpty()) return rig
-        val assetLayers = ribbons.map { it.asset }
-        val packed = append(PackedAtlas(emptyList(), emptyMap()), assetLayers, config)
-        val offset = model.atlas.pages.size
-        val placements = packed.placementByLayerId.mapValues { (_, placement) -> placement.copy(page = placement.page + offset) }
-        val (additional, sources) = PuppetSourceAtlas.build(analysis.copy(layers = assetLayers), placements)
-        val extra = sources.single()
-        require(extra.layers.none { layer -> model.sources.any { source -> source.id == extra.id && source.layers.any { it.key == layer.key } } }) {
-            "Modifier raster collides with existing artwork"
+        val generated = PuppetIr.toIr(PuppetModel(emptyList(), emptyList(), emptyList(), ribbons.map { it.drawable },
+            emptyList(), null, deformPaths = ribbons.flatMap { it.paths }))
+        val meshes = generated.meshes.associateBy { it.id }
+        val paths = generated.authoring.paths.groupBy { it.mesh }
+        val owners = rig.meshes.associateBy { it.id }
+        val outputs = ribbons.map { ribbon ->
+            val source = ribbon.asset.source
+            ModifierRasterOutput(owners.getValue(ribbon.owner.raw), meshes.getValue(ribbon.drawable.id.raw),
+                io.github.psd2live.format.model.SourceLayer(source.id.raw, source.name, source.groupPath,
+                    source.bounds.left, source.bounds.top, source.bounds.width, source.bounds.height, source.visible),
+                ModifierAlgorithmResource(source.raster.rgba), paths[ribbon.drawable.id.raw].orEmpty(),
+                ModifierRasterOutput.UvSpace.PAGE)
         }
-        val mergedSources = if (model.sources.none { it.id == extra.id }) model.sources + extra else model.sources.map {
-            if (it.id == extra.id) it.copy(layers = it.layers + extra.layers) else it
+        return attach(rig, outputs, config)
+    }
+
+    /** The same atomic resource boundary is used for generated and compatibility artwork. */
+    fun attach(rig: RigIR, outputs: List<ModifierRasterOutput>, config: PipelineConfig, checkpoint: () -> Unit = {}): RigIR {
+        if (outputs.isEmpty()) return rig
+        ModifierRasterOutput.validate(rig, outputs, checkpoint)
+        val sourceId = PuppetSourceAtlas.SOURCE_ID_RAW
+        val existing = rig.authoring.sources.singleOrNull { it.id == sourceId }
+        require(outputs.none { output -> existing?.layers?.any { it.key == output.layer.key } == true }) { "Modifier raster collides with existing artwork" }
+        val tileIds = rig.textures.tiles.mapTo(HashSet()) { it.id }
+        require(outputs.all { tileIds.add(PuppetSourceAtlas.tileIdFor(it.layer.key).raw) }) { "Modifier raster tile collision" }
+        val rasters = outputs.map { output ->
+            checkpoint()
+            val pixels = output.pixels.read()
+            RasterDigest.seed(pixels, output.pixels.digest)
+            LayerRaster(output.layer.width, output.layer.height, pixels)
         }
-        val meshes = ribbons.map { it.drawable.copy(texturePage = placements.getValue(it.asset.source.id.raw).page) }
-        require((model.drawables + meshes).map { it.id }.distinct().size == model.drawables.size + meshes.size) {
-            "Generated raster mesh ID collision"
+        val assets = outputs.mapIndexed { index, output ->
+            val source = output.layer
+            CharacterAnalyzer.classify(WorkspaceSourceLayer(LayerId(source.key), source.name, source.groupPath, SourceLayerKind.Raster,
+                source.visible, Int.MAX_VALUE, LayerBounds(source.left, source.top, source.width, source.height), 1f, false,
+                LayerBlend.Normal, ChannelMask.ALL, rasters[index], null, null, true), config)
         }
-        val byOwner = ribbons.groupBy { it.owner }
-        fun children(children: List<OrgChild>) = children.flatMap { child ->
-            val attachments = if (child is OrgChild.Drawable) byOwner[child.id].orEmpty() else emptyList()
-            attachments.map { OrgChild.Drawable(it.drawable.id) } + child
+        val packed = append(PackedAtlas(emptyList(), emptyMap()), assets, config)
+        checkpoint()
+        val offset = rig.textures.pages.size
+        val meshes = outputs.map { output ->
+            checkpoint()
+            val placement = packed.placementByLayerId.getValue(output.layer.key)
+            val geometry = requireNotNull(output.mesh.geometry)
+            val uvs = if (output.uvSpace == ModifierRasterOutput.UvSpace.PAGE) geometry.uvs else {
+                val page = packed.pages[placement.page].image
+                val values = geometry.uvs.toArray()
+                for (i in values.indices step 2) {
+                    val pixel = placement.toPage(values[i], values[i + 1])
+                    values[i] = pixel[0] / page.width
+                    values[i + 1] = pixel[1] / page.height
+                }
+                io.github.psd2live.format.model.Floats.wrap(values)
+            }
+            output.mesh.copy(page = placement.page + offset, tile = PuppetSourceAtlas.tileIdFor(output.layer.key).raw,
+                geometry = geometry.copy(uvs = uvs))
         }
-        val updated = model.copy(
-            atlas = model.atlas.copy(pages = model.atlas.pages + packed.pages.map { AtlasPage(it.image.width, it.image.height) },
-                tiles = model.atlas.tiles + additional.tiles),
-            sources = mergedSources, drawables = model.drawables + meshes,
-            parts = model.parts.map { it.copy(children = children(it.children)) }, rootChildren = children(model.rootChildren),
-            deformPaths = model.deformPaths + ribbons.flatMap { it.paths },
-        ).withDerivedRenderRoot()
-        val pages = rig.textures.pages + packed.pages.map { TexturePage(it.image.width, it.image.height, Bytes.wrap(it.png)) }
-        val bindings = rig.textures.bindings + meshes.associate { it.id.raw to it.texturePage }
-        val art = ribbons.map { ribbon ->
-            val raster = ribbon.asset.source.raster
-            TileArt(requireNotNull(ribbon.drawable.atlasTileId).raw, raster.width, raster.height, Bytes.wrap(raster.rgba))
+        val byOwner = outputs.groupBy { it.owner.id }
+        val savedTiles = config.atlasArrangement?.tiles.orEmpty()
+        val nativeLipIds = outputs.filter { output ->
+            val key = output.layer.key
+            key in savedTiles && MouthLipLayer.isLipId(key) &&
+                output.mesh.id == "${output.owner.id}_lip_${key.substringAfterLast('-')}"
+        }.mapTo(HashSet()) { it.mesh.id }
+        fun children(input: List<io.github.psd2live.format.model.ChildRef>) = input.flatMap { child ->
+            val added = if (child is io.github.psd2live.format.model.ChildRef.MeshRef) byOwner[child.id].orEmpty() else emptyList()
+            val (native, ordinary) = added.partition { it.mesh.id in nativeLipIds }
+            ordinary.map { io.github.psd2live.format.model.ChildRef.MeshRef(it.mesh.id) } + child +
+                native.map { io.github.psd2live.format.model.ChildRef.MeshRef(it.mesh.id) }
         }
-        val textures = PuppetIr.toIr(updated, pages, bindings).textures.copy(tileArt = rig.textures.tileArt + art)
-        return rig.withPuppet(updated).copy(textures = textures)
+        val source = existing?.copy(layers = existing.layers + outputs.map { it.layer }) ?: io.github.psd2live.format.model.SourceFile(
+            sourceId, "artwork.psd", null, "psd", outputs.map { it.layer })
+        val sources = if (existing == null) rig.authoring.sources + source else rig.authoring.sources.map { if (it.id == sourceId) source else it }
+        val tiles = outputs.map { output ->
+            val p = packed.placementByLayerId.getValue(output.layer.key)
+            val origin = p.toPage(0f, 0f)
+            io.github.psd2live.format.model.TextureTile(PuppetSourceAtlas.tileIdFor(output.layer.key).raw, output.layer.name,
+                output.layer.width, output.layer.height,
+                io.github.psd2live.format.model.TilePlacement(p.page + offset, origin[0], origin[1], p.scaleX, p.scaleY, p.rotation),
+                io.github.psd2live.format.model.SourceRef(sourceId, output.layer.key, true))
+        }
+        val pages = RigBuildProfile.stage("modifier raster: encode pages") {
+            packed.pages.parallelStream().map { TexturePage(it.image.width, it.image.height, Bytes.wrap(it.png)) }.toList()
+        }
+        val textures = rig.textures.copy(
+            pages = rig.textures.pages + pages,
+            tilePages = rig.textures.tilePages + packed.pages.map { io.github.psd2live.format.model.PageSize(it.image.width, it.image.height) },
+            tiles = rig.textures.tiles + tiles,
+            bindings = rig.textures.bindings + meshes.associate { it.id to it.page },
+            tileArt = rig.textures.tileArt + outputs.mapIndexed { index, output ->
+                val raster = rasters[index]
+                TileArt(PuppetSourceAtlas.tileIdFor(output.layer.key).raw, raster.width, raster.height, Bytes.wrap(raster.rgba))
+            })
+        val changes = ModifierModelChanges(meshes = ModifierObjectChanges(added = meshes),
+            parts = ModifierObjectChanges(updated = rig.parts.mapNotNull { part ->
+                val updated = part.copy(children = children(part.children))
+                if (updated == part) null else ModifierObjectUpdate(part, updated)
+            }),
+            rootChildren = ModifierFieldChange(rig.rootChildren, children(rig.rootChildren)),
+            authoring = ModifierFieldChange(rig.authoring, rig.authoring.copy(sources = sources, paths = rig.authoring.paths + outputs.flatMap { it.paths })),
+            textures = ModifierFieldChange(rig.textures, textures))
+        val candidate = changes.apply(rig, checkpoint)
+        val ordered = if (nativeLipIds.isEmpty()) candidate else {
+            val byId = meshes.associateBy { it.id }
+            val sourceOrder = rig.meshes.flatMap { mesh ->
+                listOf(mesh) + byOwner[mesh.id].orEmpty().filter { it.mesh.id in nativeLipIds }.map { byId.getValue(it.mesh.id) }
+            }
+            candidate.copy(meshes = sourceOrder + meshes.filterNot { it.id in nativeLipIds })
+        }
+        return ordered.withPuppet(PuppetIr.toPuppet(ordered).withDerivedRenderRoot()).copy(textures = textures).also { checkpoint() }
     }
 
     /** Appending dedicated pages keeps upstream UVs and page bindings unchanged. */

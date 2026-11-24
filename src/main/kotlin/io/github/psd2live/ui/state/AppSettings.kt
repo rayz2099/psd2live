@@ -78,6 +78,43 @@ object AppSettings {
 		}
 	}
 
+	internal fun workspaceTabLayoutOf(stored: String?): WorkspaceTabLayout =
+		WorkspaceTabLayout.entries.firstOrNull { it.name == stored } ?: WorkspaceTabLayout.LEFT
+
+	private val workspaceTabLayoutState = kotlinx.coroutines.flow.MutableStateFlow(
+		workspaceTabLayoutOf(runCatching { preferences.get("workspace_tab_layout", null) }.getOrNull()),
+	)
+
+	/** Where the workspace tabs sit: collapsible left vertical rail by default, or top horizontal strip. */
+	val workspaceTabLayoutFlow: kotlinx.coroutines.flow.StateFlow<WorkspaceTabLayout> get() = workspaceTabLayoutState
+
+	var workspaceTabLayout: WorkspaceTabLayout
+		get() = workspaceTabLayoutState.value
+		set(value) {
+			workspaceTabLayoutState.value = value
+			runCatching {
+				preferences.put("workspace_tab_layout", value.name)
+				preferences.flush()
+			}
+		}
+
+	private val workspaceTabRailExpandedState = kotlinx.coroutines.flow.MutableStateFlow(
+		runCatching { preferences.getBoolean("workspace_tab_rail_expanded", true) }.getOrDefault(true),
+	)
+
+	/** Whether the left vertical workspace tab rail is expanded (labels visible) or collapsed to icons. */
+	val workspaceTabRailExpandedFlow: kotlinx.coroutines.flow.StateFlow<Boolean> get() = workspaceTabRailExpandedState
+
+	var workspaceTabRailExpanded: Boolean
+		get() = workspaceTabRailExpandedState.value
+		set(value) {
+			workspaceTabRailExpandedState.value = value
+			runCatching {
+				preferences.putBoolean("workspace_tab_rail_expanded", value)
+				preferences.flush()
+			}
+		}
+
 	/** Wide enough for names like "Angle X" or "Eye L Open"; 40 dp cut nearly every name to its first word. */
 	const val DEFAULT_PARAMETER_NAME_WIDTH = 96f
 
@@ -178,6 +215,20 @@ object AppSettings {
 		get() = runCatching { preferences.getBoolean("simulation_auto_bake", false) }.getOrDefault(false)
 		set(value) {
 			runCatching { preferences.putBoolean("simulation_auto_bake", value) }
+		}
+
+	private val iconBitmapCacheState = kotlinx.coroutines.flow.MutableStateFlow(
+		runCatching { preferences.getBoolean("icon_bitmap_cache", false) }.getOrDefault(false),
+	)
+
+	/** Whether vector [GridIcon]s rasterize into cached bitmaps; off by default so icons render directly as sharp vectors. */
+	val iconBitmapCacheFlow: kotlinx.coroutines.flow.StateFlow<Boolean> get() = iconBitmapCacheState
+
+	var iconBitmapCache: Boolean
+		get() = iconBitmapCacheState.value
+		set(value) {
+			iconBitmapCacheState.value = value
+			runCatching { preferences.putBoolean("icon_bitmap_cache", value) }
 		}
 
 	private fun parameterPadHeightKey(horizontalId: String, verticalId: String): String {
@@ -306,21 +357,24 @@ object AppSettings {
 		}
 	}
 
-	private const val KEY_CANVAS_BG_KIND = "canvas_bg_kind"
+	private val canvasBackgroundRecovery by lazy { CanvasBackgroundRecovery(preferences) }
+
+	fun beginCanvasBackgroundSession() = canvasBackgroundRecovery.begin()
+	fun finishCanvasBackgroundSession() = canvasBackgroundRecovery.finish()
 	private const val KEY_CANVAS_BG_SOLID = "canvas_bg_solid"
 	private const val KEY_CANVAS_BG_CHECKER_LIGHT = "canvas_bg_checker_light"
 	private const val KEY_CANVAS_BG_CHECKER_DARK = "canvas_bg_checker_dark"
 	private const val KEY_CANVAS_BG_CHECKER_SIZE = "canvas_bg_checker_size"
 
 	/**
-	 * Colours are stored as 0xRRGGBB, with -1 for "follow the theme". The setter does not flush: the
-	 * colour picker writes on every drag move, and Preferences syncs on its own and at exit.
+	 * Colours are stored as 0xRRGGBB, with -1 for "follow the theme". Desktop is only saved after
+	 * normal GUI shutdown; entering it first flushes a recovery marker before window replacement.
 	 */
 	var canvasBackground: CanvasBackground
 		get() = runCatching {
 			fun color(key: String) = preferences.getInt(key, -1).takeIf { it in 0..0xFFFFFF }
 			CanvasBackground(
-				kind = CanvasBackgroundKind.fromId(preferences.get(KEY_CANVAS_BG_KIND, null)),
+				kind = canvasBackgroundRecovery.kind,
 				solidColor = color(KEY_CANVAS_BG_SOLID),
 				checkerLight = color(KEY_CANVAS_BG_CHECKER_LIGHT),
 				checkerDark = color(KEY_CANVAS_BG_CHECKER_DARK),
@@ -329,8 +383,8 @@ object AppSettings {
 			)
 		}.getOrDefault(CanvasBackground())
 		set(value) {
+			canvasBackgroundRecovery.select(value.kind)
 			runCatching {
-				preferences.put(KEY_CANVAS_BG_KIND, value.kind.id)
 				preferences.putInt(KEY_CANVAS_BG_SOLID, value.solidColor ?: -1)
 				preferences.putInt(KEY_CANVAS_BG_CHECKER_LIGHT, value.checkerLight ?: -1)
 				preferences.putInt(KEY_CANVAS_BG_CHECKER_DARK, value.checkerDark ?: -1)
@@ -340,7 +394,12 @@ object AppSettings {
 
 	private const val KEY_RECENT_FILES = "recent_files"
 
-	/** Offers the splits of the layers a layer import adds. */
+	/** Shows the step-by-step import guide when opening a PSD. */
+	var showPsdImportGuide: Boolean
+		get() = promptEnabled(AppPrompt.PSD_IMPORT_GUIDE)
+		set(value) = setPromptEnabled(AppPrompt.PSD_IMPORT_GUIDE, value)
+
+	/** Offers mesh splits after a new PSD or additional layer import. */
 	var autoDetectMeshSplitsOnImport: Boolean
 		get() = promptEnabled(AppPrompt.MESH_SPLITS_ON_IMPORT)
 		set(value) = setPromptEnabled(AppPrompt.MESH_SPLITS_ON_IMPORT, value)
@@ -547,6 +606,12 @@ object AppSettings {
 			preferences.remove(KEY_THEME_ID)
 			preferences.remove(KEY_THEME_LAST_DARK)
 			preferences.remove(KEY_THEME_LAST_LIGHT)
+			preferences.remove("icon_bitmap_cache")
+			iconBitmapCacheState.value = false
+			preferences.remove("workspace_tab_layout")
+			workspaceTabLayoutState.value = WorkspaceTabLayout.LEFT
+			preferences.remove("workspace_tab_rail_expanded")
+			workspaceTabRailExpandedState.value = true
 			// Enumerated by prefix so there is no action-name list to keep up to date.
 			preferences.keys().filter { it.startsWith(KEYMAP_PREFIX) }.forEach { preferences.remove(it) }
 			preferences.flush()
@@ -592,9 +657,11 @@ object AppSettings {
  * A prompt the user can turn off from the prompt itself ("Don't show again") and back on in Settings › Prompts.
  * [key] is its preference; [labelKey] names it in Settings, phrased as what is shown when it is on.
  */
-enum class AppPrompt(internal val key: String, val labelKey: String) {
+enum class AppPrompt(internal val key: String, val labelKey: String, val detailKey: String? = null) {
+	/** The step-by-step guide shown when opening a PSD. */
+	PSD_IMPORT_GUIDE("show_psd_import_guide", "psdGuide.setting.enabled", "psdGuide.setting.detail"),
 	/** The splits offered after a layer import. */
-	MESH_SPLITS_ON_IMPORT("auto_detect_mesh_splits_on_import", "editor.meshSplit.promptOnImport"),
+	MESH_SPLITS_ON_IMPORT("auto_detect_mesh_splits_on_import", "editor.meshSplit.promptOnImport", "editor.meshSplit.promptOnImport.detail"),
 	/** The dialog that reports a finished export and offers its folder. */
-	EXPORT_SUCCESS("prompt_export_success", "prompt.exportSuccess"),
+	EXPORT_SUCCESS("prompt_export_success", "prompt.exportSuccess", null),
 }

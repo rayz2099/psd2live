@@ -70,6 +70,7 @@ internal object RigGenerationMigration {
                 val old = oldLayers[layerId]; val next = desiredLayers[layerId]
                 sourceChanged || current.config.alphaThreshold != requested.alphaThreshold || current.config.meshUnits != requested.meshUnits ||
                     current.config.meshTrace != requested.meshTrace ||
+                    current.config.meshAlphaCoverage != requested.meshAlphaCoverage ||
                     (old != null && next != null && RigBuilder.meshSettings(old, current.config) != RigBuilder.meshSettings(next, requested)) ||
                     (next?.source is MouthLipLayer && (current.config.mouthThickness != requested.mouthThickness ||
                         current.config.mouthCurve != requested.mouthCurve || current.config.mouthShape != requested.mouthShape))
@@ -241,12 +242,12 @@ internal object RigGenerationMigration {
         return overlay.copy(simEdits = overlay.simEdits.map { sim ->
             checkpoint()
             val bake = sim.bake ?: return@map sim
-            fun axis(axis: SimBakedAxis): SimBakedAxis = SimBakedAxis(axis.parameter, axis.keys, axis.offsets.mapValues { (id, values) ->
+            fun axis(axis: SimBakedAxis): SimBakedAxis = axis.withMeshOffsets(axis.offsets.mapValues { (id, values) ->
                 val transform = transforms[id] ?: return@mapValues values
                 values.map { offset -> checkpoint(); transform(offset) }
             })
             sim.copy(bake = SimBakeResult.fromJson(bake.withGeometry(bake.vertexCounts,
-                bake.statics.map(::axis), bake.modes.map { SimBakedMode(axis(it.axis), it.amplitude, it.energy) }).toJson()))
+                bake.statics.map(::axis), bake.modes.map { it.withAxis(axis(it.axis)) }).toJson()))
         })
     }
 

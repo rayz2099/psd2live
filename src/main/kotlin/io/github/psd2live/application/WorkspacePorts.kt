@@ -91,6 +91,7 @@ interface WorkspaceQueries : WorkspaceStatePort {
     /** The physics rate the model declares. */
     fun physicsFps(): Int
     fun listSimulations(): List<RigSimEdit>
+    fun simulationBakeStale(sim: RigSimEdit): Boolean = currentPuppet()?.let { io.github.psd2live.core.sim.SimBake.stale(it, sim) } ?: false
     /** Runs simulation [id] on the current rig and reports how it moves; read-only. */
     fun reportSimulation(id: String, hold: Float, release: Float, wind: Pair<Float, Float>?,
                          progress: (Float) -> Unit = noSamplingProgress, cancelled: () -> Boolean = noSamplingCancellation): JsonObject
@@ -125,6 +126,7 @@ interface WorkspaceQueries : WorkspaceStatePort {
     fun rigModules(): kotlinx.serialization.json.JsonObject
     fun modifierStack(): kotlinx.serialization.json.JsonObject
     fun modifierPlan(request: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
+    fun modifierApplyPlan(id: String, scope: String = "prefix"): kotlinx.serialization.json.JsonObject = error("Modifier apply planning is unavailable")
 }
 
 /** A captured document's Layout state ([io.github.psd2live.project.WorkspaceLayout]) and the layers it applies to. */
@@ -161,6 +163,8 @@ interface WorkspaceSourcePort {
     suspend fun importPsd(path: String, discardUnsaved: Boolean = false, modifiers: WorkspaceInitialModifiers? = null, preset: WorkspaceInitialPreset? = null, includeLayerIds: Set<String>? = null): WorkspaceMutationResult
     /** A new Layout project, not generated yet, from a layout manifest or a zip holding one ([LayoutManifest]). */
     suspend fun importLayout(path: String, discardUnsaved: Boolean = false): WorkspaceMutationResult
+    /** Refresh external PSD pixels in the loaded project, retaining its rig and history. */
+    suspend fun reloadPsd(state: String, path: String): WorkspaceMutationResult
     suspend fun importCmo3(path: java.nio.file.Path, mode: Cmo3ImportMode,
                            discardUnsaved: Boolean = false): WorkspaceMutationResult
     suspend fun createArtwork(arguments: JsonObject): WorkspaceMutationResult
@@ -420,6 +424,7 @@ interface WorkspaceGenerationUpdatePort {
 
 /** Composition at the host boundary only. Command consumers depend on the relevant narrow port. */
 interface WorkspaceBackend :
+    WorkspacePersistencePort,
     WorkspaceEditorDraftPort,
     WorkspaceReadPort,
     WorkspaceSourcePort,

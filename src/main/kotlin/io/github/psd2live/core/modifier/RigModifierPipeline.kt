@@ -2,12 +2,14 @@ package io.github.psd2live.core.modifier
 
 import io.github.psd2live.core.*
 import io.github.psd2live.core.recipe.RigRecipe
-import io.github.psd2live.format.model.Physics
 import io.github.psd2live.format.model.RigIR
 import io.github.psd2live.format.model.TileArt
-import io.github.psd2live.targets.cubism.PuppetIr
+import io.github.psd2live.bridge.PuppetIr
 import java.util.concurrent.CancellationException
+import org.umamo.format.art.SourceArt
 import org.umamo.runtime.model.PuppetModel
+
+internal data class ModifierBaseSnapshot(val key: List<Any>, val model: RigPreviewModel, val input: RigIR)
 
 /** The single preview/export boundary for documents whose presets are explicit instances. */
 internal object RigModifierPipeline {
@@ -15,28 +17,7 @@ internal object RigModifierPipeline {
     fun input(model: RigPreviewModel): RigIR {
         val config = ordinaryConfig(model.config)
         val authored = model.authored.finished(config.rigEdits, config.layerVisibility, config.drawOrderOverrides)
-        return compileOrdinary(model.modifierAuthorAnalysis ?: model.analysis, model.modifierAuthorAtlas ?: model.atlas, authored, model.config)
-    }
-
-    /** Compile authored sidecars without inferring generated physics from the names of ordinary parameters. */
-    fun compileOrdinary(analysis: PipelineAnalysis, atlas: PackedAtlas, rig: BuiltRig, config: PipelineConfig,
-                        tileArt: Boolean = false, simulations: Boolean = false): RigIR {
-        val stack = config.rigEdits.modifierStack?.let(RigModifierStack::fromJson)
-        val meshOnly = config.meshOnly && stack?.let { it.instances.none { entry -> entry.enabled } && it.appliedCapabilities.isEmpty() } == true
-        val ordinary = ordinaryConfig(config).copy(meshOnly = meshOnly, generatePhysics = false)
-        val compiled = RigIrCompiler.compile(analysis, atlas, rig.copy(modifierOutput = null), ordinary, tileArt, simulations)
-        val available = rig.puppet.parameters.mapTo(HashSet()) { it.id.raw }
-        val claimed = HashSet<String>()
-        val groups = PhysicsCatalog.ordered(config.rigEdits.physicsEdits, config.rigEdits.physicsOrder) { it.id }
-            .filter { it.id !in config.rigEdits.disabledPhysicsIds && PhysicsCatalog.issueOf(it, available) == null }
-            .map { group ->
-                require(group.outputParameters.all { claimed.add(it) }) { "Ordinary physics groups have conflicting outputs" }
-                Physics3Json.group(group)
-            }
-        val textures = if (tileArt) compiled.textures else compiled.textures.copy(tileArt = rig.modifierRasterAssets)
-        return compiled.copy(textures = textures, physics = Physics(groups, config.rigEdits.physicsFps.toFloat()),
-            restPose = (if (meshOnly) compiled.restPose else emptyMap()) + rig.authoredRestPose.filterKeys { it in available },
-            parameterRoles = RigIrCompiler.orderedParameterRoles(rig.authoredParameterRoles + compiled.parameterRoles).filter { role -> role.parameters.all { it in available } })
+        return RigIrCompiler.compileAuthored(model.modifierAuthorAnalysis ?: model.analysis, model.modifierAuthorAtlas ?: model.atlas, authored, model.config)
     }
 
     /** Ordinary content may contain custom motions and physics, but no legacy preset runs implicitly. */
@@ -50,7 +31,7 @@ internal object RigModifierPipeline {
         motionBasic = false, motionSkeleton = false,
     )
 
-    fun build(pipeline: PSD2LivePipeline, analysis: PipelineAnalysis, config: PipelineConfig,
+    fun build(pipeline: PSD2LivePipeline, artwork: SourceArt, config: PipelineConfig,
               progress: ProgressListener, previousAtlas: PackedAtlas?): RigPreviewModel {
         val stack = RigModifierStack.fromJson(requireNotNull(config.rigEdits.modifierStack))
         require(config.rigEdits.swingEdits.isEmpty() && config.rigEdits.simEdits.isEmpty() && config.rigEdits.interiorEffects.isEmpty()) {
@@ -58,25 +39,55 @@ internal object RigModifierPipeline {
         }
         val ordinary = ordinaryConfig(config)
         // Mesh-only is a construction input here, not an export gate on the ordinary authored content.
-        val base = pipeline.buildOrdinaryPreview(analysis.source, ordinary.copy(meshOnly = true),
-            ProgressListener { message, fraction -> progress.update(message, fraction * .8) }, previousAtlas)
-        val input = compileOrdinary(base.analysis, base.atlas, base.rig, config)
-        val source = RigModifierSource(base.analysis, base.atlas, config, base.rig.layerIdByDrawableId, base.rig.copiedDrawableIds, base.baseRig.puppet, pipeline.meshCache)
-        val context = listOf(analysis.source, config.copy(rigEdits = config.rigEdits.copy(modifierStack = null)),
-            io.github.psd2live.i18n.I18n.currentLanguage)
-        val result = RigModifierAlgorithms.evaluator(source).evaluate(input, stack, pipeline.modifierCache, context) {
-            if (Thread.currentThread().isInterrupted) throw CancellationException("Modifier evaluation cancelled")
-            progress.update("Evaluating modifier stack", .85)
+        val baseKey = listOf(artwork, ordinary, config.meshOnly && stack.instances.none { it.enabled } && stack.appliedCapabilities.isEmpty(), io.github.psd2live.i18n.I18n.currentLanguage)
+        val retained = pipeline.modifierBase?.takeIf { it.key == baseKey }
+        val base = retained?.model ?: RigBuildProfile.stage("modifier author input") {
+            pipeline.buildOrdinaryPreview(artwork, ordinary.copy(meshOnly = true),
+                ProgressListener { message, fraction -> progress.update(message, fraction * .8) }, previousAtlas)
         }
-        val rig = base.rig.withModifierMeshes(PuppetIr.toPuppet(result.rig), result.rig.textures.tileArt)
+        if (retained != null) RigBuildProfile.count("modifier author input cache hits")
+        val input = retained?.input ?: RigIrCompiler.compileAuthored(base.analysis, base.atlas, base.rig, config)
+        // A failed binding does not invalidate its immutable ordinary artwork input.
+        pipeline.modifierBase = ModifierBaseSnapshot(baseKey, base, input)
+        val source = RigModifierSource(base.analysis, base.atlas, config, base.rig.layerIdByDrawableId, base.rig.copiedDrawableIds, base.rig.puppet, pipeline.meshCache)
+        // Saving the initial automatic layout as an explicit arrangement is presentation bookkeeping.
+        // Compare the resolved layout and let the evaluator compare the complete authored IR, including
+        // page content, before reusing a prefix or its captured inputs.
+        val context = listOf(artwork, config.copy(atlasArrangement = null, rigEdits = config.rigEdits.copy(modifierStack = null)),
+            base.atlas.placementByLayerId, base.atlas.fit, base.atlas.footprints, io.github.psd2live.i18n.I18n.currentLanguage, pipeline.rawSourceRotations)
+        val result = ModifierPluginStore.shared.withArchivedBundles(stack.runtimePluginReferences()) {
+            RigModifierAlgorithms.evaluator(source, stack, pipeline.rawSourceRotations,
+                workerSession = pipeline.modifierBuildOwner.workerSession()).evaluate(
+                input, stack, pipeline.modifierCache, context,
+                reuseCapturedAuthorInputs = true, isolateFailures = true) {
+                if (Thread.currentThread().isInterrupted) throw CancellationException("Modifier evaluation cancelled")
+                progress.update("Evaluating modifier stack", .85)
+            }
+        }
+        val evaluated = base.rig.withModifierMeshes(PuppetIr.toPuppet(result.rig), result.rig.textures.tileArt)
             .copy(modifierOutput = result.rig, modifierReport = result.report())
-        val extra = RigModifierRasterAssets.layers(rig, config).filterNot { it.source.id.raw in base.atlas.placementByLayerId }
-        val atlas = RigModifierRasterAssets.append(base.atlas, extra, config)
-        val composed = if (extra.isEmpty()) base.analysis else base.analysis.copy(layers = base.analysis.layers + extra)
+        val extra = RigModifierRasterAssets.layers(evaluated, config).filterNot { it.source.id.raw in base.atlas.placementByLayerId }
+        val appended = RigModifierRasterAssets.append(base.atlas, extra, config)
+        val arranged = RigModifierRasterAssets.arranged(extra, config)
+        val composedSource = when {
+            extra.isEmpty() -> base.analysis
+            arranged -> base.analysis.copy(layers = RigModifierRasterAssets.sourceOrder(base.analysis.layers, extra))
+            else -> base.analysis.copy(layers = base.analysis.layers + extra)
+        }
+        val composed = composedSource
+        val atlas = if (arranged) AtlasLayout.pack(composed.layers, config, previous = previousAtlas) else appended
+        val rig = if (arranged) requireNotNull(RigLayerDeletion.rebind(evaluated, composed, appended, composed, atlas)) {
+            "The arranged atlas cannot bind every generated mesh"
+        } else evaluated
         progress.update("Compiling modifier result", .95)
         val bundle = pipeline.previewBundle(composed, atlas, rig, config)
         return base.copy(analysis = composed, atlas = atlas, rig = rig, config = config, runtimeBundle = bundle,
-            modifierAuthorAtlas = base.atlas, modifierAuthorAnalysis = base.analysis).also { it.modifierEvaluation = pipeline.modifierCache.snapshot }
+            modifierAuthorAtlas = base.atlas, modifierAuthorAnalysis = base.analysis).also {
+                it.modifierEvaluation = pipeline.modifierCache.snapshot
+                pipeline.modifierBase = ModifierBaseSnapshot(baseKey, base, input)
+                it.modifierBaseSnapshot = pipeline.modifierBase
+                it.modifierBuildOwner = pipeline.modifierBuildOwner
+            }
     }
 }
 
@@ -86,6 +97,26 @@ internal fun BuiltRig.withModifierMeshes(model: PuppetModel, assets: List<TileAr
     val layers = layerIdByDrawableId.toMutableMap()
     val pages = pageByDrawableId.toMutableMap()
     val bounds = sourceBoundsByDrawableId.toMutableMap()
+    // Split pieces keep their original tile but the original drawable has been removed. Resolve
+    // their source mapping from the authoring rig before following texture-source references.
+    val remaining = model.drawables.mapTo(HashSet()) { it.id }
+    val sourcesByTile = puppet.drawables.filter {
+        it.id !in remaining && it.atlasTileId != null && it.id.raw in layerIdByDrawableId
+    }.groupBy { it.atlasTileId }
+    val splitCopies = mutableSetOf<String>()
+    for (mesh in model.drawables) {
+        if (mesh.id.raw in layers) continue
+        val tileId = mesh.atlasTileId ?: continue
+        val originals = sourcesByTile[tileId] ?: continue
+        require(originals.map { original ->
+            Triple(layers[original.id.raw], pages[original.id.raw], bounds[original.id.raw])
+        }.distinct().size == 1) { "mesh.split.source_binding_ambiguous: mesh:${mesh.id.raw} tile:${tileId.raw}" }
+        val original = originals.first().id.raw
+        layers[original]?.let { layers[mesh.id.raw] = it }
+        pages[original]?.let { pages[mesh.id.raw] = it }
+        bounds[original]?.let { bounds[mesh.id.raw] = it }
+        splitCopies += mesh.id.raw
+    }
     for (mesh in generated) {
         val original = requireNotNull(mesh.textureSourceId).raw
         layers[original]?.let { layers[mesh.id.raw] = it }
@@ -105,6 +136,6 @@ internal fun BuiltRig.withModifierMeshes(model: PuppetModel, assets: List<TileAr
             (layer.left + layer.width).toFloat(), (layer.top + layer.height).toFloat())
     }
     return copy(puppet = model, layerIdByDrawableId = layers, pageByDrawableId = pages,
-        sourceBoundsByDrawableId = bounds, copiedDrawableIds = copiedDrawableIds + generated.map { it.id.raw },
+        sourceBoundsByDrawableId = bounds, copiedDrawableIds = copiedDrawableIds + generated.map { it.id.raw } + splitCopies,
         modifierRasterAssets = assets)
 }

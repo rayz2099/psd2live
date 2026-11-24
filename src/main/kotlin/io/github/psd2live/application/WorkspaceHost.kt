@@ -98,6 +98,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.runInterruptible
@@ -138,9 +140,9 @@ internal class WorkspaceHost<V>(
         return documentCommands.previewRegeneration(before.projectId, before.state, edits)
     }
     override suspend fun applyDocumentEdits(state: String, summary: String, edits: List<WorkspaceDocumentOperation>,
-                                            author: MutationAuthor): WorkspaceMutationResult = editMutex.withLock {
+                                            author: MutationAuthor): WorkspaceMutationResult = WorkspaceEditObservation.observe(state, summary) { editMutex.withLock {
         require(edits.size in 1..128) { "Use 1..128 edits" }
-        require(edits.all { it.operation in WorkspaceDocumentEdits.supported }) { "Batch contains an unsupported document operation" }
+        require(edits.all { it.operation in WorkspaceDocumentEdits.supported || it.operation == "modifier_rebind" }) { "Batch contains an unsupported document operation" }
         val before = captureForMutation()
         if (state != before.state) throw WorkspaceConflict(state, before.state)
         val current = presentation.current()
@@ -156,7 +158,7 @@ internal class WorkspaceHost<V>(
             presentation.modelPublished(result.capture.model)
         }
         WorkspaceDocumentCommands.mutationResult(before, result, summary, edits)
-    }
+    } }
 
     override fun savedProjectData(): WorkspaceAuxiliarySnapshot {
         val read = runtime.read()
@@ -308,6 +310,31 @@ internal class WorkspaceHost<V>(
         result.mutation("Imported PSD ${input.fileName}")
     }
 
+    internal suspend fun preparePsdGuide(path: Path): WorkspacePsdGuide {
+        val root = workspaceStore.root
+        val config = sourceConfig(runtime.state.value, presentation.current())
+        val owned = runInterruptible(Dispatchers.IO) { io.github.psd2live.project.OwnedProjectSource.capture(root, path) }
+        val document = sourceImporter.prepareGuidedPsd(owned.path, path.fileName.toString(), config)
+        val preview = WorkspacePreviewBuilder(deferRuntimeBundles = true).build(document)
+        return WorkspacePsdGuide(path, root, owned, WorkspacePsdGuide.Candidate(document, preview))
+    }
+
+    internal suspend fun installPsdGuide(guide: WorkspacePsdGuide, candidate: WorkspacePsdGuide.Candidate,
+                                         discardUnsaved: Boolean) = editMutex.withLock {
+        val (state, current) = captureSourceImport(discardUnsaved)
+        if (guide.storeRoot != workspaceStore.root) throw WorkspaceConflict(guide.storeRoot.toString(), workspaceStore.root.toString())
+        val preview = previewBuilder.build(candidate.document)
+        try {
+            val result = sourceImporter.installGuidedPsd(state.state, candidate.document, preview, guide.owned.auxiliary,
+                discardUnsaved) { document, model, id ->
+                presentation.sourceInstalled(current, document, model, guide.path, id)
+            }
+            finishSourceImport(result)
+        } finally {
+            preview.modifierBuildOwner?.takeUnless { it.published }?.close()
+        }
+    }
+
     override suspend fun importLayout(path: String, discardUnsaved: Boolean): WorkspaceMutationResult = editMutex.withLock {
         val (state, current) = captureSourceImport(discardUnsaved)
         val input = Path.of(path)
@@ -317,6 +344,45 @@ internal class WorkspaceHost<V>(
         }
         finishSourceImport(result)
         result.mutation("Imported layout ${input.fileName}")
+    }
+
+    override suspend fun reloadPsd(state: String, path: String): WorkspaceMutationResult {
+        val initial = runtime.capture()
+        requireExpected(state, initial)
+        val input = Path.of(path).toAbsolutePath().normalize()
+        val originalPath = io.github.psd2live.project.OwnedProjectSource.resolve(workspaceStore.root, initial.auxiliary)
+        val sources = runInterruptible(Dispatchers.IO) {
+            require(originalPath != null && originalPath.fileName.toString().endsWith(".psd", true) &&
+                input.fileName.toString().endsWith(".psd", true) && Files.isRegularFile(input)) {
+                io.github.psd2live.i18n.tr("psdReload.sourceRequired")
+            }
+            val original = org.umamo.format.psd.PsdReader.read(Files.readAllBytes(originalPath))
+            val incoming = org.umamo.format.psd.PsdReader.read(Files.readAllBytes(input))
+            original to incoming
+        }
+        return editMutex.withLock {
+            val before = captureForMutation()
+            requireExpected(state, before)
+            val current = presentation.current()
+            val author = mutationAuthor(MutationAuthor.AGENT)
+            if (current.facts().generating || current.facts().saving || recoveringProjectId != null ||
+                (current.facts().analyzing && author != MutationAuthor.USER)) throw WorkspaceBusy()
+            require(io.github.psd2live.project.OwnedProjectSource.resolve(workspaceStore.root, before.auxiliary) == originalPath) {
+                io.github.psd2live.i18n.tr("psdReload.sourceRequired")
+            }
+            val context = currentCoroutineContext()
+            val summary = io.github.psd2live.i18n.tr("psdReload.completed")
+            val result = documentCommands.executeCandidate(before.projectId, before.state, summary, author,
+                mutation = { document, model -> WorkspacePsdReload.prepare(document, model, sources.first, sources.second) { context.ensureActive() } },
+                beforeCommit = { _, document, model -> showCommit(model, document, summary, current) })
+            if (result.applied) {
+                scheduleHistoryPersistence(before.projectId)
+                presentation.historyChanged(history())
+                presentation.modelPublished(result.capture.model)
+            }
+            WorkspaceMutationResult(result.capture.historyHead, result.capture.revision, emptyList(), summary,
+                applied = result.applied, state = result.capture.state, projectId = result.capture.projectId)
+        }
     }
 
     /** The settings a new source starts from: the open project's, without an imported model's switched-off generation. */
@@ -548,6 +614,13 @@ internal class WorkspaceHost<V>(
 
     /** The committed HEAD, read without the runtime lock. */
     internal fun currentHistoryHead(): String? = runtime.state.value.capture?.historyHead
+
+    internal fun turnStylePreview(expectedState: String, pose: Map<org.umamo.runtime.model.ParameterId, Float>,
+                                  visibleLayers: Set<String>): WorkspaceTurnStylePreview? =
+        runtime.read().runtime.capture?.takeIf { it.state == expectedState }?.let { capture ->
+            WorkspaceTurnStylePreview(capture, documentCommands, pose, visibleLayers)
+        }
+
     /** Installs a source the presentation analysed itself, when it holds one. */
     internal fun attachCurrentWorkspace() {
         if (presentation.importedSource(presentation.current()) != null) runBlocking { importedPsd() }
@@ -1336,6 +1409,7 @@ internal class WorkspaceHost<V>(
     override fun rigModules() = captureQueries().rigModules()
     override fun modifierStack() = captureQueries().modifierStack()
     override fun modifierPlan(request: JsonObject) = captureQueries().modifierPlan(request)
+    override fun modifierApplyPlan(id: String, scope: String) = captureQueries().modifierApplyPlan(id, scope)
 
     override fun generatedOverrideIssues() = captureQueries().generatedOverrideIssues()
     override fun supersededEntryNotes() = captureQueries().supersededEntryNotes()
@@ -1345,6 +1419,7 @@ internal class WorkspaceHost<V>(
     override fun staleRegenerations() = captureQueries().staleRegenerations()
 
     override fun listSimulations() = captureQueries().listSimulations()
+    override fun simulationBakeStale(sim: io.github.psd2live.core.sim.RigSimEdit) = captureQueries().simulationBakeStale(sim)
 
     private suspend fun simulationCommand(operation: WorkspaceDocumentOperation, expectedState: String, summary: String,
                                           author: MutationAuthor = MutationAuthor.AGENT, taskId: String? = null,
@@ -1658,7 +1733,7 @@ internal class WorkspaceHost<V>(
         val before = captureForMutation()
         val current = presentation.current()
         val selected = runtime.checkout(before.projectId, before.state, nodeId) { _, document, model ->
-            showCommit(model, document, "Checked out history node $nodeId", current, restoreCheckedOutPose = true, base = null)
+            showCommit(model, document, "Checked out history node $nodeId", current, base = null)
         }
         discardEditorQueues()
         scheduleHistoryPersistence(before.projectId)
@@ -1684,6 +1759,17 @@ internal class WorkspaceHost<V>(
 	}
 
     private data class PersistenceDestination(val root: Path, val projectId: String?, val kind: String)
+
+    override fun observePersistence(): kotlinx.coroutines.flow.Flow<WorkspacePersistenceState> =
+        kotlinx.coroutines.flow.combine(runtime.state, persistence.status) { runtimeState, writes ->
+            val capture = runtimeState.capture
+            writes.projectState(capture?.projectId, capture?.state,
+                PersistenceDestination(workspaceStore.root, capture?.projectId, "recovery"))
+        }
+
+    override fun retryPersistence() {
+        scheduleRecoveryCheckpoint(runtime.read())
+    }
 
     private fun scheduleHistoryPersistence(projectId: String) {
         draftQueue.forgetRejected()
@@ -1774,9 +1860,8 @@ internal class WorkspaceHost<V>(
         next: WorkspaceDocument,
         status: String,
         view: V = presentation.current(),
-        restoreCheckedOutPose: Boolean = false,
         base: WorkspaceDocument? = runtime.capture().document,
-    ) = presentation.show(view, preview, base, next, status, restoreCheckedOutPose)
+    ) = presentation.show(view, preview, base, next, status)
 
     private val repository = io.github.psd2live.project.ProjectRepository()
     private val saves = Mutex()
@@ -1857,6 +1942,9 @@ internal class WorkspaceHost<V>(
             }.use { opened ->
                 val state = presentation.decode(opened.presentation)
                 progress(WorkspaceProjectStep.BUILDING, path, 0.6f, 1f)
+                runInterruptible(Dispatchers.IO) {
+                    io.github.psd2live.core.modifier.ModifierPluginStore.shared.retainBundledReferences(opened.pluginReferences)
+                }
                 val installed = withContext(WorkspacePreviewProgress { progress(WorkspaceProjectStep.BUILDING, path, 0.6f, 1f, it.toDouble()) }) {
                     installProject(opened.projectId, opened.file, opened.source, state,
                         opened.history, opened.store, expected, discardUnsaved, opened.presentation)
@@ -1877,8 +1965,28 @@ internal class WorkspaceHost<V>(
         closeReason = reason
     }
 
+    init {
+        val pluginRevisionAtStart = io.github.psd2live.core.modifier.ModifierPluginStore.shared.revision.value
+        draftScope.launch {
+            io.github.psd2live.core.modifier.ModifierPluginStore.shared.revision.collectLatest { revision ->
+                if (revision == pluginRevisionAtStart) return@collectLatest
+                try {
+                    editMutex.withLock {
+                        val before = runtime.state.value.capture ?: return@withLock
+                        if (before.document.rigEdits.modifierStack == null) return@withLock
+                        val refreshed = runtime.refreshModel(before.state, { previewBuilder.build(it) }) { capture, model ->
+                            showCommit(model, capture.document, "", base = capture.document)
+                        }
+                        presentation.modelPublished(refreshed.model)
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                catch (failure: Exception) { System.err.println("Plugin preview refresh failed: ${failure.message}") }
+            }
+        }
+    }
 	override fun close() {
 		if (!isClosed.compareAndSet(false, true)) return
+        runtime.releaseBuildCaches()
         discardEditorQueues()
         draftScope.cancel()
         val flushed = runCatching {

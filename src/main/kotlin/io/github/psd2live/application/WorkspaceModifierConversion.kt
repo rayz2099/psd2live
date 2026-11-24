@@ -5,6 +5,7 @@ import io.github.psd2live.core.modifier.*
 import io.github.psd2live.core.recipe.RecipeSubject
 import io.github.psd2live.core.recipe.RigModules
 import io.github.psd2live.format.model.RigIR
+import io.github.psd2live.project.AtlasArrangementCodec
 import io.github.psd2live.project.WorkspaceDocument
 import io.github.psd2live.project.config
 import kotlinx.serialization.json.*
@@ -14,6 +15,29 @@ internal object WorkspaceModifierConversion {
     fun convert(document: WorkspaceDocument, model: RigPreviewModel, work: WorkspaceRasterWork): WorkspaceDocument {
         require(document.rigEdits.modifierStack == null) { "This project already uses a modifier stack" }
         work.checkpoint()
+        val prepared = capture(document, model)
+        val stack = RigModifierStack.fromJson(requireNotNull(prepared.rigEdits.modifierStack))
+        val verifiedBakes = WorkspaceModifierSimulation.prepare(prepared, stack, work, allowRebake = false)
+        val candidate = prepared.copy(rigEdits = prepared.rigEdits.copy(modifierStack = verifiedBakes.toJson()))
+        work.progress(.5f, "Verifying converted model presets")
+        val pipeline = PSD2LivePipeline().apply { deferRuntimeBundles = true }
+        fun build(document: WorkspaceDocument) = pipeline.buildPreview(document.source, document.config(),
+            ProgressListener { _, _ -> work.checkpoint() })
+        val converted = build(candidate)
+        val captured = verifiedBakes.copy(instances = verifiedBakes.instances.map {
+            WorkspaceModifierEdits.captureParameterProviders(it, converted, stopAtConsumer = true)
+        })
+        RigModifierAlgorithms.evaluator().validateOrder(captured)
+        val finished = candidate.copy(rigEdits = candidate.rigEdits.copy(modifierStack = captured.toJson()))
+        val verified = if (captured == verifiedBakes) converted else build(finished)
+        val previous = meaningful(RigIrCompiler.compile(model, tileArt = true, simulations = true))
+        val next = meaningful(RigIrCompiler.compile(verified, tileArt = true, simulations = true))
+        if (previous != next) throw mismatch(previous, next)
+        work.checkpoint()
+        return finished
+    }
+
+    internal fun capture(document: WorkspaceDocument, model: RigPreviewModel): WorkspaceDocument {
         val config = model.config
         val ordinaryOnly = config.meshOnly || config.rigEdits.importedCmo3 != null
         val stack = dynamics(model, if (ordinaryOnly) RigModifierStack() else bindings(model))
@@ -22,23 +46,13 @@ internal object WorkspaceModifierConversion {
             val binding = model.sources.bindingKey ?: PSD2LivePipeline().bindingKey(document.source, config)
             journal + RigCheckpoint.encode(model.authored, binding)
         } else journal
-        val prepared = document.copy(rigEdits = document.rigEdits.copy(
+        val generatedArt = stack.instances.any { instance -> instance.outputAliases.any { (name, id) ->
+            name.startsWith("mouth-art:") && id in model.atlas.placementByLayerId
+        } }
+        val settings = if (generatedArt) AtlasArrangementCodec.with(document.settings, AtlasLayout.frozen(model.atlas)) else document.settings
+        return document.copy(settings = settings, rigEdits = document.rigEdits.copy(
             modifierStack = stack.toJson(), authoringJournal = candidateJournal, swingEdits = emptyList(), simEdits = emptyList(),
             physicsOrder = (PhysicsCatalog.active(model).map { it.id } + document.rigEdits.physicsOrder).distinct()))
-        val verifiedBakes = WorkspaceModifierSimulation.prepare(prepared, stack, work, allowRebake = false)
-        val candidate = prepared.copy(rigEdits = prepared.rigEdits.copy(modifierStack = verifiedBakes.toJson()))
-        work.progress(.5f, "Verifying converted model presets")
-        val converted = PSD2LivePipeline().buildPreview(candidate.source, candidate.config(),
-            ProgressListener { _, _ -> work.checkpoint() })
-        val previous = meaningful(RigIrCompiler.compile(model, tileArt = true, simulations = true))
-        val next = meaningful(RigIrCompiler.compile(converted, tileArt = true, simulations = true))
-        if (previous != next) throw mismatch(previous, next)
-        work.checkpoint()
-        val captured = verifiedBakes.copy(instances = verifiedBakes.instances.map {
-            WorkspaceModifierEdits.captureParameterProviders(it, converted, stopAtConsumer = true)
-        })
-        RigModifierAlgorithms.evaluator().validateOrder(captured)
-        return candidate.copy(rigEdits = candidate.rigEdits.copy(modifierStack = captured.toJson()))
     }
 
     private fun mismatch(previous: RigIR, next: RigIR): WorkspaceModifierConversionMismatch {
@@ -166,6 +180,8 @@ internal object WorkspaceModifierConversion {
                 }
                 if (values.isNotEmpty()) putJsonObject("values") { values.forEach { (key, value) -> put(key, value) } }
             }, hierarchyAliases + buildMap {
+                if (spec.mouthOutline) putAll(mouthOutlineAliases(model))
+                if (spec.seeThrough) putAll(seeThroughAliases(model, spec.module == RigModules.EYE_SEE_THROUGH))
                 nativePhysics.filter { it.id in spec.module?.physicsGroups.orEmpty() }.forEach { put("physics:${it.id}", it.id) }
                 for (chain in chains.filter { it.native.kind in RigModifierChains.kinds(spec.type) }) {
                     chain.parameters.forEach { (native, normalized) -> put("chain-parameter:${normalized.raw.removePrefix("SourceChain:")}", native) }
@@ -186,8 +202,15 @@ internal object WorkspaceModifierConversion {
             } else capture(RigLegacyBindings.spec(base.id), version, base.knobs.associate { it.id to config.recipe.baseValue(area, it.id) })
         }
         val subject = RecipeSubject.of(model.analysis)
+        // Legacy lip ribbons used the final mouth poses and see-through copies used the final bind.
         val modules = RigModules.modules.filter { RigModules.builds(it, config, subject) && !(fittedFace && it == RigModules.FACE_DEPTH_TURN) }
-            .mapNotNull { RigLegacyBindings.find(it.id) }.toMutableList()
+            .mapNotNull { RigLegacyBindings.find(it.id) }.sortedBy {
+                when {
+                    it.seeThrough -> 2
+                    it.mouthOutline -> 1
+                    else -> 0
+                }
+            }.toMutableList()
         while (modules.isNotEmpty()) {
             val spec = requireNotNull(modules.firstOrNull { providers.keys.containsAll(it.requires) }) {
                 "Conversion cannot resolve legacy module prerequisites: ${modules.map { it.type }}"
@@ -229,6 +252,29 @@ internal object WorkspaceModifierConversion {
             add("motion", 1, MotionClips.toJson(captured), mapOf("motion" to clip.id))
         }
         return stack
+    }
+
+    private fun mouthOutlineAliases(model: RigPreviewModel): Map<String, String> = buildMap {
+        val base = model.baseRig
+        val layers = model.analysis.layers.mapNotNull { it.source as? MouthLipLayer }.associateBy { it.id.raw }
+        val meshesByLayer = base.ownLayerIdByDrawableId.entries.groupBy({ it.value }, { it.key })
+        val pathsByMesh = base.puppet.deformPaths.groupBy { it.drawableId.raw }
+        for ((mesh, layer) in base.ownLayerIdByDrawableId) {
+            val lip = layers[layer] ?: continue
+            val owner = meshesByLayer[lip.ownerId]?.singleOrNull { "${it}_lip_${lip.side}" == mesh } ?: continue
+            val suffix = "$owner:${lip.side}"
+            put("mouth-lip:$suffix", mesh)
+            put("mouth-art:$suffix", layer)
+            for (path in pathsByMesh[mesh].orEmpty()) put("mouth-path:$suffix:${path.id}", path.id)
+        }
+    }
+
+    private fun seeThroughAliases(model: RigPreviewModel, eyes: Boolean): Map<String, String> {
+        val rig = model.rig
+        val originals = rig.seeThrough.orEmpty().filter { it.eyes == eyes }.mapTo(HashSet()) { it.original }
+        if (eyes) originals += rig.seeThroughWindows.keys
+        return rig.seeThroughCopies.entries.filter { it.value in originals }
+            .associate { (copy, original) -> "see-through:$original" to copy }
     }
 }
 

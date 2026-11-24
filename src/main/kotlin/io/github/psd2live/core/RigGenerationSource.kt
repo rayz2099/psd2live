@@ -37,7 +37,10 @@ internal object RigGenerationSource {
         }
 
         fun get(source: SourceArt, reference: SourceArt?, config: PipelineConfig, stage: String, analyze: () -> PipelineAnalysis): PipelineAnalysis {
-            val key = Key(source, reference, config.copy(textureOverrides = emptyMap(), atlasArrangement = null), stage)
+            // Explicit modifiers execute after source classification; neither their settings nor baked arrays
+            // are inputs to geometrySource/CharacterAnalyzer. Keep all ordinary authoring inputs in the key.
+            val key = Key(source, reference, config.copy(textureOverrides = emptyMap(), atlasArrangement = null,
+                rigEdits = config.rigEdits.copy(modifierStack = null)), stage)
             synchronized(entries) { entries[key] }?.let { return it }
             return analyze().also { synchronized(entries) { entries[key] = it } }
         }
@@ -182,11 +185,11 @@ internal object RigGenerationSource {
         if (reference.layers.any { it.id.raw == id } || id in DepthSplit.frontLayerIds(overlay) ||
             id in ArtPrimitiveJournal.ownedLayers(overlay) || id in ArtPrimitiveJournal.supersededLayers(overlay) ||
             PrimitiveResolution.of(overlay).isPartLayer(id) || id in partitionCoverage(overlay)) return reference
-        return io.github.psd2live.project.WorkspaceSourceArt(reference.widthPx, reference.heightPx,
+        return io.github.psd2live.document.WorkspaceSourceArt(reference.widthPx, reference.heightPx,
             reference.layers + if (trace == MeshTrace.TEXTURE && CanvasDensity.dense(layer))
-                (io.github.psd2live.project.WorkspaceSourceLayer.copyOf(layer, layer.order) as io.github.psd2live.project.WorkspaceSourceLayer)
+                (io.github.psd2live.document.WorkspaceSourceLayer.copyOf(layer, layer.order) as io.github.psd2live.document.WorkspaceSourceLayer)
                     .copy(raster = CanvasDensity.alignedRaster(layer), rect = null)
-            else io.github.psd2live.project.WorkspaceSourceLayer.copyOf(CanvasDensity.canvasLayer(layer), layer.order),
+            else io.github.psd2live.document.WorkspaceSourceLayer.copyOf(CanvasDensity.canvasLayer(layer), layer.order),
             reference.groups)
     }
 

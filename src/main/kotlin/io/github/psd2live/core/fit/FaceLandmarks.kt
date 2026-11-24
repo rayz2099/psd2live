@@ -2,6 +2,7 @@ package io.github.psd2live.core.fit
 
 import io.github.psd2live.core.ClassifiedLayer
 import io.github.psd2live.core.PartRole
+import io.github.psd2live.core.PartRoles
 import io.github.psd2live.core.SemanticTag
 import io.github.psd2live.core.Side
 import kotlin.math.abs
@@ -11,22 +12,6 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
-
-/**
- * A feature point of the head read off the art, in the rig's aligned space: [id] names it (`face.chin`, `eye.L.outer`),
- * [part] the feature it belongs to. A [later] point is not used by the head's turn yet; it is kept for what will need it
- * (a closing eye's lashes, an opening mouth's skin).
- */
-data class Landmark(val id: String, val part: String, val x: Float, val y: Float, val later: Boolean = false)
-
-/**
- * The head's feature points ([points]), the face skin's outline in order round it ([contour], rig space, empty when the
- * art has no face layer) and distances that are not points ([measures], rig units).
- */
-class FaceLandmarks(val points: List<Landmark>, val contour: List<Pair<Float, Float>>, val measures: Map<String, Float>) {
-	private val byId = points.associateBy { it.id }
-	operator fun get(id: String): Landmark? = byId[id]
-}
 
 /**
  * Reads [FaceLandmarks] off the classified layers and the eyes', brows' and mouth's fits. Every point is found on the
@@ -44,6 +29,8 @@ class FaceLandmarks(val points: List<Landmark>, val contour: List<Pair<Float, Fl
  */
 object FaceLandmarking {
 	private const val ALPHA = 96
+	private data class HairColumns(val width: Int, val height: Int, val upper: IntArray, val bottom: IntArray)
+	private val hairColumns = java.util.Collections.synchronizedMap(java.util.WeakHashMap<ByteArray, HairColumns>())
 
 	private class Pixels(val xs: FloatArray, val ys: FloatArray) {
 		val size get() = xs.size
@@ -73,6 +60,7 @@ object FaceLandmarking {
 	 * and [mouth] are the fits already read (any may be missing); [faceCenterX] is the canvas middle of the face.
 	 */
 	fun read(layers: List<ClassifiedLayer>, eyes: EyeFitting.Result?, brows: Map<Side, BrowFit>, mouth: MouthFit?, faceCenterX: Float,
+	         coveringHair: List<ClassifiedLayer> = emptyList(),
 	         toRig: (Float, Float) -> Pair<Float, Float>): FaceLandmarks {
 		val out = ArrayList<Landmark>()
 		val measures = LinkedHashMap<String, Float>()
@@ -85,6 +73,19 @@ object FaceLandmarking {
 
 		// Eyes, from their fits and their layers.
 		val eyeFits = eyes?.fits.orEmpty()
+		val eyeCenters = eyeFits.mapValues { (_, fit) -> fit.toCanvas(0.5f, fit.baseline(0.5f)) }
+		val leftCenter = eyeCenters[Side.LEFT]
+		val rightCenter = eyeCenters[Side.RIGHT]
+		val nearestEye: ((Float, Float) -> Side)? = if (leftCenter != null && rightCenter != null && leftCenter != rightCenter) {
+			val (lx, ly) = leftCenter
+			val (rx, ry) = rightCenter
+			val midX = (lx + rx) * 0.5f; val midY = (ly + ry) * 0.5f
+			val dx = lx - rx; val dy = ly - ry
+			// Split shared artwork along the bisector of the fitted eye centres in the aligned frame.
+			val sideAt = { x: Float, y: Float -> if ((x - midX) * dx + (y - midY) * dy >= 0f) Side.LEFT else Side.RIGHT }
+			sideAt
+		} else null
+		val lashPixels = HashMap<ClassifiedLayer, Pixels>()
 		for ((side, fit) in eyeFits) {
 			val s = "eye.${sideName(side)}"
 			add("$s.inner", s, fit.toCanvas(0f, 0f))
@@ -93,7 +94,11 @@ object FaceLandmarking {
 			add("$s.apex", s, fit.toCanvas(EyeFit.u(apex), fit.upper[apex]))
 			val low = fit.lower.indices.maxBy { fit.lower[it] - fit.baseline(EyeFit.u(it)) }
 			add("$s.lowLid", s, fit.toCanvas(EyeFit.u(low), fit.lower[low]))
-			for (q in listOf(0.25f, 0.5f, 0.75f)) add("$s.upper${(q * 100).toInt()}", s, fit.toCanvas(q, EyeFit.sample(fit.upper, q)), later = true)
+			for (q in 25..75 step 25) {
+				val u = q / 100f
+				add("$s.upper$q", s, fit.toCanvas(u, EyeFit.sample(fit.upper, u)))
+				add("$s.lower$q", s, fit.toCanvas(u, EyeFit.sample(fit.lower, u)))
+			}
 			fit.closed?.let { closed -> add("$s.closedMid", s, fit.toCanvas(0.5f, EyeFit.sample(closed, 0.5f)), later = true) }
 			fit.iris?.let { iris ->
 				add("$s.iris", s, iris.centerX to iris.centerY)
@@ -102,31 +107,39 @@ object FaceLandmarking {
 				add("$s.irisOuter", s, (if (fit.axisX >= 0f) iris.right else iris.left) to iris.centerY)
 			}
 			fun eyeLayers(tag: SemanticTag, role: PartRole?) = shown(tag, role).filter { it.semantic.side == side || it.semantic.side == Side.NONE && sideOf(it.centroidX) == side }
-			fun inEye(p: Pixels): List<Pair<Float, Float>> = (0 until p.size).map { i -> toRig(p.xs[i], p.ys[i]).let { r -> fit.toEye(r.first, r.second) } }
+			fun lashInk(role: PartRole?): List<Pair<Float, Float>> {
+				val candidates = shown(SemanticTag.EYELASH, role).filter {
+					it.semantic.side == side || it.semantic.side == Side.NONE && (nearestEye != null || sideOf(it.centroidX) == side)
+				}
+				val (overlays, primary) = candidates.partition { it.source.groupPath.split('/').any(PartRoles::isThroughHairGroup) }
+				fun largestLocalInk(from: List<ClassifiedLayer>): List<Pair<Float, Float>> = from.asSequence().map { layer ->
+					val p = lashPixels.getOrPut(layer) { pixels(layer) }
+					val sampleSide = nearestEye.takeIf { layer.semantic.side == Side.NONE }
+					buildList {
+						for (i in 0 until p.size) {
+							val (x, y) = toRig(p.xs[i], p.ys[i])
+							if (sampleSide == null || sampleSide(x, y) == side) add(fit.toEye(x, y))
+						}
+					}
+				}.maxByOrNull { it.size }.orEmpty()
+				// A painted through-hair copy can fill a missing eye landmark, one eye's ink at a time.
+				return largestLocalInk(primary).ifEmpty { largestLocalInk(overlays) }
+			}
 			eyeLayers(SemanticTag.IRIDES, PartRole.PUPIL).firstOrNull()?.let { addCanvas("$s.pupil", s, it.centroidX, it.centroidY) }
 			for ((k, h) in eyeLayers(SemanticTag.IRIDES, PartRole.HIGHLIGHT).withIndex()) addCanvas("$s.highlight$k", s, h.centroidX, h.centroidY)
 			// The upper lash line: its tail beyond the outer corner and its inner end.
-			eyeLayers(SemanticTag.EYELASH, null).maxByOrNull { it.opaquePixels }?.let { lash ->
-				val pts = inEye(pixels(lash))
-				if (pts.isNotEmpty()) {
-					val tail = pts.maxBy { it.first }; val start = pts.minBy { it.first }
-					add("$s.lashTail", s, fit.toCanvas(tail.first, tail.second))
-					add("$s.lashInner", s, fit.toCanvas(start.first, start.second))
-				}
+			lashInk(null).takeIf { it.isNotEmpty() }?.let { pts ->
+				val tail = pts.maxBy { it.first }; val start = pts.minBy { it.first }
+				add("$s.lashTail", s, fit.toCanvas(tail.first, tail.second))
+				add("$s.lashInner", s, fit.toCanvas(start.first, start.second))
 			}
-			eyeLayers(SemanticTag.EYELASH, PartRole.LID).maxByOrNull { it.opaquePixels }?.let { lid ->
-				val pts = inEye(pixels(lid))
-				if (pts.isNotEmpty()) {
-					val a = pts.minBy { it.first }; val b = pts.maxBy { it.first }; val top = pts.minBy { it.second }
-					add("$s.lidInner", s, fit.toCanvas(a.first, a.second)); add("$s.lidOuter", s, fit.toCanvas(b.first, b.second)); add("$s.lidTop", s, fit.toCanvas(top.first, top.second))
-				}
+			lashInk(PartRole.LID).takeIf { it.isNotEmpty() }?.let { pts ->
+				val a = pts.minBy { it.first }; val b = pts.maxBy { it.first }; val top = pts.minBy { it.second }
+				add("$s.lidInner", s, fit.toCanvas(a.first, a.second)); add("$s.lidOuter", s, fit.toCanvas(b.first, b.second)); add("$s.lidTop", s, fit.toCanvas(top.first, top.second))
 			}
-			eyeLayers(SemanticTag.EYELASH, PartRole.LOWER).maxByOrNull { it.opaquePixels }?.let { lower ->
-				val pts = inEye(pixels(lower))
-				if (pts.isNotEmpty()) {
-					val a = pts.minBy { it.first }; val b = pts.maxBy { it.first }
-					add("$s.lowerLashInner", s, fit.toCanvas(a.first, a.second)); add("$s.lowerLashOuter", s, fit.toCanvas(b.first, b.second))
-				}
+			lashInk(PartRole.LOWER).takeIf { it.isNotEmpty() }?.let { pts ->
+				val a = pts.minBy { it.first }; val b = pts.maxBy { it.first }
+				add("$s.lowerLashInner", s, fit.toCanvas(a.first, a.second)); add("$s.lowerLashOuter", s, fit.toCanvas(b.first, b.second))
 			}
 			eyeLayers(SemanticTag.EYELASH, PartRole.SHADOW).maxByOrNull { it.opaquePixels }?.let { addCanvas("$s.shadow", s, it.centroidX, it.centroidY, later = true) }
 		}
@@ -139,6 +152,10 @@ object FaceLandmarking {
 			val n = fit.centre.size
 			val peak = fit.centre.indices.minBy { fit.centre[it] }
 			add("$s.peak", s, fit.toRig(peak.toFloat() / (n - 1), fit.centre[peak]))
+			for (q in 25..75 step 25) {
+				val u = q / 100f
+				add("$s.center$q", s, fit.toRig(u, BrowFit.sample(fit.centre, u)))
+			}
 		}
 
 		// The mouth, from its fit; a mouth the fit could not read (a closed line) from its layer's ends and middle.
@@ -184,6 +201,7 @@ object FaceLandmarking {
 			}
 			// The outline is read in the head's own upright frame, so a head drawn tilted keeps its chin at the bottom.
 			if (canvas.size > 40) {
+				upperCover(face, canvas, eyeY, coveringHair, measures)
 				fun rigY(x: Float, y: Float) = toRig(x, y).second
 				val eyesRig = eyeCentres.map { toRig(it.first, it.second) }
 				val mouthRig = mouthY?.let { m -> mouthLayer.map { toRig(it.centroidX, it.centroidY) }.let { ms -> ms.map { it.second }.average().toFloat() } }
@@ -234,12 +252,22 @@ object FaceLandmarking {
 			chin?.let { c -> out.firstOrNull { it.id == "mouth.lowerMid" }?.let { m -> add("face.chinCentre", "face", (c.x + m.x) / 2 to (c.y * 2 + m.y) / 3, later = true) } }
 		}
 
-		// Ears.
-		for (ear in layers.filter { it.opaquePixels > 0 && it.semantic.tag == SemanticTag.EARS }) {
-			val p = pixels(ear); if (p.isEmpty()) continue
+		// Each ear may be split into front, fur and back layers. Measure one silhouette per side and kind,
+		// not one landmark set per layer (the depth-turn input requires unique semantic IDs).
+		val ears = layers.filter { it.opaquePixels > 0 && it.semantic.tag == SemanticTag.EARS }.groupBy { ear ->
 			val side = if (ear.semantic.side != Side.NONE) ear.semantic.side else sideOf(ear.centroidX)
 			// An ear on top of the head (an animal's) stands on its base; one at the side of the face hangs from its root by the cheek.
 			val onTop = ear.semantic.role == PartRole.ANIMAL || eyeY != null && eyeGap != null && ear.centroidY < eyeY - eyeGap
+			side to onTop
+		}
+		for ((key, parts) in ears) {
+			val (side, onTop) = key
+			// Count overlapping pixels once, and use canvas scan order to break extrema ties independently
+			// of layer stacking order, just as for a single raster.
+			val silhouette = parts.flatMap { ear -> pixels(ear).let { p -> (0 until p.size).map { p.xs[it] to p.ys[it] } } }
+				.distinct().sortedWith(compareBy<Pair<Float, Float>> { it.second }.thenBy { it.first })
+			if (silhouette.isEmpty()) continue
+			val p = Pixels(FloatArray(silhouette.size) { silhouette[it].first }, FloatArray(silhouette.size) { silhouette[it].second })
 			val s = "ear.${sideName(side)}${if (onTop) ".animal" else ""}"
 			val top = (0 until p.size).minBy { p.ys[it] }; val bottom = (0 until p.size).maxBy { p.ys[it] }
 			val inner = (0 until p.size).minBy { abs(p.xs[it] - faceCenterX) }; val outer = (0 until p.size).maxBy { abs(p.xs[it] - faceCenterX) }
@@ -251,12 +279,15 @@ object FaceLandmarking {
 			} else {
 				addCanvas("$s.root", s, p.xs[inner], p.ys[inner]); addCanvas("$s.outer", s, p.xs[outer], p.ys[outer])
 				addCanvas("$s.top", s, p.xs[top], p.ys[top]); addCanvas("$s.lobe", s, p.xs[bottom], p.ys[bottom])
+				face?.let { skin -> earAttachment(p, skin, p.xs[outer] - p.xs[inner]) }?.let { (x, y) ->
+					addCanvas("$s.attachment", s, x, y)
+				}
 			}
 		}
 
 		// Hair.
 		val unit = eyeGap ?: 40f
-		for ((k, fringe) in shown(SemanticTag.FRONT_HAIR, null).withIndex()) hairPoints("hair.front$k", fringe, unit, faceCenterX, ::addCanvas, tips = true, below = eyeY?.let { it - unit } ?: Float.NEGATIVE_INFINITY)
+		for ((k, fringe) in shown(SemanticTag.FRONT_HAIR, null).withIndex()) hairPoints("hair.front$k", fringe, unit, faceCenterX, ::addCanvas, below = eyeY?.let { it - unit } ?: Float.NEGATIVE_INFINITY)
 		for ((k, lock) in shown(SemanticTag.FRONT_HAIR, PartRole.SIDE).withIndex()) {
 			val p = pixels(lock); if (p.isEmpty()) continue
 			val s = "hair.side$k"
@@ -266,45 +297,121 @@ object FaceLandmarking {
 			addCanvas("$s.root", s, p.xs[top], p.ys[top]); addCanvas("$s.tip", s, p.xs[bottom], p.ys[bottom])
 			edge?.let { addCanvas("$s.faceEdge", s, p.xs[it], p.ys[it]) }
 		}
-		for ((k, back) in shown(SemanticTag.BACK_HAIR, null).withIndex()) hairPoints("hair.back$k", back, unit, faceCenterX, ::addCanvas, tips = true, below = eyeY ?: Float.NEGATIVE_INFINITY)
+		for ((k, back) in shown(SemanticTag.BACK_HAIR, null).withIndex()) hairPoints("hair.back$k", back, unit, faceCenterX, ::addCanvas, below = eyeY ?: Float.NEGATIVE_INFINITY)
 		return FaceLandmarks(out, contour, measures)
 	}
 
+	/** Measure how much opaque front hair extends beyond the face edge at the drawn forehead. */
+	private fun upperCover(face: ClassifiedLayer, outline: List<Pair<Float, Float>>, eyeY: Float,
+	                       hair: List<ClassifiedLayer>, measures: MutableMap<String, Float>) {
+		if (hair.isEmpty() || face.bounds.width <= 1f) return
+		val top = outline.minOf { it.second }
+		val height = eyeY - top
+		if (height <= 1f) return
+		val width = face.bounds.width
+		val step = max(1f, width / 250f)
+		val left = ArrayList<Float>()
+		val right = ArrayList<Float>()
+		for (fraction in listOf(.24f, .32f, .40f, .48f, .56f, .64f)) {
+			val y = top + height * fraction
+			val edges = outline.indices.mapNotNull { i ->
+				val (x0, y0) = outline[i]
+				val (x1, y1) = outline[(i + 1) % outline.size]
+				if ((y0 > y) == (y1 > y)) null else x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+			}
+			val row = hair.filter { y in it.bounds.top..it.bounds.bottom }
+			fun covered(x: Float) = row.any { x in it.bounds.left..it.bounds.right && alpha(it, x, y) }
+			fun measure(edge: Float?, direction: Float): Float? {
+				if (edge == null || !covered(edge) || !covered(edge - direction * step)) return null
+				var margin = step
+				while (margin < .16f * width && covered(edge + direction * margin)) margin += step
+				return margin / width
+			}
+			measure(edges.minOrNull(), -1f)?.let(left::add)
+			measure(edges.maxOrNull(), 1f)?.let(right::add)
+		}
+		if (left.size >= 4) measures["face.upperCover.R"] = left.sorted()[left.size / 2]
+		if (right.size >= 4) measures["face.upperCover.L"] = right.sorted()[right.size / 2]
+	}
+
+	/** Observed seam where the face edge crosses the side ear's art, sampled across distinct raster rows. */
+	private fun earAttachment(ear: Pixels, skin: ClassifiedLayer, outward: Float): Pair<Float, Float>? {
+		if (outward == 0f) return null
+		val rows = LinkedHashMap<Float, Float>()
+		fun onSkin(x: Float, y: Float) = x >= skin.source.bounds.left && y >= skin.source.bounds.top && alpha(skin, x, y)
+		for (i in 1 until ear.size) {
+			val y = ear.ys[i]
+			val left = ear.xs[i - 1]; val right = ear.xs[i]
+			if (ear.ys[i - 1] != y || right - left != 1f) continue
+			val inside = if (outward > 0f) left else right
+			val outside = if (outward > 0f) right else left
+			if (!onSkin(inside, y) || onSkin(outside, y)) continue
+			val x = (left + right) / 2f
+			val previous = rows[y]
+			if (previous == null || (x - previous) * outward > 0f) rows[y] = x
+		}
+		if (rows.size < 3) return null
+		val (y, x) = rows.entries.elementAt(rows.size / 2)
+		return x to y
+	}
+
+	/** Column edges are raster-local and stay fixed across face, eye, brow and mouth fits. */
+	private fun columns(raster: org.umamo.format.art.LayerRaster): HairColumns {
+		val width = raster.width; val height = raster.height; val rgba = raster.rgba
+		hairColumns[rgba]?.takeIf { it.width == width && it.height == height }?.let { return it }
+		val upper = IntArray(width) { -1 }
+		val bottom = IntArray(width) { -1 }
+		var alpha = 3
+		for (y in 0 until height) {
+			if (Thread.currentThread().isInterrupted) throw InterruptedException()
+			for (x in 0 until width) {
+				if ((rgba[alpha].toInt() and 0xff) >= ALPHA) {
+					if (upper[x] < 0) upper[x] = y
+					bottom[x] = y
+				}
+				alpha += 4
+			}
+		}
+		return HairColumns(width, height, upper, bottom).also { hairColumns[rgba] = it }
+	}
+
 	/** A hair layer's points: its top in the middle, its outermost points each side, and the tips and gaps of its lower edge. */
-	private fun hairPoints(s: String, layer: ClassifiedLayer, unit: Float, faceCenterX: Float, add: (String, String, Float, Float, Boolean) -> Unit, tips: Boolean,
-	                       below: Float = Float.NEGATIVE_INFINITY) {
-		val raster = layer.source.raster
+	private fun hairPoints(s: String, layer: ClassifiedLayer, unit: Float, faceCenterX: Float, add: (String, String, Float, Float, Boolean) -> Unit,
+	                       below: Float) {
 		val left = layer.source.bounds.left; val top = layer.source.bounds.top
-		// The lowest opaque pixel of each column: the lower edge.
-		val bottom = IntArray(raster.width) { -1 }
-		val upper = IntArray(raster.width) { -1 }
-		for (x in 0 until raster.width) for (y in 0 until raster.height) if ((raster.rgba[(y * raster.width + x) * 4 + 3].toInt() and 0xff) >= ALPHA) { if (upper[x] < 0) upper[x] = y; bottom[x] = y }
-		val cols = (0 until raster.width).filter { bottom[it] >= 0 }
+		val (_, _, upper, bottom) = columns(layer.source.raster)
+		val cols = bottom.indices.filter { bottom[it] >= 0 }
 		if (cols.isEmpty()) return
 		val mid = cols.minBy { abs(left + it - faceCenterX) }
 		add("$s.top", s, left + mid + 0.5f, top + upper[mid] + 0.5f, false)
 		add("$s.outerA", s, left + cols.first() + 0.5f, top + bottom[cols.first()] + 0.5f, false)
 		add("$s.outerB", s, left + cols.last() + 0.5f, top + bottom[cols.last()] + 0.5f, false)
-		if (!tips) return
 		// Tips: the edge's lowest points that stand out by a tenth of the eyes' distance from both sides; gaps: its highest between tips.
 		val prominence = unit * 0.1f
 		val window = (unit * 0.15f).toInt().coerceAtLeast(3)
 		val found = ArrayList<Int>()
-		for (i in cols.indices) {
-			val x = cols[i]; val y = bottom[x]
+		fun highestColumn(from: Int, through: Int): Int {
+			var best = -1
+			for (column in maxOf(0, from)..minOf(bottom.lastIndex, through)) {
+				val edge = bottom[column]
+				if (edge >= 0 && (best < 0 || edge < bottom[best])) best = column
+			}
+			return best
+		}
+		for (x in cols) {
+			val y = bottom[x]
 			if (top + y < below) continue
-			val near = cols.filter { abs(it - x) <= window }
-			if (near.any { bottom[it] > y }) continue
-			val leftUp = cols.filter { it < x && it >= x - window * 4 }.minOfOrNull { bottom[it] } ?: continue
-			val rightUp = cols.filter { it > x && it <= x + window * 4 }.minOfOrNull { bottom[it] } ?: continue
-			if (y - max(leftUp, rightUp) < prominence) continue
+			if ((maxOf(0, x - window)..minOf(bottom.lastIndex, x + window)).any { bottom[it] > y }) continue
+			val leftUp = highestColumn(x - window * 4, x - 1)
+			val rightUp = highestColumn(x + 1, x + window * 4)
+			if (leftUp < 0 || rightUp < 0 || y - max(bottom[leftUp], bottom[rightUp]) < prominence) continue
 			if (found.isNotEmpty() && x - found.last() < window) continue
 			found += x
 		}
 		for ((k, x) in found.withIndex()) add("$s.tip$k", s, left + x + 0.5f, top + bottom[x] + 0.5f, false)
 		for (k in 0 until found.size - 1) {
-			val gx = cols.filter { it > found[k] && it < found[k + 1] }.minByOrNull { bottom[it] } ?: continue
-			add("$s.gap$k", s, left + gx + 0.5f, top + bottom[gx] + 0.5f, false)
+			val gx = highestColumn(found[k] + 1, found[k + 1] - 1)
+			if (gx >= 0) add("$s.gap$k", s, left + gx + 0.5f, top + bottom[gx] + 0.5f, false)
 		}
 	}
 

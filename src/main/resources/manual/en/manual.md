@@ -213,6 +213,7 @@ The **Model** menu in the title bar holds commands that act on the whole model. 
 | Item | Purpose |
 |---|---|
 | Reanalyze PSD | Re-reads the source PSD with the current settings and generates ({key:REANALYZE}) |
+| Reload PSD | Re-reads the images of the project's PSD, keeping the rig and history (see [[psd-re-import]]) |
 | Replace the model with a CMO3… | Replaces objects in the current model with those in the CMO3 by ID, adds new objects, and keeps what the file does not have |
 | Split Layers by Mesh… | Splits parts drawn on one layer but separate from each other (such as the left and right legs) into independent layers |
 | Texture Upscale… | Upscales layer pixels 2× / 4× ({key:TEXTURE_UPSCALE}, see [[texture-upscale]]) |
@@ -723,7 +724,13 @@ The chosen preset is remembered, and PSDs imported later from the menu, recent f
 *> For users coming from Cubism: parts are built automatically from the recognized parts, not from the PSD folders. To open an existing Cubism model project, use [[cmo3-import]].
 
 @@ psd-re-import | Re-import PSDs
-After the artwork changes, you can put only the new pixels into the existing project, and the edits you made to the model are all kept. PSD2Live does not match up the layers of a whole PSD; it replaces layer by layer:
+After the artwork changes, you can put only the new pixels into the existing project, and the edits you made to the model are all kept. Reload the whole PSD at once, or replace single layers.
+## Reloading the whole PSD
+1. Save the PSD in your painting program at the same path. Keep the canvas size and the names of the existing layers.
+2. Choose **Model → Reload PSD**. If the project does not know its PSD yet, or the file has moved, a file picker opens and the project remembers your choice.
+3. Changed images go into their layers and added layers wait for **Regenerate**; transparency, visibility and folder changes are taken too. Meshes that would clip the new pixels are rebuilt and keep their rig data: check their poses. A layer you deleted or split in the project stays that way while its PSD image does not change; if the image changed, the reload is refused.
+4. The reload is one step you can undo; nothing is saved automatically.
+!> A changed canvas size, or an existing layer removed or renamed, is refused and the project stays as it was. To start over from such a PSD, use **Reanalyze PSD** below.
 ## Replacing a layer's pixels
 1. In the Materials panel **Import** the modified PSD; it becomes a new material folder.
 2. Select the layer to update on the canvas or in the layer list.
@@ -748,6 +755,8 @@ The **Model presets** panel decides in one place what is generated automatically
 | Physics and simulation | Front hair and back hair each choose **Simulation** / **Classic sway** / **Off**; **Clothing** simulation (acts only on loose parts); jelly eyes; auto Pin physics weights |
 With **Selected only** ticked, the physics and simulation presets act only on the selected layers.
 *> It is best to generate with the defaults first and preview; when you need to adjust, change one item at a time so you can see what each does. Texture atlas settings are not here but in the export window.
+
+With custom `MOUTH_CLOSE` artwork, open **Closed-mouth Visibility** in the fitted mouth settings. Add or move keys on the Mouth Open axis, select a key to set its opacity, then choose **Apply**. For a later fade, set 100% at 0.20 and 0% at 0.25. The open artwork fades in over the same interval. Mouth deformation keys stay in place.
 
 @@ update-generated-rig | Update Generated Rig
 Actions such as turning on hair simulation, enabling the skeleton or splitting layers merge your edits onto the generated result of that moment and pin it, so that upgrading the program never quietly changes your model. When you want the improvements of a newer generator, run **Update Generated Rig** yourself.
@@ -986,6 +995,8 @@ Where the automatic mesh is not right in a few places, change the topology direc
 | Re-triangulate | Topology menu: around the selected vertices (the whole mesh with none selected) turns slivers into more even triangles, leaving vertices and texture in place |
 When several art meshes are selected, clicking a vertex of one mesh makes it the primary mesh; a mesh-points line and edge and face selection act only on the primary mesh.
 !> Deleting outline points changes the boundary, so check under several parameter poses after changing it. Do everyday shape pulling in Deform mode, and use Edit mode only to change topology.
+
+To join a detached tip, select an outline vertex on the tip, then {kbd:Shift}+click a facing outline vertex on another island in the same ArtMesh. **Connect** adds two triangles across the gap when there is room. **Merge** collapses the selected vertices into one. Both operations carry the existing keyforms and vertex weights onto the edited mesh.
 
 @@ mesh-duplication | Mesh duplication
 Copy one ArtMesh's vertices and triangles onto other ArtMeshes, for variants of one shape such as an open and a closed eye or several expressions. Each target takes the same topology where the source sits on the canvas and samples its own texture; the target's keyforms, blend shapes, paths, vertex groups and glue migrate onto the new mesh.
@@ -1885,10 +1896,13 @@ The same model can be exported directly for VTube Studio, the web, Unity and so 
 ## Runtimes and players
 | Menu item | Output | Main limits |
 |---|---|---|
-| VTube Studio… | The full set of moc3 files + `.vtube.json` | Face tracking maps only standard parameters; one hotkey per motion and one toggle hotkey per expression |
+| VTube Studio… | The full set of moc3 files, `.vtube.json`, and a model selection icon | Face tracking maps standard parameters. Motion and expression hotkeys are ready to assign. |
 | PSD2Live runtime rig… | `.p2lrt` | Without the data the editor attaches; optional compression, stripping names and so on |
 | Web player… | `index.html`, the player script, the WebAssembly runtime and `.p2lrt` | Must be accessed over http |
 | Unity prefab… | `.p2lunity`, textures and an install script | Needs Unity 6.0 or later; parameters are baked into Blend Shapes and combinations are approximated additively; masks and physics are not written |
+
+Place the entire VTube Studio export folder in `Live2DModels` and restart VTube Studio. The model list shows an icon rendered from the default pose. Assign keyboard shortcuts and on-screen buttons in the hotkey settings.
+
 ## Layered PSD
 - **PSD at a pose…**: poses the model by a motion's moment or by given parameter values, one layer per visible mesh; deformers and parameters are not kept.
 - **Source PSD…** (with generated layers): exports the project's source layers, optionally at 1× or an upscaled ratio, and can include the automatically split layers, so you can go back to your drawing software for fine touch-ups (also available with {key:REEXPORT_PSD}).
@@ -2003,7 +2017,7 @@ PSD2Live has a built-in local MCP service. Once it is on, AI hosts such as Claud
 All operations can be called under either tool set, with exactly the same execution and validation.
 ## Notes
 - The service runs only on this machine, using Streamable HTTP and Bearer token authentication. The token can edit your workspace and is stored only in the configuration of the host on this machine; after changing the port or token, update the configuration of the connected hosts to match.
-- For hosts that support only Stdio, use Python 3 to run `mcp_proxy.py` in the repository root to bridge.
+- For hosts that support only Stdio, use Python 3 to run `tools/mcp_proxy.py` to bridge.
 - When no window is open, the command-line `mcp` subcommand can start the MCP endpoint on its own.
 @@ external-application-integration-api | Live2D Cubism Editor External API Integration
 When writing scripts or troubleshooting host calls, you need to know the calling conventions of MCP operations. Every operation has strict request and result schemas, which you can list with `workspace_list_operations` and inspect field by field with `workspace_get_operation`.

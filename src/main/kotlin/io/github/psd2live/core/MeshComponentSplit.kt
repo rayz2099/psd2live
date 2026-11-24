@@ -1,6 +1,7 @@
 package io.github.psd2live.core
 
-import io.github.psd2live.project.WorkspaceSourceLayer
+import io.github.psd2live.algorithms.binding.MeshSplitTopology
+import io.github.psd2live.document.WorkspaceSourceLayer
 import org.umamo.format.art.LayerBounds
 import org.umamo.format.art.LayerId
 import org.umamo.format.art.LayerRaster
@@ -20,10 +21,20 @@ internal object MeshComponentSplit {
         checkpoint: () -> Unit = {},
         val ownerByVertex: IntArray = IntArray(0),
     ) {
+        private val boxes = opaqueBounds(checkpoint)
+
+        /** Opaque component extents in canvas coordinates, in the same order as the split pieces. */
+        val componentBounds: List<Bounds> = LayerSpace.of(source).let { space ->
+            boxes.map { box -> Bounds(
+                space.rasterToCanvasX(box[0].toFloat()), space.rasterToCanvasY(box[1].toFloat()),
+                space.rasterToCanvasX(box[2] + 1f), space.rasterToCanvasY(box[3] + 1f),
+            ) }
+        }
+
         /** Small transparent thumbnails, prepared with the split plan so the dialog stays responsive. */
         val previewImages: List<BufferedImage> = buildPreviewImages(checkpoint)
 
-        private fun buildPreviewImages(checkpoint: () -> Unit): List<BufferedImage> {
+        private fun opaqueBounds(checkpoint: () -> Unit): List<IntArray> {
             val raster = source.raster
             val boxes = Array(components.size) { intArrayOf(raster.width, raster.height, -1, -1) }
             for (pixel in ownerByPixel.indices) {
@@ -37,8 +48,13 @@ internal object MeshComponentSplit {
                 if (x > box[2]) box[2] = x
                 if (y > box[3]) box[3] = y
             }
+            require(boxes.all { it[2] >= it[0] && it[3] >= it[1] }) { "Every mesh island needs source pixels" }
+            return boxes.asList()
+        }
+
+        private fun buildPreviewImages(checkpoint: () -> Unit): List<BufferedImage> {
+            val raster = source.raster
             val images = boxes.map { box ->
-                require(box[2] >= box[0] && box[3] >= box[1]) { "Every mesh island needs source pixels" }
                 val width = box[2] - box[0] + 1
                 val height = box[3] - box[1] + 1
                 val scale = minOf(1f, 96f / width, 64f / height)
@@ -73,19 +89,6 @@ internal object MeshComponentSplit {
             require(ids == null || ids.size == names.size && ids.distinct().size == ids.size && ids.all { it.isNotBlank() })
             val raster = source.raster
             val base = WorkspaceSourceLayer.copyOf(source, source.order) as WorkspaceSourceLayer
-            val boxes = Array(components.size) { intArrayOf(raster.width, raster.height, -1, -1) }
-            for (pixel in ownerByPixel.indices) {
-                if (pixel % 1024 == 0) checkpoint()
-                if ((raster.rgba[pixel * 4 + 3].toInt() and 0xff) == 0) continue
-                val box = boxes[ownerByPixel[pixel]]
-                val x = pixel % raster.width
-                val y = pixel / raster.width
-                if (x < box[0]) box[0] = x
-                if (y < box[1]) box[1] = y
-                if (x > box[2]) box[2] = x
-                if (y > box[3]) box[3] = y
-            }
-            require(boxes.all { it[2] >= it[0] && it[3] >= it[1] }) { "Every mesh island needs source pixels" }
             // Each piece is cropped in the source's own raster grid, so a dense layer's pieces keep its density.
             val space = LayerSpace.of(source)
             return boxes.mapIndexed { index, box ->
@@ -142,31 +145,10 @@ internal object MeshComponentSplit {
         val width = source.raster.width
         val height = source.raster.height
         if (width <= 0 || height <= 0 || mesh.indices.size < 6 || mesh.uvs.size != mesh.positions.size) return null
-        val parent = IntArray(mesh.vertexCount) { it }
-        fun find(v: Int): Int {
-            var root = v
-            while (root != parent[root]) root = parent[root]
-            var current = v
-            while (current != root) {
-                val next = parent[current]
-                parent[current] = root
-                current = next
-            }
-            return root
-        }
-        fun union(a: Int, b: Int) { parent[find(a)] = find(b) }
-        val used = BooleanArray(mesh.vertexCount)
-        for (i in mesh.indices.indices step 3) {
-            if (i % 1023 == 0) checkpoint()
-            val a = mesh.indices[i]
-            val b = mesh.indices[i + 1]
-            val c = mesh.indices[i + 2]
-            if (a !in used.indices || b !in used.indices || c !in used.indices) return null
-            used[a] = true; used[b] = true; used[c] = true
-            union(a, b); union(b, c)
-        }
-        val groups = (used.indices).filter { used[it] }.groupBy(::find).values
-        if (groups.size < 2) return null
+        val islands = MeshSplitTopology.connectedIslands(mesh.vertexCount, mesh.indices, checkpoint) ?: return null
+        if (islands.isEmpty()) return null
+        // Preserve source component order for ties in old requests; modifiers keep their own model-space order.
+        val groups = islands.sortedBy { it.vertices.first() }.map { it.vertices.asList() }
         require(local.size == mesh.positions.size && local.all(Float::isFinite))
         fun localX(v: Int) = local[v * 2]
         fun localY(v: Int) = local[v * 2 + 1]

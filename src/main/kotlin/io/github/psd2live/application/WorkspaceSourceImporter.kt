@@ -29,6 +29,8 @@ internal class WorkspaceSourceImporter(
     },
     private val newProjectId: () -> String = { UUID.randomUUID().toString() },
     private val initialWorkspaceIds: () -> List<String> = { emptyList() },
+    private val preparePreset: (WorkspaceDocument, WorkspaceRasterWork, WorkspaceInitialPreset) -> Pair<WorkspaceDocument, RigPreviewModel> =
+        { document, work, choices -> WorkspacePresetInitialization.prepare(document, work, choices) },
 ) {
     suspend fun importPsd(path: Path, projectId: String?, state: String, discardUnsaved: Boolean = false,
                          initialConfig: PipelineConfig = PipelineConfig(),
@@ -115,13 +117,7 @@ internal class WorkspaceSourceImporter(
                                 project: (WorkspaceDocument, RigPreviewModel, String) -> Unit,
                                 sourceAuxiliary: JsonObject = JsonObject(emptyMap()), layout: Boolean = false,
                                 modifiers: WorkspaceInitialModifiers? = null, preset: WorkspaceInitialPreset? = null): WorkspaceCommit<RigPreviewModel> {
-        require(preset == null || modifiers == WorkspaceInitialModifiers.CUSTOM) { "Custom choices require the custom modifier mode" }
-        val choices = when (modifiers) {
-            WorkspaceInitialModifiers.RECOMMENDED -> WorkspaceModelPresetLibrary.shared.get("modern").choices
-            WorkspaceInitialModifiers.CUSTOM -> requireNotNull(preset) { "Custom modifier choices are required" }
-            WorkspaceInitialModifiers.MINIMAL, WorkspaceInitialModifiers.DEFAULT, WorkspaceInitialModifiers.FULL -> WorkspaceInitialPreset.forMode(modifiers)
-            else -> null
-        }
+        val choices = WorkspaceInitialPreset.resolveChoices(modifiers, preset)
         val before = runtime.state.value
         currentCoroutineContext().ensureActive()
         // Capture before source I/O. Another edit or reload cannot be hidden by taking a newer token.
@@ -133,37 +129,15 @@ internal class WorkspaceSourceImporter(
         }
         progress(0.1f, "Reading source artwork")
         val input = prepare()
-        val source = input.source; val overrides = input.overrides
         progress(0.4f, "Preparing new source document")
-        val baseline = if (modifiers == WorkspaceInitialModifiers.RECOMMENDED)
-            WorkspacePresetBaseline.configure(initialConfig, "modern") else initialConfig
-        val config = (choices?.configure(baseline) ?: baseline).copy(layerVisibility = emptyMap(), deletedLayerIds = emptySet(),
-            layerOverrides = overrides, parentOverrides = emptyMap(), drawOrderOverrides = emptyMap(), meshOverrides = emptyMap(),
-            rigEdits = RigEditOverlay.Empty, generationSource = null, meshSource = null,
-            hairSimulationFront = choices?.frontHair == WorkspaceInitialHair.SIMULATION,
-            hairSimulationBack = choices?.backHair == WorkspaceInitialHair.SIMULATION)
-        val overlay = if (modifiers == null) RigEditOverlay.Empty else RigEditOverlay(
-            modifierStack = io.github.psd2live.core.modifier.RigModifierStack().toJson())
-        val created = WorkspaceDocument(source, emptyMap(), emptySet(), overrides, emptyMap(), overlay,
-            WorkspaceSettingsCodec.encode(config),
-            layout = if (layout) WorkspaceLayout(generation = WorkspaceGeneration.NotGenerated, layerTags = input.userTags,
-                referenceLayerIds = input.references) else WorkspaceLayout.Empty)
-        // An imported file's layers are also materials of the new project, each layer showing its own: they can be
-        // replaced, placed again or exported from the material browser. The rig reads only the source, as before.
+        var document = sourceDocument(input, initialConfig, layout, modifiers, choices)
+        val config = document.rawConfig()
         val context = currentCoroutineContext()
-        var document = runInterruptible(Dispatchers.Default) {
-            RigBuildProfile.threadStage("source import: linked materials and raster hashes") {
-                input.materials?.let { file ->
-                    input.materialFolder?.let { WorkspaceMaterialEdits.addLinked(created, file, it, context::ensureActive) }
-                        ?: WorkspaceMaterialEdits.addLinked(created, file, checkCancelled = context::ensureActive)
-                } ?: created
-            }
-        }
         progress(0.6f, "Rebuilding new source project")
         var built = RigBuildProfile.stage("source import: preview build (wall time)") {
             if (choices == null) build(document) else {
                 val prepared = runInterruptible(Dispatchers.Default) {
-                    WorkspacePresetInitialization.prepare(document, WorkspaceRasterWork.Direct.cancellable(context), choices)
+                    preparePreset(document, WorkspaceRasterWork.Direct.cancellable(context), choices)
                 }
                 document = prepared.first
                 prepared.second
@@ -186,24 +160,66 @@ internal class WorkspaceSourceImporter(
             currentCoroutineContext()[WorkspaceJobCompletion]?.committed(WorkspaceOperationOutput(result.mutation(summary).lifecycleResult()))
             return result
         }
+        progress(0.9f, "Installing new source project")
+        val installed = publishSource(state, document, built, config, sourceAuxiliary, discardUnsaved, project)
+        val result = WorkspaceCommit(installed, true)
+        currentCoroutineContext()[WorkspaceJobCompletion]?.committed(WorkspaceOperationOutput(result.mutation(summary).sourceResult()))
+        return result
+    }
+
+    internal suspend fun prepareGuidedPsd(path: Path, displayName: String, initialConfig: PipelineConfig): WorkspaceDocument =
+        sourceDocument(Prepared(readPsd(path), emptyMap(), materials = displayName), initialConfig,
+            layout = false, modifiers = WorkspaceInitialModifiers.EMPTY, choices = null)
+
+    internal suspend fun installGuidedPsd(state: String, document: WorkspaceDocument, preview: RigPreviewModel,
+                                          sourceAuxiliary: JsonObject, discardUnsaved: Boolean,
+                                          project: (WorkspaceDocument, RigPreviewModel, String) -> Unit): WorkspaceCommit<RigPreviewModel> =
+        WorkspaceCommit(publishSource(state, document, preview, document.rawConfig(), sourceAuxiliary, discardUnsaved, project), true)
+
+    private suspend fun sourceDocument(input: Prepared, initialConfig: PipelineConfig, layout: Boolean,
+                                       modifiers: WorkspaceInitialModifiers?, choices: WorkspaceInitialPreset?): WorkspaceDocument {
+        val source = input.source; val overrides = input.overrides
+        val config = WorkspaceInitialPreset.applyToConfig(modifiers, choices, initialConfig).copy(
+            layerVisibility = emptyMap(), deletedLayerIds = emptySet(),
+            layerOverrides = overrides, parentOverrides = emptyMap(), drawOrderOverrides = emptyMap(), meshOverrides = emptyMap(),
+            rigEdits = RigEditOverlay.Empty, generationSource = null, meshSource = null)
+        val overlay = if (modifiers == null) RigEditOverlay.Empty else RigEditOverlay(
+            modifierStack = io.github.psd2live.core.modifier.RigModifierStack().toJson())
+        val created = WorkspaceDocument(source, emptyMap(), emptySet(), overrides, emptyMap(), overlay,
+            WorkspaceSettingsCodec.encode(config),
+            layout = if (layout) WorkspaceLayout(generation = WorkspaceGeneration.NotGenerated, layerTags = input.userTags,
+                referenceLayerIds = input.references) else WorkspaceLayout.Empty)
+        // An imported file's layers are also materials of the new project, each layer showing its own: they can be
+        // replaced, placed again or exported from the material browser. The rig reads only the source, as before.
+        val context = currentCoroutineContext()
+        return runInterruptible(Dispatchers.Default) {
+            RigBuildProfile.threadStage("source import: linked materials and raster hashes") {
+                input.materials?.let { file ->
+                    input.materialFolder?.let { WorkspaceMaterialEdits.addLinked(created, file, it, context::ensureActive) }
+                        ?: WorkspaceMaterialEdits.addLinked(created, file, checkCancelled = context::ensureActive)
+                } ?: created
+            }
+        }
+    }
+
+    private suspend fun publishSource(state: String, document: WorkspaceDocument, built: RigPreviewModel, config: PipelineConfig,
+                                      sourceAuxiliary: JsonObject, discardUnsaved: Boolean,
+                                      project: (WorkspaceDocument, RigPreviewModel, String) -> Unit): WorkspaceCapture<RigPreviewModel> {
         // A new project keeps its first layout: the atlas is arranged on request, not on every edit. The stored
         // arrangement is that layout exactly, so the model it builds is this one.
         val arrangement = AtlasLayout.frozen(built.modifierAuthorAtlas ?: built.atlas)
         val preview = built.copy(config = built.config.copy(atlasArrangement = arrangement), atlas = built.atlas.copy(arranged = true))
+            .retainModifierCachesFrom(built)
         // The preview was generated from effective settings; the document keeps the raw ones it was given.
         val prepared = document.copy(rigEdits = preview.config.rigEdits,
             settings = AtlasArrangementCodec.with(WorkspaceSettingsCodec.encode(WorkspaceSettingsPolicy.restoreRaw(preview.config, config)), arrangement))
-        progress(0.9f, "Installing new source project")
         val id = newProjectId()
-        val installed = installPrepared(state, id, prepared, preview,
+        return installPrepared(state, id, prepared, preview,
             auxiliary = JsonObject(sourceAuxiliary + WorkspaceAuxiliaryCodec.encode(WorkspaceAuxiliaryData()) +
                 PreviewSessions.initial(preview.rig.puppet.parameters, initialWorkspaceIds()) +
                 ("assetCatalog" to WorkspaceAssetCatalog().encode())), discardUnsaved = discardUnsaved, dirty = true) {
             project(prepared, preview, id)
         }
-        val result = WorkspaceCommit(installed, true)
-        currentCoroutineContext()[WorkspaceJobCompletion]?.committed(WorkspaceOperationOutput(result.mutation(summary).sourceResult()))
-        return result
     }
 
     /** Source pixels are private and immutable here. Never move the presentation callback to the worker. */

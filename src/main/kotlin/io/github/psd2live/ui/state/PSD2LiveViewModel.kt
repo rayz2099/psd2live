@@ -185,7 +185,8 @@ class PSD2LiveViewModel : AutoCloseable {
         val layerName: String,
         val plan: MeshComponentSplit.Plan,
         val preview: RigPreviewModel,
-        val expected: io.github.psd2live.project.WorkspaceProjectSnapshot? = null,
+        val expected: io.github.psd2live.project.WorkspaceProjectSnapshot?,
+        val fromImport: Boolean,
     )
 
     internal data class LayerSplitDecision(
@@ -194,7 +195,7 @@ class PSD2LiveViewModel : AutoCloseable {
         val sides: List<Side>,
     )
 
-    /** Several layers that can be split by mesh, offered together: after a layer import, or from the Tools menu. */
+    /** Several layers that can be split by mesh, offered together: after a layer import, or from the Model menu. */
     internal data class MeshSplitBatchOffer(
         val preview: RigPreviewModel,
         val splits: List<MeshSplitOffer>,
@@ -400,6 +401,7 @@ class PSD2LiveViewModel : AutoCloseable {
 		current: PSD2LiveState,
 		live: Map<ParameterId, Float> = livePose.value,
 	): Map<ParameterId, Float> {
+		canvasEditors[current.activeWorkspace.id to current.activeCanvas.id]?.capturedEditPose?.let { return it }
 		val trial = interior.poseFor(current)
 		val pose = shownPose(current, live) + swingPreviewValues + trial
 		val parameters =
@@ -1098,15 +1100,19 @@ class PSD2LiveViewModel : AutoCloseable {
     /** False while a live simulation needs frames, so the paused preview keeps pumping. */
     val previewSettled: Boolean get() = pausedPhysicsSettled && (_state.value.simulationPreviewId == null || _simulationStatus.value is SimulationStatus.Failed)
 
-    private val meshSplitQueue = ArrayDeque<String>()
-    private val manualMeshSplitRequests = mutableSetOf<String>()
+    private enum class MeshSplitTrigger { IMPORT, MESH_SETTINGS, LAYER_MENU, MODEL_MENU }
+
+    /** A missing layer list means the whole model. An import always supplies its own layer IDs. */
+    private data class MeshSplitRequest(val trigger: MeshSplitTrigger, val layerIds: List<String>? = null)
+
+    private val meshSplitQueue = ArrayDeque<MeshSplitRequest>()
+    private var activeMeshSplitRequest: MeshSplitRequest? = null
     private val meshSplitCheck by lazy { MeshSplitCheck(scope) }
     private val meshSplitChecking get() = meshSplitCheck.running
     private var meshSplitApplying = false
     /** Start presets being brought to the model: splits wait for them, since they replace the model. */
     private var presetsApplying = false
-    /** Model > Split Layers by Mesh asked for while a split or the presets were still being applied. */
-    private var meshSplitScanQueued = false
+    private val importPresetContinuation = ImportPresetContinuation()
     private val meshSplitsBlocked get() = meshSplitChecking || meshSplitApplying || presetsApplying ||
         pendingMeshSplit != null || pendingMeshSplitBatch != null
 
@@ -1141,12 +1147,12 @@ class PSD2LiveViewModel : AutoCloseable {
                     if (clips != next.rigEdits.motionClips) next = next.copy(rigEdits = next.rigEdits.copy(motionClips = clips))
                 }
                 if (next.projectOpenGeneration != current.projectOpenGeneration) {
+                    importPresetContinuation.clear()
                     meshSplitCheck.cancel()
                     pendingMeshSplit = null
                     pendingMeshSplitBatch = null
                     meshSplitQueue.clear()
-                    manualMeshSplitRequests.clear()
-                    meshSplitScanQueued = false
+                    activeMeshSplitRequest = null
                 }
                 if (next.activeWorkspace.id != current.activeWorkspace.id || next.projectOpenGeneration != current.projectOpenGeneration)
                     next = next.copy(simulationPreviewId = null)
@@ -1205,6 +1211,7 @@ class PSD2LiveViewModel : AutoCloseable {
     private fun replaceState(next: PSD2LiveState) {
         synchronized(stateLock) {
             if (next.projectOpenGeneration != _state.value.projectOpenGeneration) {
+                importPresetContinuation.clear()
                 meshSplitCheck.cancel()
                 simulationEpoch++; simPreparing?.cancel(); simStepping?.cancel()
                 simulationSessionId = null; pendingSimulationDelta = 0f
@@ -1212,8 +1219,7 @@ class PSD2LiveViewModel : AutoCloseable {
                 pendingMeshSplit = null
                 pendingMeshSplitBatch = null
                 meshSplitQueue.clear()
-                manualMeshSplitRequests.clear()
-                meshSplitScanQueued = false
+                activeMeshSplitRequest = null
             }
             val logged = trackProjectChanges(_state.value, next).withStateChangeLog(_state.value)
             _state.value = logged
@@ -1359,74 +1365,30 @@ class PSD2LiveViewModel : AutoCloseable {
         }
     }
 
-    /** Offer one source split at a time after the new mesh is actually in the preview. */
-    internal fun offerMeshSplit(layerIds: List<String>) {
-        if (layerIds.size > 1) {
-            offerImportMeshSplit(layerIds)
-            return
-        }
-        layerIds.forEach { id ->
-            if (id !in meshSplitQueue && pendingMeshSplit?.layerId != id) meshSplitQueue.addLast(id)
-        }
-        checkNextMeshSplit()
+    private fun offerImportMeshSplit(layerIds: List<String>) {
+        if (layerIds.isEmpty() || !_state.value.autoDetectMeshSplitsOnImport) return
+        enqueueMeshSplit(MeshSplitRequest(MeshSplitTrigger.IMPORT, layerIds))
     }
 
-    /** A layer import with several new layers: offers their splits, alone or together. */
-    internal fun offerImportMeshSplit(layerIds: List<String>) {
-        if (!AppSettings.autoDetectMeshSplitsOnImport) return
-        if (meshSplitsBlocked) return
-        val preview = _state.value.previewModel ?: return
-        meshSplitCheck.start(
-            action = { detectMeshSplits(preview, layerIds) },
-            completed = { offers ->
-                if (_state.value.previewModel === preview) when {
-                    offers.size == 1 -> pendingMeshSplit = offers.single()
-                    offers.size > 1 -> pendingMeshSplitBatch = MeshSplitBatchOffer(preview, offers)
-                }
-            },
-            failed = { reportMeshSplitCheckFailure(it) },
-        )
+    private fun offerMeshSplitAfterMeshSettings(layerId: String) =
+        enqueueMeshSplit(MeshSplitRequest(MeshSplitTrigger.MESH_SETTINGS, listOf(layerId)))
+
+    private fun enqueueMeshSplit(request: MeshSplitRequest) {
+        if (request == activeMeshSplitRequest || request in meshSplitQueue) return
+        meshSplitQueue.addLast(request)
+        resumeMeshSplits()
     }
 
-    /** Tools > split layers by mesh: scans every source layer and offers the ones whose mesh falls apart. */
-    internal fun requestMeshSplitScan() {
-        // An open offer or a running scan already answers the request.
-        if (meshSplitChecking || pendingMeshSplit != null || pendingMeshSplitBatch != null) return
-        if (meshSplitApplying || presetsApplying) {
-            // Waits for the model the presets or the split are making, rather than dropping the click.
-            meshSplitScanQueued = true
-            setStatusText(tr("start.splits.waiting"))
-            return
-        }
-        meshSplitScanQueued = false
-        val preview = _state.value.previewModel ?: return
-        if (preview.config.rigEdits.importedCmo3 != null) {
-            setErrorMessage(tr("editor.meshSplit.authored"))
-            return
-        }
-        setStatusText(tr("start.splits.scanning"))
-        meshSplitCheck.start(
-            action = { detectMeshSplits(preview, preview.analysis.source.layers.map { it.id.raw }) },
-            completed = { offers ->
-                if (_state.value.previewModel === preview) when {
-                    offers.isEmpty() -> setStatusText(tr("start.splits.none"))
-                    offers.size == 1 -> pendingMeshSplit = offers.single()
-                    else -> pendingMeshSplitBatch = MeshSplitBatchOffer(preview, offers)
-                }
-            },
-            failed = { reportMeshSplitCheckFailure(it) },
-        )
-    }
+    /** Scan all source layers on demand from the Model menu. */
+    internal fun requestMeshSplitScan() = enqueueMeshSplit(MeshSplitRequest(MeshSplitTrigger.MODEL_MENU))
 
     private fun reportMeshSplitCheckFailure(failure: Throwable) {
-        meshSplitQueue.clear()
-        manualMeshSplitRequests.clear()
         val message = tr("error.meshSplitCheckFailed", workspaceFailureMessage(failure))
         updateState { it.withLog(message, level = LogLevel.ERROR, tag = "MeshSplit").copy(errorMessage = message) }
     }
 
     /** The source layers among [layerIds] whose mesh falls apart into several pieces and can still be split. */
-    private suspend fun detectMeshSplits(preview: RigPreviewModel, layerIds: List<String>): List<MeshSplitOffer> {
+    private suspend fun detectMeshSplits(preview: RigPreviewModel, layerIds: List<String>, fromImport: Boolean): List<MeshSplitOffer> {
         val expected = workspaceBackend?.snapshot()
         return withContext(Dispatchers.Default) {
             val context = kotlinx.coroutines.currentCoroutineContext()
@@ -1436,35 +1398,24 @@ class PSD2LiveViewModel : AutoCloseable {
                     ?: return@mapNotNull null
                 val source = preview.analysis.source.layers.firstOrNull { it.id.raw == id }
                     ?: preview.analysis.layers.first { it.source.id.raw == id }.source
-                MeshSplitOffer(id, source.name, plan, preview, expected)
+                MeshSplitOffer(id, source.name, plan, preview, expected, fromImport)
             }
         }
     }
 
-    /** Splits the layers chosen in the batch offer. */
     internal fun applyMeshSplitBatch(decisions: List<LayerSplitDecision>) {
         val offer = pendingMeshSplitBatch ?: return
-        meshSplitCheck.cancel()
-        pendingMeshSplitBatch = null
-        val valid = validSplitDecisions(decisions)
-        if (valid.isEmpty()) return
-        meshSplitApplying = true
-        scope.launch {
-            try {
-                applyMeshSplits(offer.preview, valid)
-            } catch (failure: Throwable) {
-                if (failure is kotlinx.coroutines.CancellationException) throw failure
-                setErrorMessage(workspaceFailureMessage(failure))
-            } finally {
-                meshSplitApplying = false
-                resumeMeshSplits()
-            }
-        }
+        confirmMeshSplits(offer.preview, decisions)
     }
 
     internal fun dismissMeshSplitBatch() {
-        meshSplitCheck.cancel()
+        if (pendingMeshSplitBatch != null) dismissMeshSplit()
+    }
+
+    internal fun dismissMeshSplit() {
+        pendingMeshSplit = null
         pendingMeshSplitBatch = null
+        activeMeshSplitRequest = null
         resumeMeshSplits()
     }
 
@@ -1476,6 +1427,7 @@ class PSD2LiveViewModel : AutoCloseable {
 
     /** Back to the active workspace; the start page folds away, other pages keep their tabs. */
     fun leaveStartPage() {
+        if (activePage == AppPage.START && startSection == StartSection.SETTINGS) endSettingsPage()
         openPages = openPages - AppPage.START
         showWorkspace()
     }
@@ -1483,48 +1435,55 @@ class PSD2LiveViewModel : AutoCloseable {
     /** Opens [page] as a tab and shows it, with [module] brought forward when given. */
     internal fun showPage(page: AppPage, module: String? = null) {
         if (page !in openPages) openPages = AppPage.entries.filter { it in openPages || it == page }
-        if (activePage == AppPage.SETTINGS && page != AppPage.SETTINGS) endSettingsPage()
+        if (activePage == AppPage.START && startSection == StartSection.SETTINGS && page != AppPage.START) endSettingsPage()
         activePage = page
         if (module != null && module in page.modules) requestedPageModule = module
     }
 
-    /** Shows the help page on [tab], its content panel brought forward. */
+    /** Shows the help section on [tab] inside the start hub. */
     internal fun showHelp(tab: HelpTab) {
         helpTab = tab
-        showPage(AppPage.HELP, HELP_CONTENT)
+        showStartPage(StartSection.HELP)
     }
 
     internal fun setHelpTab(tab: HelpTab) {
         helpTab = tab
     }
 
-    /** Shows the manual or tutorial page [id] on the help page; a page that does not open is ignored. */
+    /** Shows the manual or tutorial page [id] in the help section; a page that does not open is ignored. */
     internal fun showHelpPage(id: String) {
         val page = Manual.page(id)?.takeIf { it.opens } ?: return
         helpPage = page.id
         helpTab = if (page.root == Manual.Root.MANUAL) HelpTab.MANUAL else HelpTab.TUTORIALS
-        showPage(AppPage.HELP, HELP_CONTENT)
+        showStartPage(StartSection.HELP)
     }
 
     internal fun setSettingsTopic(topic: SettingsTopic) {
         settingsTopic = topic
     }
 
-    /** Shows [page], or goes back to the workspace when it already shows: what its shortcut does. */
-    internal fun togglePage(page: AppPage, module: String? = null) {
-        if (activePage == page && module == null) showWorkspace() else showPage(page, module)
+    /** Shows [section] on the start hub, or goes back to the workspace when it already shows: what its shortcut does. */
+    internal fun toggleStartSection(section: StartSection) {
+        if (activePage == AppPage.START && startSection == section) showWorkspace() else showStartPage(section)
     }
 
     /** Closes [page]'s tab, showing the workspace if it was the page shown. */
     internal fun closePage(page: AppPage) {
+        if (page == AppPage.PSD_GUIDE) {
+            if (!psdGuide.saving) {
+                showPage(page, PSD_GUIDE_CONTENT)
+                psdGuide.requestClose()
+            }
+            return
+        }
+        if (page == AppPage.START && activePage == AppPage.START && startSection == StartSection.SETTINGS) endSettingsPage()
         openPages = openPages - page
         if (activePage == page) activePage = null
-        if (page == AppPage.SETTINGS) endSettingsPage()
     }
 
     /** Back to the active workspace, every page keeping its tab. */
     internal fun showWorkspace() {
-        if (activePage == AppPage.SETTINGS) endSettingsPage()
+        if (activePage == AppPage.START && startSection == StartSection.SETTINGS) endSettingsPage()
         activePage = null
     }
 
@@ -1553,6 +1512,7 @@ class PSD2LiveViewModel : AutoCloseable {
     }
 
     internal fun setStartSection(section: StartSection) {
+        if (startSection == StartSection.SETTINGS && section != StartSection.SETTINGS) endSettingsPage()
         startSection = section
     }
 
@@ -1689,9 +1649,8 @@ class PSD2LiveViewModel : AutoCloseable {
     }
 
     internal fun requestMeshSplit(layerId: String) {
-        if (pendingMeshSplit?.layerId == layerId) return
-        manualMeshSplitRequests += layerId
-        offerMeshSplit(listOf(layerId))
+        if (pendingMeshSplit?.layerId == layerId || pendingMeshSplitBatch?.splits?.any { it.layerId == layerId } == true) return
+        enqueueMeshSplit(MeshSplitRequest(MeshSplitTrigger.LAYER_MENU, listOf(layerId)))
     }
 
     internal data class DepthSplitOffer(
@@ -1754,119 +1713,34 @@ class PSD2LiveViewModel : AutoCloseable {
 
     internal enum class ObjectDialog { FIND_REPLACE, CONVERT_IDS }
 
-    internal var modifierAddition by mutableStateOf<ModifierAddition?>(null)
-        private set
-    private var modifierPreviewJob: kotlinx.coroutines.Job? = null
-    private var modifierPreviewSequence = 0
-
-    internal fun openModifierAddition(group: Boolean = false) {
-        val model = _state.value.previewModel ?: return
-        val expected = currentWorkspaceState() ?: return
-        val objects = selectedObjectTargets()
-        val selected = objects.filter { it.startsWith("mesh:") }.map { it.substringAfter(':') }
-        val warp = if (!group && selected.isEmpty()) objects.firstOrNull { it.startsWith("warp:") }?.substringAfter(':') else null
-        val authoredIds = model.authored.rig.puppet.drawables.mapTo(HashSet()) { it.id }
-        val ids = selected.ifEmpty { model.rig.puppet.drawables.filter { it.mesh != null && it.id in authoredIds }.map { it.id.raw } }
-        if (ids.isEmpty()) return
-        modifierAddition = ModifierAddition(expected, if (warp != null) listOf(io.github.psd2live.core.modifier.ModifierTarget("deformer", warp))
-            else ids.map { io.github.psd2live.core.modifier.ModifierTarget("mesh", it) })
-        val dialog = requireNotNull(modifierAddition)
-        val first = io.github.psd2live.core.modifier.RigLegacyBindings.specs
-            .sortedBy { it.type.endsWith("/legacy") && it.type != "body/legacy" }
-            .firstOrNull { it.type != "face.depth-turn" && !dialog.availability(model, it.type).hidden }?.type
-        modifierAddition = modifierAddition?.copy(type = if (group) null else if (warp != null) "swing" else first,
-            group = if (group) io.github.psd2live.application.WorkspaceModifierPlan.RECOMMENDED_GROUP else null)
+    private val modifiers by lazy {
+        ModifierController({ _state.value }, { workspaceBackend }, ::currentWorkspaceState,
+            ::selectedObjectTargets, scope, ::saveDocumentEdits, ::setErrorMessage)
     }
-
-    internal fun dismissModifierAddition() { modifierPreviewSequence++; modifierPreviewJob?.cancel(); modifierAddition = null }
-
-    internal fun previewModifierAddition(type: String?, group: String?, configuration: kotlinx.serialization.json.JsonObject? = null, preset: String? = null) {
-        val dialog = modifierAddition ?: return
-        val workspace = workspaceBackend ?: return
-        modifierPreviewJob?.cancel()
-        val sequence = ++modifierPreviewSequence
-        modifierAddition = dialog.copy(type = type, group = group, configuration = configuration, plan = null, preview = null, loading = true, error = null)
-        modifierPreviewJob = scope.launch {
-            try {
-                val (plan, preview) = withContext(Dispatchers.Default) {
-                    val editedPlan = if (configuration != null && preset == null && group == null && type == dialog.type) {
-                        dialog.plan?.let { previous ->
-                            val entries = previous.getValue("entries").jsonArray
-                            val entry = entries.lastOrNull()?.jsonObject
-                            if (entry == null || entry["type"]?.jsonPrimitive?.content != type) null
-                            else kotlinx.serialization.json.JsonObject(previous + ("entries" to kotlinx.serialization.json.JsonArray(
-                                entries.dropLast(1) + kotlinx.serialization.json.JsonObject(entry + ("config" to configuration)))))
-                        }
-                    } else null
-                    val plan = editedPlan ?: workspace.captureQueries().modifierPlan(kotlinx.serialization.json.buildJsonObject {
-                        type?.let { put("type", it) }; group?.let { put("group", it) }; configuration?.let { put("config", it) }; preset?.let { put("preset", it) }
-                        put("targets", kotlinx.serialization.json.JsonArray(dialog.targets.map { target -> kotlinx.serialization.json.buildJsonObject {
-                            put("kind", target.kind); put("id", target.id)
-                        } }))
-                    })
-                    if (plan.getValue("state").jsonPrimitive.content != dialog.state) throw io.github.psd2live.application.WorkspaceConflict(dialog.state, plan.getValue("state").jsonPrimitive.content)
-                    withContext(Dispatchers.Main) {
-                        if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(plan = plan)
-                    }
-                    val preview: kotlinx.serialization.json.JsonObject? = null
-                    plan to preview
-                }
-                if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(plan = plan, preview = preview, loading = false)
-            } catch (failure: Exception) {
-                if (failure is kotlinx.coroutines.CancellationException) throw failure
-                if (sequence == modifierPreviewSequence) modifierAddition = modifierAddition?.copy(loading = false, error = failure.message)
-            }
-        }
-    }
-
-    internal fun switchModifierPreset(group: String) {
-        val dialog = modifierAddition ?: return
-        if (dialog.committing) return
-        modifierAddition = dialog.copy(loading = true, committing = true)
-        saveDocumentEdits(dialog.state, tr("modifier.switch"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(
-            "modifier_switch", kotlinx.serialization.json.buildJsonObject { put("group", group) }))) { failure ->
-            if (failure == null) dismissModifierAddition()
-            else modifierAddition = modifierAddition?.copy(loading = false, committing = false, error = failure)
-        }
-    }
-
-    internal fun confirmModifierAddition() {
-        val dialog = modifierAddition ?: return
-        val plan = dialog.plan ?: return
-        if (dialog.loading || plan.getValue("entries").jsonArray.isEmpty()) return
-        modifierAddition = dialog.copy(loading = true, committing = true)
-        saveDocumentEdits(dialog.state, tr("modifier.history.add"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation("modifier_add_group",
-            kotlinx.serialization.json.buildJsonObject { put("group", plan.getValue("group")); put("entries", plan.getValue("entries")) }))) { failure ->
-            if (failure == null) dismissModifierAddition() else modifierAddition = modifierAddition?.copy(loading = false, committing = false, error = failure)
-        }
-    }
-
-    /** Reject a field captured from a projection that has not caught up with the authoritative stack. */
-    internal fun modifierEditState(): String? {
-        val shown = _state.value.rigEdits.modifierStack?.let(io.github.psd2live.core.modifier.RigModifierStack::fromJson)
-        val observed = workspaceBackend?.captureQueries()?.modifierStack() ?: return null
-        val rows = observed.getValue("entries").jsonArray
-        val entries = shown?.instances.orEmpty()
-        val matches = _state.value.historySnapshot?.headNodeId == observed.getValue("history_node_id").jsonPrimitive.content &&
-            observed.getValue("legacy").jsonPrimitive.boolean == (shown == null) &&
-            rows.size == entries.size && entries.zip(rows).all { (instance, raw) ->
-            val row = raw.jsonObject
-            row.getValue("id").jsonPrimitive.content == instance.id && row.getValue("config") ==
-                (if (instance.type == "simulation") kotlinx.serialization.json.JsonObject(instance.config - "bake") else instance.config) &&
-                row.getValue("enabled").jsonPrimitive.boolean == instance.enabled
-        }
-        if (!matches) { setErrorMessage(tr("modifier.stale")); return null }
-        return observed.getValue("state").jsonPrimitive.content
+    internal val modifierAddition get() = modifiers.modifierAddition
+    internal fun openModifierAddition(group: Boolean = false) = modifiers.openModifierAddition(group)
+    internal fun dismissModifierAddition() = modifiers.dismissModifierAddition()
+    internal fun previewModifierAddition(type: String?, group: String?, configuration: kotlinx.serialization.json.JsonObject? = null, preset: String? = null) =
+        modifiers.previewModifierAddition(type, group, configuration, preset)
+    internal fun switchModifierPreset(group: String, richness: String = "standard") =
+        modifiers.switchModifierPreset(group, richness)
+    internal fun confirmModifierAddition() = modifiers.confirmModifierAddition()
+    internal fun modifierEditOrigin(): ModifierEditOrigin? = modifiers.modifierEditOrigin()
+    internal fun modifierEditState(origin: ModifierEditOrigin? = null): String? = modifiers.modifierEditState(origin)
+    internal fun openTurnStylePreview(): io.github.psd2live.application.WorkspaceTurnStylePreview? {
+        val workspace = workspaceBackend as? DesktopWorkspace ?: return null
+        val current = _state.value
+        if (current.isBusy || current.workspaceEditBusy || current.editorDraftBusy) return null
+        val expected = modifierEditState() ?: return null
+        val pose = current.parameterValues + current.previewParameterValues.takeIf { current.previewLive }.orEmpty()
+        return workspace.host.turnStylePreview(expected, pose, current.effectiveVisibleLayerIds)
+            ?: run { setErrorMessage(tr("modifier.stale")); null }
     }
 
     internal fun editModifier(operation: String, request: kotlinx.serialization.json.JsonObject, expectedState: String? = modifierEditState(),
-                              onComplete: (String?) -> Unit = {}) {
-        val expected = expectedState ?: run { onComplete(tr("modifier.stale")); return }
-        saveDocumentEdits(expected, tr("modifier.history.edit"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(operation, request))) { failure ->
-            if (failure != null) setErrorMessage(failure)
-            onComplete(failure)
-        }
-    }
+                              onComplete: (String?) -> Unit = {}) = modifiers.editModifier(operation, request, expectedState, onComplete)
+    internal fun editModifiers(operations: List<io.github.psd2live.application.WorkspaceDocumentOperation>, expectedState: String? = modifierEditState(),
+                               onComplete: (String?) -> Unit = {}) = modifiers.editModifiers(operations, expectedState, onComplete)
 
     internal fun locateModifierContent(kind: String, id: String) {
         val model = _state.value.previewModel ?: return
@@ -2128,62 +2002,94 @@ class PSD2LiveViewModel : AutoCloseable {
         }
     }
 
-    internal fun dismissMeshSplit() {
-        pendingMeshSplit = null
-        resumeMeshSplits()
-    }
-
-    internal fun dismissAllMeshSplits() {
-        meshSplitCheck.cancel()
-        pendingMeshSplit = null
-        pendingMeshSplitBatch = null
-        meshSplitQueue.clear()
-        manualMeshSplitRequests.clear()
-        meshSplitScanQueued = false
-    }
-
-    /** Runs what waited for a split or the presets to finish: a queued menu scan first, then queued layer checks. */
+    /** Run pending checks before applying the start presets to a newly imported PSD. */
     private fun resumeMeshSplits() {
-        if (meshSplitScanQueued) requestMeshSplitScan() else checkNextMeshSplit()
+        checkNextMeshSplit()
+        val choices = importPresetContinuation.take(_state.value.projectOpenGeneration,
+            meshSplitsBlocked || meshSplitQueue.isNotEmpty()) ?: return
+        val expected = currentWorkspaceState() ?: return
+        presetsApplying = true
+        saveDocumentEdits(expected, tr("modifier.switch"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(
+            "modifier_initialize", kotlinx.serialization.json.buildJsonObject {
+                put("modifiers", choices.initialMode().name.lowercase())
+                if (choices.initialMode() == io.github.psd2live.application.WorkspaceInitialModifiers.CUSTOM)
+                    put("preset", kotlinx.serialization.json.Json.encodeToJsonElement(
+                        io.github.psd2live.application.WorkspaceInitialPreset.serializer(), choices.initialPreset()))
+            }))) { failure ->
+            presetsApplying = false
+            if (failure != null) setErrorMessage(failure)
+            resumeMeshSplits()
+        }
     }
 
     private fun checkNextMeshSplit() {
-        if (meshSplitsBlocked || meshSplitQueue.isEmpty()) return
-        val id = meshSplitQueue.removeFirst()
-        val preview = _state.value.previewModel ?: return
-        if (preview.config.rigEdits.importedCmo3 != null) {
-            if (id in manualMeshSplitRequests) setErrorMessage(tr("editor.meshSplit.authored"))
-            manualMeshSplitRequests -= id
-            checkNextMeshSplit()
+        if (meshSplitsBlocked) return
+        while (meshSplitQueue.isNotEmpty()) {
+            val request = meshSplitQueue.removeFirst()
+            val fromImport = request.trigger == MeshSplitTrigger.IMPORT
+            if (fromImport && !_state.value.autoDetectMeshSplitsOnImport) continue
+            val preview = _state.value.previewModel ?: continue
+            val manual = request.trigger == MeshSplitTrigger.MODEL_MENU || request.trigger == MeshSplitTrigger.LAYER_MENU
+            if (preview.config.rigEdits.importedCmo3 != null) {
+                if (manual) setErrorMessage(tr("editor.meshSplit.authored"))
+                continue
+            }
+            val layerIds = request.layerIds ?: preview.analysis.source.layers.map { it.id.raw }
+            val previousStatus = _state.value.statusText
+            val scanningStatus = tr("start.splits.scanning")
+            if (manual || fromImport) setStatusText(scanningStatus)
+            activeMeshSplitRequest = request
+            meshSplitCheck.start(
+                action = { detectMeshSplits(preview, layerIds, fromImport) },
+                completed = { offers ->
+                    if (_state.value.previewModel !== preview) {
+                        meshSplitQueue.addFirst(request)
+                    } else when {
+                        offers.size == 1 -> pendingMeshSplit = offers.single()
+                        offers.size > 1 -> pendingMeshSplitBatch = MeshSplitBatchOffer(preview, offers)
+                        request.trigger == MeshSplitTrigger.MODEL_MENU -> setStatusText(tr("start.splits.none"))
+                        request.trigger == MeshSplitTrigger.LAYER_MENU -> setStatusText(tr("editor.meshSplit.none"))
+                        else -> Unit
+                    }
+                },
+                failed = { reportMeshSplitCheckFailure(it) },
+                finished = {
+                    if (_state.value.statusText == scanningStatus) setStatusText(previousStatus)
+                    if (pendingMeshSplit == null && pendingMeshSplitBatch == null) activeMeshSplitRequest = null
+                    resumeMeshSplits()
+                },
+            )
             return
         }
-        meshSplitCheck.start(
-            action = { detectMeshSplits(preview, listOf(id)).singleOrNull() },
-            completed = { offer ->
-                if (_state.value.previewModel === preview && offer != null) pendingMeshSplit = offer
-                else if (id in manualMeshSplitRequests && _state.value.previewModel === preview)
-                    setErrorMessage(tr("editor.meshSplit.none"))
-                manualMeshSplitRequests -= id
-            },
-            failed = { reportMeshSplitCheckFailure(it) },
-            finished = { resumeMeshSplits() },
-        )
     }
 
     internal fun confirmMeshSplit(names: List<String>, sides: List<Side>) {
         val offer = pendingMeshSplit ?: return
-        val valid = validSplitDecisions(listOf(LayerSplitDecision(offer, names, sides)))
+        confirmMeshSplits(offer.preview, listOf(LayerSplitDecision(offer, names, sides)))
+    }
+
+    private fun confirmMeshSplits(preview: RigPreviewModel, decisions: List<LayerSplitDecision>) {
+        val valid = validSplitDecisions(decisions)
         if (valid.isEmpty()) return
-        pendingMeshSplit = null
+        val request = activeMeshSplitRequest
+        val generation = _state.value.projectOpenGeneration
         meshSplitApplying = true
+        pendingMeshSplit = null
+        pendingMeshSplitBatch = null
         scope.launch {
             try {
-                applyMeshSplits(offer.preview, valid)
+                if (_state.value.projectOpenGeneration != generation) return@launch
+                if (_state.value.previewModel !== preview) {
+                    if (request != null) meshSplitQueue.addFirst(request)
+                } else {
+                    applyMeshSplits(valid)
+                }
             } catch (failure: Throwable) {
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
                 setErrorMessage(workspaceFailureMessage(failure))
             } finally {
                 meshSplitApplying = false
+                activeMeshSplitRequest = null
                 resumeMeshSplits()
             }
         }
@@ -2197,14 +2103,8 @@ class PSD2LiveViewModel : AutoCloseable {
         d.names.map(String::trim).distinct().size == d.names.size
     }
 
-    /** Splits each decided layer of [basePreview] into its pieces as one history step; nothing if the model moved on. */
-    private suspend fun applyMeshSplits(basePreview: RigPreviewModel, validDecisions: List<LayerSplitDecision>) {
-        if (_state.value.previewModel !== basePreview) {
-            // The pieces were found on a model that has since been rebuilt; find them again on this one.
-            meshSplitScanQueued = true
-            setStatusText(tr("start.splits.rescanning"))
-            return
-        }
+    /** Splits each chosen layer into its pieces as one history step. */
+    private suspend fun applyMeshSplits(validDecisions: List<LayerSplitDecision>) {
         val workspace = requireNotNull(workspaceBackend) { "Workspace is not ready" }
         val expected = requireNotNull(validDecisions.first().offer.expected) { "Partition offer has no captured workspace state" }
         require(validDecisions.all { it.offer.expected?.state == expected.state }) { "Partition offers belong to different states" }
@@ -2272,50 +2172,32 @@ class PSD2LiveViewModel : AutoCloseable {
             workspace.applyDocumentEdits(expectedState, summary, edits, io.github.psd2live.project.MutationAuthor.USER)
         }
 
-    private val warpControlFields = mutableMapOf<String, WarpControlField>()
-
-    internal fun applyWarpControlField(token: String, operation: String, request: kotlinx.serialization.json.JsonObject) {
-        val current = _state.value
-        if (current.workspaceEditBusy || current.editorDraftBusy) return
-        val source = current.previewModel ?: return
-        val expected = currentWorkspaceState() ?: return
-        val edit = io.github.psd2live.application.WorkspaceDocumentOperation(operation, request)
-        val field = warpControlFields.getOrPut(token) { WarpControlField(expected, current, WorkspaceStateCodec.document(current), source, edit) }
-        try {
-            val document = io.github.psd2live.application.WorkspaceWarpControlEdits.apply(edit, field.document, field.model)
-            val records = document.rigEdits.authoringJournal.drop(field.document.rigEdits.authoringJournal.size)
-            // The copies over the bangs follow the edited warps' meshes before the commit, as on the canvas.
-            val puppet = io.github.psd2live.core.SeeThroughLayers.refresh(
-                records.fold(field.model.rig.puppet) { model, record -> io.github.psd2live.core.RigAuthoringJournal.apply(model, record) }, field.model)
-            val preview = field.model.copy(rig = field.model.rig.copy(puppet = puppet), config = field.model.config.copy(rigEdits = document.rigEdits))
-            field.operation = edit; field.preview = preview
-            updateState { it.copy(previewModel = preview, previewModelDirty = true, projectDirty = true) }
-        } catch (failure: Exception) { updateState { it.copy(errorMessage = failure.message) } }
+    private val canvasGestures by lazy {
+        CanvasGestureController({ _state.value }, { updateState(it) }, ::currentWorkspaceState, ::saveDocumentEdits)
     }
-
-    internal fun endWarpControlField(token: String) {
-        val field = warpControlFields.remove(token) ?: return
-        saveDocumentEdits(field.expectedState, "Edit Warp controls", listOf(field.operation)) { failure ->
-            if (failure != null || currentWorkspaceState() == field.expectedState) updateState { state ->
-                if (state.previewModel === field.preview) state.copy(previewModel = field.state.previewModel,
-                    previewModelDirty = field.state.previewModelDirty, projectDirty = field.state.projectDirty,
-                    errorMessage = failure) else state.copy(errorMessage = failure)
-            }
-        }
-    }
+    internal fun applyWarpControlField(token: String, operation: String, request: kotlinx.serialization.json.JsonObject) = canvasGestures.applyWarpControlField(token, operation, request)
+    internal fun endWarpControlField(token: String) = canvasGestures.endWarpControlField(token)
 
     private fun saveWorkspaceEdit(onComplete: (String?) -> Unit, mutation: suspend () -> Unit) {
         if (_state.value.workspaceEditBusy || _state.value.editorDraftBusy) { onComplete("An editor operation is still being applied"); return }
         updateState { it.copy(canvasEditBusy = true) }
         scope.launch {
+            var busyCleared = false
             try {
-                withContext(Dispatchers.Default) { mutation() }
-                onComplete(null)
-            } catch (failure: Exception) {
-                if (failure is kotlinx.coroutines.CancellationException) throw failure
-                onComplete(failure.message ?: "Could not save editor changes")
-            } finally {
+                val failure = try {
+                    withContext(Dispatchers.Default) { mutation() }
+                    null
+                } catch (failure: Exception) {
+                    if (failure is kotlinx.coroutines.CancellationException) throw failure
+                    failure.message ?: "Could not save editor changes"
+                }
+                // Clear busy before invoking onComplete so callbacks (e.g. an immediate save) see an idle workspace.
                 updateState { it.copy(canvasEditBusy = false) }
+                busyCleared = true
+                // A failed completion callback cannot turn an already committed edit into a rejected one.
+                onComplete(failure)
+            } finally {
+                if (!busyCleared) updateState { it.copy(canvasEditBusy = false) }
                 runQueuedProjectSave()
             }
         }
@@ -2592,84 +2474,22 @@ class PSD2LiveViewModel : AutoCloseable {
 	internal val pipeline = PSD2LivePipeline()
 	private val preferences by lazy { Preferences.userNodeForPackage(PSD2LiveViewModel::class.java) }
 	private var workspaceBackend: WorkspaceBackend? = null
-    private var pendingDestructiveAction: (() -> Unit)? = null
-    private var pendingDestructiveCancellation: (() -> Unit)? = null
-    var confirmUnsavedChanges: (() -> Int)? = null
-    private var queuedCanvasSave: Boolean? = null
+    private val projectLifecycle by lazy {
+        ProjectLifecycleController({ _state.value }, { updateState(it) },
+            { workspaceBackend?.hasUnsavedChanges() == true }, ::flushEditorFields, ::saveProjectNow, scope)
+    }
+    var confirmUnsavedChanges: (() -> Int)?
+        get() = projectLifecycle.confirmUnsavedChanges
+        set(value) { projectLifecycle.confirmUnsavedChanges = value }
+    fun withSavedChanges(action: () -> Unit) = projectLifecycle.withSavedChanges(action)
+    private fun withSavedChangesOrCancel(onCancel: () -> Unit, action: () -> Unit) = projectLifecycle.withSavedChangesOrCancel(onCancel, action)
+    internal val queuedProjectSave: Boolean? get() = projectLifecycle.queuedProjectSave
+    fun requestProjectSave(saveAs: Boolean = false) = projectLifecycle.requestProjectSave(saveAs)
+    internal fun runQueuedProjectSave() = projectLifecycle.runQueuedProjectSave()
+    fun clearProjectSaveError() = projectLifecycle.clearProjectSaveError()
+    fun cancelProjectLocation() = projectLifecycle.cancelProjectLocation()
+    fun saveProjectTo(path: Path) = projectLifecycle.saveProjectTo(path)
 
-    fun withSavedChanges(action: () -> Unit) = withSavedChangesOrCancel({}, action)
-
-    private fun cancelPendingDestructiveAction() {
-        pendingDestructiveAction = null
-        pendingDestructiveCancellation?.also { pendingDestructiveCancellation = null; it() }
-    }
-
-    private fun withSavedChangesOrCancel(onCancel: () -> Unit, action: () -> Unit) {
-        if (_state.value.projectSaving) { onCancel(); return }
-        // Anything half-typed is closed first, so the dirty check and the confirm dialog below see the
-        // value the user actually ended on rather than the last committed one.
-        flushEditorFields()
-        if (!_state.value.projectDirty && workspaceBackend?.hasUnsavedChanges() != true &&
-            !_state.value.workspaceEditBusy && !_state.value.editorDraftBusy) { action(); return }
-        when (confirmUnsavedChanges?.invoke() ?: 2) {
-            0 -> {
-                cancelPendingDestructiveAction()
-                pendingDestructiveAction = action
-                pendingDestructiveCancellation = onCancel
-                requestProjectSave()
-            }
-            1 -> { cancelPendingDestructiveAction(); queuedCanvasSave = null; action() }
-            else -> { cancelPendingDestructiveAction(); onCancel() }
-        }
-    }
-    /**
-     * The save asked for while an edit was being applied: true for Save As. One slot, and a Save As in it is never
-     * turned into a plain save by a later Ctrl+S (the Save As dialog saves the same content), nor dropped.
-     */
-    internal val queuedProjectSave: Boolean? get() = queuedCanvasSave
-
-    fun requestProjectSave(saveAs: Boolean = false) {
-        // A save captures the workspace, so it has to see the value still sitting in a focused field.
-        flushEditorFields()
-        if (_state.value.workspaceEditBusy || _state.value.editorDraftBusy) {
-            val queued = queuedCanvasSave == true || saveAs
-            queuedCanvasSave = queued
-            updateState { it.copy(statusText = tr(if (queued) "project.saveAsQueued" else "project.saveQueued")) }
-            return
-        }
-        if (_state.value.analysis == null) return
-        if (saveAs || _state.value.projectFile == null) {
-            updateState { it.copy(showProjectLocationDialog = true, projectSaveError = null) }
-        } else saveProjectTo(Path.of(_state.value.projectFile!!))
-    }
-    /** Runs the save [requestProjectSave] queued, once no edit is being applied; a Save As opens its dialog. */
-    internal fun runQueuedProjectSave() {
-        if (_state.value.workspaceEditBusy || _state.value.editorDraftBusy) return
-        val saveAs = queuedCanvasSave ?: return
-        queuedCanvasSave = null
-        if (_state.value.statusText == tr(if (saveAs) "project.saveAsQueued" else "project.saveQueued")) updateState { it.copy(statusText = tr("status.ready")) }
-        requestProjectSave(saveAs)
-    }
-    fun clearProjectSaveError() { updateState { it.copy(projectSaveError = null) } }
-    fun cancelProjectLocation() {
-        cancelPendingDestructiveAction()
-        updateState { it.copy(showProjectLocationDialog = false) }
-    }
-    fun saveProjectTo(path: Path) {
-        scope.launch {
-            try {
-                saveProjectNow(path)
-                updateState { it.copy(showProjectLocationDialog = false) }
-                if (!_state.value.projectDirty && workspaceBackend?.hasUnsavedChanges() != true &&
-                    !_state.value.workspaceEditBusy && !_state.value.editorDraftBusy)
-                    pendingDestructiveAction?.also {
-                        pendingDestructiveAction = null
-                        pendingDestructiveCancellation = null
-                        it()
-                    }
-            } catch (_: Throwable) { cancelPendingDestructiveAction() }
-        }
-    }
     internal suspend fun saveProjectNow(path: Path? = null): String {
         val started = _state.value
         updateState { it.copy(projectSaveError = null) }
@@ -2727,12 +2547,17 @@ class PSD2LiveViewModel : AutoCloseable {
             require(current.projectId == prior.projectId && current.projectOpenGeneration == prior.projectOpenGeneration &&
                 current.saveIdentity == prior.saveIdentity) { "Workspace changed while loading project" }
         }
+        projectLifecycle.close()
+        modifiers.close()
+        materials.close()
+        timelineGestures.clear()
+        canvasGestures.clear()
         previewRebuildJob?.cancel()
         if (cancelActiveWork) activeWorkJob?.cancel()
         resetCanvasPaintSessions()
         state.projectFile?.let(AppSettings::rememberRecentFile)
         replaceState(state.copy(
-            projectDirty = dirty,
+            projectDirty = dirty, recoveryPersistence = null,
             projectOpenGeneration = _state.value.projectOpenGeneration + 1,
             recentFiles = AppSettings.recentFiles(),
         ))
@@ -2784,6 +2609,7 @@ class PSD2LiveViewModel : AutoCloseable {
             projectId = projectId, projectSourceName = if (replacing) current.projectSourceName else sourceName,
             projectFile = if (replacing) current.projectFile else null,
             inputPath = if (replacing) current.inputPath else path?.toString().orEmpty(),
+            externalPsdPath = if (replacing) current.externalPsdPath else path?.takeIf { it.fileName.toString().endsWith(".psd", true) }?.toString(),
             loadedInputPath = if (replacing) current.loadedInputPath else path?.toString(),
             loadedInputFileSignature = if (replacing) current.loadedInputFileSignature else null,
             analysis = preview.analysis, previewModel = preview, previewModelDirty = false,
@@ -3152,7 +2978,7 @@ class PSD2LiveViewModel : AutoCloseable {
 
     /** Closes every open field session so a save or a window close sees the value just typed. */
     fun flushEditorFields() {
-		warpControlFields.keys.toList().forEach(::endWarpControlField)
+		canvasGestures.flush()
 		commitParameterScrub()
 		editorSessions.flush()
 	}
@@ -3437,8 +3263,22 @@ class PSD2LiveViewModel : AutoCloseable {
 		(workspaceBackend as? DesktopWorkspace)?.sessionRecovery?.forget()
 	}
 
+    internal fun projectSaveFeedback(state: PSD2LiveState) = projectSaveFeedback(state,
+        workspaceBackend?.stateToken(), workspaceBackend?.hasUnsavedChanges() == true, editorSessions.anyOpen)
+
+    private var persistenceObservation: Job? = null
+    fun retryRecoveryPersistence() { workspaceBackend?.retryPersistence() }
+
 	fun attachWorkspace(workspace: WorkspaceBackend) {
 		workspaceBackend = workspace
+        persistenceObservation?.cancel()
+        persistenceObservation = scope.launch {
+            workspace.observePersistence().collect { saved ->
+                if (workspaceBackend === workspace) updateState { current ->
+                    current.copy(recoveryPersistence = saved.takeIf { it.projectId == current.projectId })
+                }
+            }
+        }
         (workspace as? DesktopWorkspace)?.attachCurrentWorkspace()
 		recoveryOffer.value = (workspace as? DesktopWorkspace)?.sessionRecovery?.pending()
 		runCatching {
@@ -3502,15 +3342,20 @@ class PSD2LiveViewModel : AutoCloseable {
 	private var lastTick = System.nanoTime()
 	private var lastSdkParameterPublishNanos = 0L
 	private var lastSdkParameterCanvasId: String? = null
-	private fun refreshSdkSession(preview: RigPreviewModel) {
-		renderCoordinator.invalidateModel()
-		if (renderCoordinator.claimModelLoad(_state.value.previewLive)) sdkSession.load(preview)
+	private fun refreshSdkSession(preview: RigPreviewModel) = synchronized(stateLock) {
+		if (_state.value.previewModel !== preview) return@synchronized
+		val capturedAt = System.nanoTime()
+		val origin = runCatching { workspaceBackend?.captureTextures()?.presentationOrigin(preview) }.getOrNull()
+		// Drafts without a matching committed capture still reject stale frames, but cannot report revision latency.
+		val token = io.github.psd2live.util.PresentationToken(origin?.revision, origin?.state, capturedAt, observation = origin?.observation)
+		renderCoordinator.invalidateModel(token)
+		if (renderCoordinator.claimModelLoad(_state.value.previewLive)) sdkSession.load(preview, token)
 	}
 
-	private fun ensureSdkSessionLoaded() {
+	private fun ensureSdkSessionLoaded() = synchronized(stateLock) {
 		val current = _state.value
-		val preview = current.previewModel ?: return
-		if (renderCoordinator.claimModelLoad(current.previewLive)) sdkSession.load(preview)
+		val preview = current.previewModel ?: return@synchronized
+		if (renderCoordinator.claimModelLoad(current.previewLive)) sdkSession.load(preview, renderCoordinator.presentation)
 	}
 
 	internal fun acceptSdkFrame(frame: PreviewFrame, nowNanos: Long = System.nanoTime()) {
@@ -3525,7 +3370,7 @@ class PSD2LiveViewModel : AutoCloseable {
 
 		// The image and information overlays follow their own view's frame stream. Publishing every
 		// frame through the document state makes every dock and every other canvas recompose.
-		renderCoordinator.publish(frame)
+		if (!renderCoordinator.publish(frame)) return
 		if (canvas == null || canvas.id == current.activeCanvas.id) {
 			_sdkFrame.value = frame
 		}
@@ -3638,6 +3483,11 @@ class PSD2LiveViewModel : AutoCloseable {
 		val target = runCatching { Path.of(path).toAbsolutePath().normalize() }.getOrNull()
 		val kind = target?.takeIf(Files::isRegularFile)?.let { classifyRecentPath(it.toString()) }
 		if (target == null || kind == null) { openRecentFile(path); return }
+		if (kind == RecentFileKind.PSD) {
+			openPsdGuide(target)
+			psdGuide.awaitIdle()
+			return
+		}
 		val permission = kotlinx.coroutines.CompletableDeferred<Boolean>()
 		withSavedChangesOrCancel({ permission.complete(false) }) { permission.complete(true) }
 		if (!permission.await()) return
@@ -3648,11 +3498,7 @@ class PSD2LiveViewModel : AutoCloseable {
 					openProjectNow(target, discardUnsaved = true)
 					if (_state.value.projectOpenGeneration != generation) leaveStartPage()
 				}
-				RecentFileKind.PSD -> {
-					setInputPath(target.toString())
-					analyze(discardUnsaved = true)
-					activeWorkJob?.join()
-				}
+				RecentFileKind.PSD -> Unit
 			}
 		} catch (failure: Exception) {
 			if (failure is kotlinx.coroutines.CancellationException) throw failure
@@ -3672,10 +3518,7 @@ class PSD2LiveViewModel : AutoCloseable {
 		}
 		when (classifyRecentPath(target.toString())) {
 			RecentFileKind.PROJECT -> openProject(target)
-			RecentFileKind.PSD -> withSavedChanges {
-				setInputPath(target.toString())
-				analyze()
-			}
+			RecentFileKind.PSD -> openPsdGuide(target)
 			null -> {
 				AppSettings.forgetRecentFile(path)
 				updateState { it.copy(recentFiles = AppSettings.recentFiles()) }
@@ -3815,6 +3658,20 @@ class PSD2LiveViewModel : AutoCloseable {
 		editorChanged()
 	}
 
+	/** Switches whether meshes cover every pixel with any alpha; the meshes are rebuilt like any global mesh change. */
+	fun setMeshAlphaCoverage(enabled: Boolean) {
+		if (state.value.meshAlphaCoverage == enabled) return
+        workspaceBackend?.takeUnless { editorSessions.anyOpen }?.let { workspace ->
+            val port: io.github.psd2live.application.WorkspaceSettingsPort = workspace
+            runWorkspaceCommand { state -> port.updateProjectSettings(state,
+                kotlinx.serialization.json.buildJsonObject { put("meshAlphaCoverage", enabled) }) }
+            return
+        }
+		updateState { it.copy(meshAlphaCoverage = enabled) }
+		schedulePreviewRebuild()
+		editorChanged()
+	}
+
 	fun setPartMeshSettings(layerId: String, settings: MeshSettings) {
 		clearMeshSettingsPreviewState(layerId)
         workspaceBackend?.let { workspace ->
@@ -3831,13 +3688,13 @@ class PSD2LiveViewModel : AutoCloseable {
 		clearMeshSettingsPreviewState(layerId)
         workspaceBackend?.let { workspace ->
             val port: io.github.psd2live.application.WorkspaceSettingsPort = workspace
-            runWorkspaceCommand(after = { offerMeshSplit(listOf(layerId)) }) { state -> port.setLayerMeshSettings(state, layerId, null, true) }
+            runWorkspaceCommand(after = { offerMeshSplitAfterMeshSettings(layerId) }) { state -> port.setLayerMeshSettings(state, layerId, null, true) }
             return
         }
 		updateState { it.copy(meshOverrides = it.meshOverrides - layerId) }
 		schedulePreviewRebuild()
 	    editorChanged()
-		scope.launch { previewRebuildJob?.join(); offerMeshSplit(listOf(layerId)) }
+		scope.launch { previewRebuildJob?.join(); offerMeshSplitAfterMeshSettings(layerId) }
 	}
 
 	fun previewPartMeshSettings(layerId: String, settings: MeshSettings) {
@@ -3883,7 +3740,7 @@ class PSD2LiveViewModel : AutoCloseable {
         workspaceBackend?.let { workspace ->
             cancelPartMeshSettingsPreview(layerId)
             val port: io.github.psd2live.application.WorkspaceSettingsPort = workspace
-            runWorkspaceCommand(after = { offerMeshSplit(listOf(layerId)) }) { state ->
+            runWorkspaceCommand(after = { offerMeshSplitAfterMeshSettings(layerId) }) { state ->
                 port.setLayerMeshSettings(state, layerId, meshSettingFields(settings), false)
             }
             return
@@ -3904,10 +3761,10 @@ class PSD2LiveViewModel : AutoCloseable {
 				)
 			}
 			editorChanged()
-			offerMeshSplit(listOf(layerId))
+			offerMeshSplitAfterMeshSettings(layerId)
 		} else {
 			setPartMeshSettings(layerId, settings)
-			scope.launch { previewRebuildJob?.join(); offerMeshSplit(listOf(layerId)) }
+			scope.launch { previewRebuildJob?.join(); offerMeshSplitAfterMeshSettings(layerId) }
 		}
 	}
 
@@ -4609,71 +4466,21 @@ class PSD2LiveViewModel : AutoCloseable {
 		motionEditor.selection = pasted
 	}
 
-	/** Starts a key or handle drag: samples apply to this clip, and the drag records one history node. */
-	fun beginMotionKeyDrag() {
-		motionEditor.dragOrigin = editingMotionClip() ?: return
-		motionEditor.dragSelection = motionEditor.selection
-		motionEditor.dragState = currentWorkspaceState()
-		motionEditor.dragClips = MotionCatalog.entries(_state.value.rigEdits)
-		motionEditor.dragRequest = null
-	}
-
-	fun dragMotionKeys(dt: Float, dv: Float = 0f, normalized: Boolean = false) {
-		val origin = motionEditor.dragOrigin ?: return
-		val (next, moved) = MotionKeyEdits.move(origin, motionEditor.dragSelection, dt, dv, motionParameterRanges(), normalized, motionKeyLimits())
-		previewMotionClip(origin.id) { next }
-		motionEditor.dragMode = "move_keys"
-		motionEditor.dragRequest = kotlinx.serialization.json.buildJsonObject { put("selection", motionSelectionJson(motionEditor.dragSelection)); put("dt", dt); put("dv", dv); put("normalized", normalized) }
-		motionEditor.selection = moved
-	}
-
-	/** Sets one Bezier handle of [ref], relative to the drag's origin clip. */
-	internal fun dragMotionHandle(ref: MotionKeyRef, outgoing: Boolean, handle: MotionHandle) {
-		val origin = motionEditor.dragOrigin ?: return
-		val next = MotionKeyEdits.mapKeys(origin, setOf(ref)) { _, key ->
-			if (outgoing) key.copy(outHandle = handle.clamped()) else key.copy(inHandle = handle.clamped())
-		}
-		previewMotionClip(origin.id) { next }
-		val key = next.curve(ref.parameterId)?.keys?.firstOrNull(ref::matches) ?: return
-		motionEditor.dragMode = "replace_keys"
-		motionEditor.dragRequest = kotlinx.serialization.json.buildJsonObject { putJsonArray("keys") { add(kotlinx.serialization.json.buildJsonObject { put("parameter", ref.parameterId); put("from_time", ref.time); put("key", motionKeyJson(key)) }) } }
-	}
-
-	fun endMotionKeyDrag() {
-		val origin = motionEditor.dragOrigin ?: return
-		val request = motionEditor.dragRequest
-		val mode = motionEditor.dragMode
-		val before = motionEditor.dragClips
-		val expected = motionEditor.dragState
-		motionEditor.dragOrigin = null
-		motionEditor.dragSelection = emptySet()
-		motionEditor.dragState = null
-		motionEditor.dragClips = emptyList()
-		// The drag only previewed; the committed clips come back whatever landed meanwhile.
-		updateState { state ->
-			val committed = shownDocument?.takeIf { it.first == state.projectOpenGeneration }?.second?.rigEdits?.let(MotionCatalog::entries) ?: before
-			state.copy(rigEdits = MotionCatalog.replacing(state.rigEdits, committed))
-		}
-		// Whether the preview still shows the drag does not matter: a commit shown meanwhile may have replaced it.
-		if (expected == null || request == null) return
-		val edits = timelineEdits(mode, request, origin)
-		fun yieldDrag() = updateState { it.withLog(level = LogLevel.WARNING, tag = "Workspace", message = tr("log.editorDraftConflict", origin.name)) }
-		// Another author's commit that left the clip as the drag found it does not stop the drag, as with any field
-		// draft; one that changed the clip wins and the drag is dropped with a warning. The state read here may
-		// predate a commit already shown; its conflict names the state to follow.
-		saveWorkspaceEdit({ failure -> if (failure != null) updateState { it.copy(statusText = failure) } }) {
-			val port: io.github.psd2live.application.WorkspaceDocumentPort = requireNotNull(workspaceBackend) { "Project workspace unavailable" }
-			var state = currentWorkspaceState() ?: return@saveWorkspaceEdit
-			repeat(MOTION_DRAG_REBASES) {
-				if (state != expected && editingMotionClip() != origin) { yieldDrag(); return@saveWorkspaceEdit }
-				try {
-					port.applyDocumentEdits(state, "Edit timeline", edits, io.github.psd2live.project.MutationAuthor.USER)
-					return@saveWorkspaceEdit
-				} catch (conflict: io.github.psd2live.application.WorkspaceConflict) { state = conflict.actualState }
-			}
-			yieldDrag()
-		}
-	}
+    private val timelineGestures by lazy {
+        TimelineGestureController({ _state.value }, { workspaceBackend }, ::currentWorkspaceState,
+            motionEditor, { editingMotionClip() }, ::previewMotionClip, ::motionParameterRanges, ::motionKeyLimits,
+            { before -> updateState { state ->
+                val committed = shownDocument?.takeIf { it.first == state.projectOpenGeneration }?.second?.rigEdits?.let(MotionCatalog::entries) ?: before
+                state.copy(rigEdits = MotionCatalog.replacing(state.rigEdits, committed))
+            } }, ::timelineEdits,
+            { action -> saveWorkspaceEdit({ failure -> if (failure != null) setStatusText(failure) }, action) },
+            { name -> updateState { it.withLog(level = LogLevel.WARNING, tag = "Workspace", message = tr("log.editorDraftConflict", name)) } })
+    }
+    fun beginMotionKeyDrag() = timelineGestures.beginMotionKeyDrag()
+    fun dragMotionKeys(dt: Float, dv: Float = 0f, normalized: Boolean = false) = timelineGestures.dragMotionKeys(dt, dv, normalized)
+    internal fun dragMotionHandle(ref: MotionKeyRef, outgoing: Boolean, handle: MotionHandle) = timelineGestures.dragMotionHandle(ref, outgoing, handle)
+    fun endMotionKeyDrag() = timelineGestures.endMotionKeyDrag()
+    internal fun cancelMotionKeyDrag() = timelineGestures.cancel()
 
 	/** Moves the playhead and poses the preview there; the preview pauses so the editor owns the pose. */
 	fun setMotionPlayhead(time: Float) {
@@ -5155,12 +4962,12 @@ class PSD2LiveViewModel : AutoCloseable {
 		updateState { it.copy(mutedPrompts = emptySet()) }
 	}
 
-	fun openSettings() = showPage(AppPage.SETTINGS)
+	fun openSettings() = showStartPage(StartSection.SETTINGS)
 
-	/** Opens the settings page on [topic]. */
+	/** Opens the settings section on [topic]. */
 	internal fun openSettings(topic: SettingsTopic) {
 		settingsTopic = topic
-		showPage(AppPage.SETTINGS, SETTINGS_CONTENT)
+		showStartPage(StartSection.SETTINGS)
 	}
 
 	/** Leaving the settings page: a shortcut being recorded is dropped and the canvas takes the keys again. */
@@ -6661,8 +6468,9 @@ class PSD2LiveViewModel : AutoCloseable {
 		when (action) {
 			is io.github.psd2live.ui.utils.DesktopDropTarget.DroppedAction.OpenProject -> openProject(action.file.toPath())
 			is io.github.psd2live.ui.utils.DesktopDropTarget.DroppedAction.OpenPsd -> {
-				action.outputDir?.let { setOutputPath(it.absolutePath) }
-				withSavedChanges {
+				if (action.file.extension.equals("psd", true)) openPsdGuide(action.file.toPath(), action.outputDir?.toPath())
+				else withSavedChanges {
+					action.outputDir?.let { setOutputPath(it.absolutePath) }
 					setInputPath(action.file.absolutePath)
 					analyze(discardUnsaved = true)
 				}
@@ -6715,7 +6523,7 @@ class PSD2LiveViewModel : AutoCloseable {
                 if (_state.value.activeCanvas.id == canvasId && _state.value.activeCanvas.mode != CanvasMode.EDIT) setCanvasMode(canvasId, CanvasMode.EDIT)
                 canvasEditorFor(canvasId).selectImportedLayer(placeId)
                 selectOnCanvas(workspaceId, canvasId, CanvasMode.EDIT, placeId)
-                if (!asReference) offerMeshSplit(ids)
+                if (!asReference) offerImportMeshSplit(ids)
             } catch (failure: Exception) {
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
                 setErrorMessage(failure.message ?: tr("error.importLayerFailed"))
@@ -6728,50 +6536,19 @@ class PSD2LiveViewModel : AutoCloseable {
 	/** A material carried by the pointer from the materials panel, at [position] in root coordinates. */
 	data class MaterialDrag(val id: String, val label: String, val position: androidx.compose.ui.geometry.Offset)
 
-	private val _materialDrag = kotlinx.coroutines.flow.MutableStateFlow<MaterialDrag?>(null)
-	val materialDrag: kotlinx.coroutines.flow.StateFlow<MaterialDrag?> = _materialDrag
-
-	/**
-	 * Where a material dropped at a root position lands on each edit canvas, in canvas units; null off the canvas.
-	 * Each edit canvas registers its own while it shows.
-	 */
-	val materialDropTargets = java.util.concurrent.ConcurrentHashMap<String, (androidx.compose.ui.geometry.Offset) -> androidx.compose.ui.geometry.Offset?>()
-
-	fun startMaterialDrag(id: String, label: String, position: androidx.compose.ui.geometry.Offset) {
-		_materialDrag.value = MaterialDrag(id, label, position)
-		fileDrops.move(CarriedFiles(emptyList(), CarriedMaterial(id, label)), position.x, position.y)
-	}
-	fun moveMaterialDrag(position: androidx.compose.ui.geometry.Offset) {
-		val drag = _materialDrag.value ?: return
-		_materialDrag.value = drag.copy(position = position)
-		fileDrops.move(CarriedFiles(emptyList(), CarriedMaterial(drag.id, drag.label)), position.x, position.y)
-	}
-	fun cancelMaterialDrag() { _materialDrag.value = null; fileDrops.end() }
-
-	/** Drops the carried material where the pointer is: whatever the target there does with it, as with files. */
-	fun endMaterialDrag() {
-		val drag = _materialDrag.value ?: return
-		_materialDrag.value = null
-		val carried = CarriedFiles(emptyList(), CarriedMaterial(drag.id, drag.label))
-		perform(carried, fileDrops.drop(carried, drag.position.x, drag.position.y))
-	}
-
-	/** Adds material [materialId] as a further reference image, in front of the model or [under] it (`layout_add_reference`), or removes every one showing it with null. */
-	fun setLayoutReference(materialId: String?, opacity: Float? = null, removing: String? = null, under: Boolean = false) {
-		if (materialId == null) {
-			val ids = _state.value.layout.references.filter { removing == null || it.materialId == removing }.map { it.id }
-			if (ids.isNotEmpty()) workspaceBackend?.let { backend ->
-				val port: io.github.psd2live.application.WorkspaceDocumentPort = backend
-				runWorkspaceCommand { state -> port.applyDocumentEdits(state, tr("references.removed"), ids.map { id ->
-					io.github.psd2live.application.WorkspaceDocumentOperation(io.github.psd2live.application.WorkspaceMaterialEdits.REFERENCE,
-						kotlinx.serialization.json.buildJsonObject { put("id", id); put("material_id", kotlinx.serialization.json.JsonNull) })
-				}, MutationAuthor.USER) }
-			}
-			return
-		}
-		layoutEdit(tr("materials.referenceSet"), io.github.psd2live.application.WorkspaceMaterialEdits.ADD_REFERENCE,
-			kotlinx.serialization.json.buildJsonObject { put("material_id", materialId); opacity?.let { put("opacity", it) }; if (under) put("under", true) })
-	}
+    private val materials by lazy {
+        MaterialController({ _state.value }, { workspaceBackend }, { editorSessions.anyOpen },
+            { finished, action -> runWorkspaceCommand(onFinished = finished, action = action) }, ::setStatusText,
+            { selectReference(it) }, ::toggleLayerVisibility, ::deleteLayer, fileDrops, ::perform)
+    }
+    fun startMaterialDrag(id: String, label: String, position: androidx.compose.ui.geometry.Offset) = materials.startMaterialDrag(id, label, position)
+    fun moveMaterialDrag(position: androidx.compose.ui.geometry.Offset) = materials.moveMaterialDrag(position)
+    fun cancelMaterialDrag() = materials.cancelMaterialDrag()
+    fun endMaterialDrag() = materials.endMaterialDrag()
+    val materialDrag get() = materials.materialDrag
+    val materialDropTargets get() = materials.materialDropTargets
+    val referenceOpacityDraft get() = materials.referenceOpacityDraft
+    val materialEditor get() = materials.materialEditor
 
 	fun selectReference(id: String?, canvasId: String = _state.value.activeCanvas.id, workspaceId: String = _state.value.activeWorkspace.id) {
 		updateCanvasPresentation(workspaceId, canvasId, CanvasMode.EDIT) {
@@ -6780,200 +6557,73 @@ class PSD2LiveViewModel : AutoCloseable {
 		selectionAnchorId = null
 	}
 
-	private val _referenceOpacityDraft = kotlinx.coroutines.flow.MutableStateFlow<ReferenceOpacityDraft?>(null)
-	/** Transient feedback shared by all canvases; only the release is a document edit. */
-	val referenceOpacityDraft: kotlinx.coroutines.flow.StateFlow<ReferenceOpacityDraft?> = _referenceOpacityDraft
+	fun setLayoutReference(materialId: String?, opacity: Float? = null, removing: String? = null, under: Boolean = false) = materials.setLayoutReference(materialId, opacity, removing, under)
 
-	fun previewReferenceOpacity(id: String, opacity: Float) = previewReferenceOpacity(ReferenceTarget.Image(id), opacity)
-	fun previewReferenceOpacity(target: ReferenceTarget, opacity: Float) {
-		_referenceOpacityDraft.value = ReferenceOpacityDraft(target, opacity.coerceIn(0f, 1f))
-	}
+	fun previewReferenceOpacity(id: String, opacity: Float) = materials.previewReferenceOpacity(id, opacity)
 
-	fun commitReferenceOpacity(id: String, opacity: Float) = commitReferenceOpacity(ReferenceTarget.Image(id), opacity)
-	fun commitReferenceOpacity(target: ReferenceTarget, opacity: Float) {
-		val workspace = workspaceBackend?.takeUnless { editorSessions.anyOpen || _state.value.workspaceEditBusy }
-		if (workspace == null) { _referenceOpacityDraft.value = null; return }
-		val port: io.github.psd2live.application.WorkspaceDocumentPort = workspace
-		runWorkspaceCommand(onFinished = { _referenceOpacityDraft.value = null }) { state ->
-			port.applyDocumentEdits(state, tr("references.edited"), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(
-				io.github.psd2live.application.WorkspaceReferenceOpacity.OP,
-				kotlinx.serialization.json.buildJsonObject {
-					when (target) {
-						is ReferenceTarget.Image -> put("reference_id", target.id)
-						is ReferenceTarget.Layer -> put("layer_id", target.layerId)
-					}
-					put("opacity", opacity.coerceIn(0f, 1f))
-				})), MutationAuthor.USER)
-		}
-	}
+	fun previewReferenceOpacity(target: ReferenceTarget, opacity: Float) = materials.previewReferenceOpacity(target, opacity)
 
-	/** Changes reference image [id] with the fields [fields] puts (`layout_set_reference`): one history edit. */
-	fun editReference(id: String, fields: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) =
-		layoutEdit(tr("references.edited"), io.github.psd2live.application.WorkspaceMaterialEdits.REFERENCE,
-			kotlinx.serialization.json.buildJsonObject { put("id", id); fields() })
+	fun commitReferenceOpacity(id: String, opacity: Float) = materials.commitReferenceOpacity(id, opacity)
 
-	fun removeReference(id: String) {
-		if (_state.value.selectedReferenceId == id) selectReference(null)
-		layoutEdit(tr("references.removed"), io.github.psd2live.application.WorkspaceMaterialEdits.REFERENCE,
-			kotlinx.serialization.json.buildJsonObject { put("id", id); put("material_id", kotlinx.serialization.json.JsonNull) })
-	}
+	fun commitReferenceOpacity(target: ReferenceTarget, opacity: Float) = materials.commitReferenceOpacity(target, opacity)
 
-	fun orderReference(id: String, index: Int) = layoutEdit(tr("references.order"), io.github.psd2live.application.WorkspaceMaterialEdits.ORDER_REFERENCE,
-		kotlinx.serialization.json.buildJsonObject { put("id", id); put("index", index) })
+	fun editReference(id: String, fields: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) = materials.editReference(id, fields)
 
-	/** Pins [target] to keyform [points] - each parameter ID to value - or unpins it with none. */
-	fun setReferencePin(target: ReferenceTarget, points: List<io.github.psd2live.project.PinPoint>) {
-		val encoded = kotlinx.serialization.json.JsonArray(points.map { point ->
-			kotlinx.serialization.json.JsonObject(point.mapValues { kotlinx.serialization.json.JsonPrimitive(it.value) }) })
-		when (target) {
-			is ReferenceTarget.Layer -> layoutEdit(tr(if (points.isEmpty()) "layers.pin.unpinned" else "layers.pin.pinned", 1),
-				io.github.psd2live.application.WorkspaceLayoutEdits.PIN_REFERENCE,
-				kotlinx.serialization.json.buildJsonObject { put("layer_ids", strings(listOf(target.layerId))); put("points", encoded) })
-			is ReferenceTarget.Image -> editReference(target.id) { put("points", encoded) }
-		}
-	}
+	fun removeReference(id: String) = materials.removeReference(id)
 
-	/** Shows [target] at keyform [point] too, or no longer there when it already does. */
-	fun toggleReferencePoint(target: ReferenceTarget, point: io.github.psd2live.project.PinPoint) {
-		val points = target.pin(_state.value.layout)
-		val existing = points.firstOrNull { ReferencePinRows.same(it, point) }
-		setReferencePin(target, if (existing != null) points - existing else points + point)
-	}
+	fun orderReference(id: String, index: Int) = materials.orderReference(id, index)
 
-	/** Shows [target] behind the model, in the layer stack or in front of it (`reference_set_mode`). */
-	fun setReferenceMode(target: ReferenceTarget, mode: ReferenceMode) {
-		if (target is ReferenceTarget.Image && _state.value.selectedReferenceId == target.id && mode == ReferenceMode.LAYER) selectReference(null)
-		layoutEdit(tr("references.moved", tr(mode.labelKey)), io.github.psd2live.application.WorkspaceReferenceModes.OP,
-			kotlinx.serialization.json.buildJsonObject {
-				when (target) {
-					is ReferenceTarget.Image -> put("reference_id", target.id)
-					is ReferenceTarget.Layer -> put("layer_id", target.layerId)
-				}
-				put("mode", mode.key)
-			})
-	}
+	fun setReferencePin(target: ReferenceTarget, points: List<io.github.psd2live.project.PinPoint>) = materials.setReferencePin(target, points)
 
-	/** Shows or hides [target]: a reference image in the document, a reference layer as any layer. */
-	fun setReferenceVisible(target: ReferenceTarget, visible: Boolean) {
-		when (target) {
-			is ReferenceTarget.Image -> editReference(target.id) { put("visible", visible) }
-			is ReferenceTarget.Layer -> if (_state.value.isLayerVisible(target.layerId) != visible) toggleLayerVisibility(target.layerId)
-		}
-	}
+	fun toggleReferencePoint(target: ReferenceTarget, point: io.github.psd2live.project.PinPoint) = materials.toggleReferencePoint(target, point)
 
-	/** Removes [target]: a reference image goes, a reference layer is deleted. */
-	fun removeReference(target: ReferenceTarget) = when (target) {
-		is ReferenceTarget.Image -> removeReference(target.id)
-		is ReferenceTarget.Layer -> deleteLayer(target.layerId)
-	}
+	fun setReferenceMode(target: ReferenceTarget, mode: ReferenceMode) = materials.setReferenceMode(target, mode)
 
-	/** Reference image [id] moved, scaled or turned on the canvas to [rect] and [rotation]. */
-	fun placeReference(id: String, rect: io.github.psd2live.project.LayerCanvasRect, rotation: Float) = editReference(id) {
-		put("rect", kotlinx.serialization.json.buildJsonObject { put("left", rect.left); put("top", rect.top); put("width", rect.width); put("height", rect.height) })
-		put("rotation", rotation)
-	}
+	fun setReferenceVisible(target: ReferenceTarget, visible: Boolean) = materials.setReferenceVisible(target, visible)
 
-	private fun layoutEdit(summary: String, operation: String, request: kotlinx.serialization.json.JsonObject) {
-		val workspace = workspaceBackend?.takeUnless { editorSessions.anyOpen } ?: return
-		val port: io.github.psd2live.application.WorkspaceDocumentPort = workspace
-		runWorkspaceCommand { state -> port.applyDocumentEdits(state, summary,
-			listOf(io.github.psd2live.application.WorkspaceDocumentOperation(operation, request)), MutationAuthor.USER) }
-	}
+	fun removeReference(target: ReferenceTarget) = materials.removeReference(target)
+
+	fun placeReference(id: String, rect: io.github.psd2live.project.LayerCanvasRect, rotation: Float) = materials.placeReference(id, rect, rotation)
+
+	private fun layoutEdit(summary: String, operation: String, request: kotlinx.serialization.json.JsonObject) = materials.layoutEdit(summary, operation, request)
+
+	fun importMaterials(files: List<java.nio.file.Path>, folderId: String?, asReference: Boolean = false, under: Boolean = false) = materials.importMaterials(files, folderId, asReference, under)
+
+	fun createMaterialFolder(name: String, parentId: String?) = materials.createMaterialFolder(name, parentId)
+
+	fun moveMaterials(ids: Collection<String>, folderId: String?) = materials.moveMaterials(ids, folderId)
+
+	fun renameMaterial(id: String, name: String) = materials.renameMaterial(id, name)
+
+	fun deleteMaterials(ids: Collection<String>) = materials.deleteMaterials(ids)
+
+	fun tagMaterials(ids: Collection<String>, set: Set<String>) = materials.tagMaterials(ids, set)
+
+	fun setMaterialResolution(id: String, width: Int, height: Int) = materials.setMaterialResolution(id, width, height)
+
+	fun placeMaterial(id: String, x: Float? = null, y: Float? = null, reference: Boolean? = null) = materials.placeMaterial(id, x, y, reference)
+
+	fun markMaterialsReference(ids: Collection<String>, reference: Boolean) = materials.markMaterialsReference(ids, reference)
+
+	fun replaceLayerWithMaterial(layerId: String, materialId: String) = materials.replaceLayerWithMaterial(layerId, materialId)
+
+	fun openMaterialEditor(id: String) = materials.openMaterialEditor(id)
+
+	fun closeMaterialEditor() = materials.closeMaterialEditor()
+
+	fun showInMaterialEditor(id: String) = materials.showInMaterialEditor(id)
+
+	fun paintMaterial(id: String, request: kotlinx.serialization.json.JsonObject) = materials.paintMaterial(id, request)
+
+	internal fun adjustMaterial(id: String, adjustment: io.github.psd2live.application.WorkspaceMaterialPixels.Adjustment) = materials.adjustMaterial(id, adjustment)
+
+	fun unlinkMaterials(layerIds: Collection<String>) = materials.unlinkMaterials(layerIds)
+
+	fun adoptLayerMaterials() = materials.adoptLayerMaterials()
+
+	fun generateLayout(refresh: Boolean = true) = materials.generateLayout(refresh)
 
 	private fun strings(values: Collection<String>) = kotlinx.serialization.json.JsonArray(values.map { kotlinx.serialization.json.JsonPrimitive(it) })
-
-	/** Reads [files] (images, PSD, CMO3 images, SVG, folders) into the material library under [folderId]: one history edit. */
-	fun importMaterials(files: List<java.nio.file.Path>, folderId: String?, asReference: Boolean = false, under: Boolean = false) {
-		if (files.isEmpty()) return
-		val workspace = workspaceBackend?.takeUnless { editorSessions.anyOpen } ?: return
-		val port: io.github.psd2live.application.WorkspaceDocumentPort = workspace
-		updateState { it.copy(statusText = tr("materials.importing", files.size)) }
-		runWorkspaceCommand { state ->
-			val entries = kotlinx.coroutines.withContext(Dispatchers.IO) {
-				io.github.psd2live.application.WorkspaceMaterialFiles.read(files.map { it.toAbsolutePath() })
-			}
-			val token = io.github.psd2live.application.WorkspaceMaterialStaging.stage(entries)
-			port.applyDocumentEdits(state, tr("materials.imported", entries.size), listOf(io.github.psd2live.application.WorkspaceDocumentOperation(
-				io.github.psd2live.application.WorkspaceMaterialEdits.ADD, kotlinx.serialization.json.buildJsonObject {
-					put("staging", token); folderId?.let { put("folder_id", it) }
-					if (asReference) put("as_reference", true)
-					if (asReference && under) put("reference_under", true)
-				})), MutationAuthor.USER)
-		}
-	}
-
-	fun createMaterialFolder(name: String, parentId: String?) = layoutEdit(tr("materials.folder.created", name), io.github.psd2live.application.WorkspaceMaterialEdits.FOLDER,
-		kotlinx.serialization.json.buildJsonObject { put("name", name); parentId?.let { put("parent_id", it) } })
-
-	fun moveMaterials(ids: Collection<String>, folderId: String?) = layoutEdit(tr("materials.moved"), io.github.psd2live.application.WorkspaceMaterialEdits.MOVE,
-		kotlinx.serialization.json.buildJsonObject { put("ids", strings(ids)); put("folder_id", folderId?.let { kotlinx.serialization.json.JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull) })
-
-	fun renameMaterial(id: String, name: String) = layoutEdit(tr("materials.renamed"), io.github.psd2live.application.WorkspaceMaterialEdits.RENAME,
-		kotlinx.serialization.json.buildJsonObject { put("id", id); put("name", name) })
-
-	fun deleteMaterials(ids: Collection<String>) = layoutEdit(tr("materials.deleted"), io.github.psd2live.application.WorkspaceMaterialEdits.DELETE,
-		kotlinx.serialization.json.buildJsonObject { put("ids", strings(ids)) })
-
-	fun tagMaterials(ids: Collection<String>, set: Set<String>) = layoutEdit(tr("materials.tagged"), io.github.psd2live.application.WorkspaceMaterialEdits.TAG,
-		kotlinx.serialization.json.buildJsonObject { put("ids", strings(ids)); put("set", strings(set)) })
-
-	fun setMaterialResolution(id: String, width: Int, height: Int) = layoutEdit(tr("materials.resolution.set"), io.github.psd2live.application.WorkspaceMaterialEdits.RESOLUTION,
-		kotlinx.serialization.json.buildJsonObject { put("id", id); put("width", width); put("height", height) })
-
-	/** Places material [id] on the canvas, centred at ([x], [y]) in canvas units, or at its own place when null. */
-	fun placeMaterial(id: String, x: Float? = null, y: Float? = null, reference: Boolean? = null) = layoutEdit(tr("materials.placed"), io.github.psd2live.application.WorkspaceMaterialEdits.PLACE,
-		kotlinx.serialization.json.buildJsonObject {
-			put("material_id", id)
-			if (x != null && y != null) put("at", kotlinx.serialization.json.buildJsonArray { add(kotlinx.serialization.json.JsonPrimitive(x)); add(kotlinx.serialization.json.JsonPrimitive(y)) })
-			if (reference != null) put("reference", reference)
-		})
-
-	/** Marks material items or folders to place as reference layers, or not (`material_mark_reference`). */
-	fun markMaterialsReference(ids: Collection<String>, reference: Boolean) = layoutEdit(
-		tr(if (reference) "materials.referenceMarked" else "materials.referenceUnmarked"), io.github.psd2live.application.WorkspaceMaterialEdits.MARK_REFERENCE,
-		kotlinx.serialization.json.buildJsonObject { put("ids", strings(ids)); put("reference", reference) })
-
-	/** Layer [layerId] shows material [materialId] over its unchanged rectangle: `layer_replace_image` with the material. */
-	fun replaceLayerWithMaterial(layerId: String, materialId: String) = layoutEdit(tr("materials.replaced"), "layer_replace_image",
-		kotlinx.serialization.json.buildJsonObject { put("layer_id", layerId); put("material_id", materialId) })
-
-	private val _materialEditor = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
-
-	/** The material item the material window shows, or null while the window is closed. */
-	val materialEditor: kotlinx.coroutines.flow.StateFlow<String?> = _materialEditor
-
-	fun openMaterialEditor(id: String) { _materialEditor.value = id }
-	fun closeMaterialEditor() { _materialEditor.value = null }
-
-	/** The material window follows the panel's selection while it is open. */
-	fun showInMaterialEditor(id: String) { if (_materialEditor.value != null) _materialEditor.value = id }
-
-	/** One paint gesture ([request] as `material_paint` takes it, without the id) on material [id]'s pixels. */
-	fun paintMaterial(id: String, request: kotlinx.serialization.json.JsonObject) = layoutEdit(tr("materials.painted"),
-		io.github.psd2live.application.WorkspaceMaterialPixels.PAINT, kotlinx.serialization.json.JsonObject(request + ("id" to kotlinx.serialization.json.JsonPrimitive(id))))
-
-	/** Material [id]'s pixels flipped and recoloured, as `material_adjust` does. */
-	internal fun adjustMaterial(id: String, adjustment: io.github.psd2live.application.WorkspaceMaterialPixels.Adjustment) = layoutEdit(tr("materials.adjusted"),
-		io.github.psd2live.application.WorkspaceMaterialPixels.ADJUST, kotlinx.serialization.json.buildJsonObject {
-			put("id", id)
-			adjustment.flip?.let { put("flip", it) }
-			if (adjustment.hue != 0f) put("hue", adjustment.hue)
-			if (adjustment.saturation != 0f) put("saturation", adjustment.saturation)
-			if (adjustment.lightness != 0f) put("lightness", adjustment.lightness)
-			if (adjustment.contrast != 0f) put("contrast", adjustment.contrast)
-		})
-
-	/** Gives [layerIds] copies of the materials they share, their pixels unchanged (`material_fork`). */
-	fun unlinkMaterials(layerIds: Collection<String>) = layoutEdit(tr("materials.unlinked"), io.github.psd2live.application.WorkspaceMaterialEdits.FORK,
-		kotlinx.serialization.json.buildJsonObject { put("layer_ids", strings(layerIds)) })
-
-	/** Gives every layer that shows no material one of its own (`material_adopt_layers`). */
-	fun adoptLayerMaterials() = layoutEdit(tr("materials.adopt.action"), io.github.psd2live.application.WorkspaceMaterialEdits.ADOPT,
-		kotlinx.serialization.json.buildJsonObject { })
-
-	/** Generates the rig, or generates it again: what waits joins it, the user's edits stay. [refresh]: mesh replaced images from their new pixels. */
-	fun generateLayout(refresh: Boolean = true) = layoutEdit(tr("layout.generate.summary"), io.github.psd2live.application.WorkspaceGenerationEdits.GENERATE,
-		kotlinx.serialization.json.buildJsonObject { if (!refresh) put("refresh_geometry", kotlinx.serialization.json.JsonArray(emptyList())) })
 
 	/** A new empty project to place materials on before generating; the Layout workspace shows it. */
 	fun createLayoutProject(width: Int, height: Int) {
@@ -7274,6 +6924,7 @@ class PSD2LiveViewModel : AutoCloseable {
 	fun setParameterValues(values: Map<ParameterId, Float>) = setParameterValues(values, currentAutoKey())
 
 	private fun setParameterValues(values: Map<ParameterId, Float>, autoKey: kotlinx.serialization.json.JsonObject?) {
+		if (canvasEditors[_state.value.activeWorkspace.id to _state.value.activeCanvas.id]?.capturedEditPose != null) return
 		if (values.isEmpty()) return
 		val current = _state.value
 		val model = current.previewModel
@@ -7352,6 +7003,31 @@ class PSD2LiveViewModel : AutoCloseable {
 	}
 
 	private var parameterSnapJob: Job? = null
+	private var parameterSnapNoticeJob: Job? = null
+	private val _parameterSnapNotice = MutableStateFlow<String?>(null)
+	/** Brief non-intrusive notice shown on the edit canvas when deformation snaps parameters to nearest keys. */
+	val parameterSnapNotice: StateFlow<String?> = _parameterSnapNotice.asStateFlow()
+
+	private fun showParameterSnapNotice(targets: Map<ParameterId, Float>, puppet: org.umamo.runtime.model.PuppetModel) {
+		val items = targets.entries.map { (id, value) ->
+			val name = puppet.parameters.firstOrNull { it.id == id }?.name?.takeIf { it.isNotBlank() } ?: id.raw
+			val formatted = if (kotlin.math.abs(value - kotlin.math.round(value)) < 1e-4f) kotlin.math.round(value).toInt().toString()
+				else "%.2f".format(java.util.Locale.ROOT, value).trimEnd('0').trimEnd('.')
+			name to formatted
+		}
+		val text = when (items.size) {
+			0 -> return
+			1 -> tr("canvas.snap.notice.one", items[0].first, items[0].second)
+			2 -> tr("canvas.snap.notice.two", items[0].first, items[0].second, items[1].first, items[1].second)
+			else -> tr("canvas.snap.notice.many", items[0].first, items[0].second, items.size)
+		}
+		_parameterSnapNotice.value = text
+		parameterSnapNoticeJob?.cancel()
+		parameterSnapNoticeJob = scope.launch {
+			delay(1800L)
+			if (_parameterSnapNotice.value == text) _parameterSnapNotice.value = null
+		}
+	}
 
 	/** True while a snap-to-nearest-key animation is running. */
 	val isSnappingParameters: Boolean get() = parameterSnapJob?.isActive == true
@@ -7404,12 +7080,18 @@ class PSD2LiveViewModel : AutoCloseable {
 
 	fun snapAxesToNearestKeys(axes: List<org.umamo.runtime.model.KeyformAxis>, onReady: () -> Unit): Boolean {
 		val puppet = _state.value.previewModel?.rig?.puppet ?: return false
+        return snapAxesToNearestKeysOnModel(axes, puppet, onReady)
+    }
+
+    internal fun snapAxesToNearestKeysOnModel(axes: List<org.umamo.runtime.model.KeyformAxis>, puppet: org.umamo.runtime.model.PuppetModel,
+                                            onReady: () -> Unit): Boolean {
 		if (axes.isEmpty()) return false
 		val pose = _state.value.parameterValues
 		val defaults = puppet.parameters.associate { it.id to it.default }
 		val targets = io.github.psd2live.core.nearestKeyPose(axes, pose, defaults)
 		if (targets.isEmpty()) return false
 		val expectedState = currentWorkspaceState() ?: return false
+		showParameterSnapNotice(targets, puppet)
 		parameterSnapJob?.cancel()
 		parameterSnapJob = scope.launch {
 			try {
@@ -7868,7 +7550,35 @@ class PSD2LiveViewModel : AutoCloseable {
 		updateState { it.copy(exportSuccess = null, focusCanvasRequest = it.focusCanvasRequest + 1) }
 	}
 
-    fun analyze(discardUnsaved: Boolean = false) {
+    /** Model > Reload PSD: refresh textures in this project; starting over from a PSD still goes through analyze. */
+    fun reloadPsd(path: Path) {
+        if (_state.value.isBusy || _state.value.projectSaving || _state.value.analysis == null) return
+        flushEditorFields()
+        endSwing()
+        previewRebuildJob?.cancel()
+        activeWorkJob = scope.launch {
+            try {
+                val workspace = requireNotNull(workspaceBackend) { "Project workspace unavailable" }
+                workspace.awaitEditorDrafts()
+                _state.first { !it.workspaceEditBusy }
+                val expected = workspace.snapshot()
+                updateState { it.copy(isAnalyzing = true, isIndeterminateProgress = true, errorMessage = null, statusText = tr("status.analyzing")) }
+                val result = withContext(io.github.psd2live.application.WorkspaceExecution(expected.projectId, expected.state, MutationAuthor.USER)) {
+                    workspace.reloadPsd(expected.state, path.toAbsolutePath().normalize().toString())
+                }
+                updateState { it.copy(statusText = tr(if (result.applied) "psdReload.completed" else "psdReload.unchanged")) }
+            } catch (failure: Throwable) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                val detail = workspaceFailureMessage(failure)
+                updateState { it.withLog(tr("log.failed", detail), level = LogLevel.ERROR, tag = "Analysis")
+                    .copy(errorMessage = detail, statusText = tr("status.failed", detail)) }
+            } finally { updateState { it.copy(isAnalyzing = false, isIndeterminateProgress = false) } }
+        }
+    }
+
+    internal fun rememberExternalPsd(path: String) = updateState { it.copy(externalPsdPath = path) }
+
+    fun analyze(discardUnsaved: Boolean = false, checkImportedMeshSplits: Boolean = true) {
         if (_state.value.isBusy || _state.value.projectSaving) return
         val rawInput = _state.value.inputPath.trim()
         if (rawInput.isEmpty()) { updateState { it.copy(errorMessage = tr("dialog.inputRequired")) }; return }
@@ -7884,8 +7594,117 @@ class PSD2LiveViewModel : AutoCloseable {
         startWorkspaceImport(discardUnsaved, tr("status.analyzing"), afterImport = {
             leaveStartPage()
             openWorkspacePreset(if (layout) WorkspacePreset.LAYOUT else WorkspacePreset.EDIT)
-        }) { if (layout) it.importLayout(path, discardUnsaved) else it.importPsd(path, discardUnsaved, choices.initialMode(),
-            if (choices.initialMode() == io.github.psd2live.application.WorkspaceInitialModifiers.CUSTOM) choices.initialPreset() else null) }
+            if (!layout) {
+                if (choices.initialMode() != io.github.psd2live.application.WorkspaceInitialModifiers.EMPTY)
+                    importPresetContinuation.start(_state.value.projectOpenGeneration, choices)
+                if (checkImportedMeshSplits) {
+                    offerImportMeshSplit(_state.value.previewModel?.analysis?.source?.layers.orEmpty().map { it.id.raw })
+                }
+                resumeMeshSplits()
+            }
+        }) { if (layout) it.importLayout(path, discardUnsaved) else it.importPsd(path, discardUnsaved,
+            io.github.psd2live.application.WorkspaceInitialModifiers.EMPTY) }
+    }
+
+    internal val psdGuide by lazy { PsdGuideState(scope) }
+
+    internal fun openPsdGuide(path: Path, outputDirectory: Path? = null) {
+        val target = path.toAbsolutePath().normalize()
+        if (!_state.value.showPsdImportGuide && AppPage.PSD_GUIDE !in openPages) {
+            importPsdWithDefaults(target, outputDirectory)
+            return
+        }
+        val host = (workspaceBackend as? DesktopWorkspace)?.host ?: return
+        psdGuide.request(target, outputDirectory, host)
+        showPage(AppPage.PSD_GUIDE, PSD_GUIDE_CONTENT)
+    }
+
+    internal fun discardPsdGuide() {
+        if (!psdGuide.discard((workspaceBackend as? DesktopWorkspace)?.host)) return
+        openPages = openPages - AppPage.PSD_GUIDE
+        if (_state.value.analysis == null) showStartPage() else showWorkspace()
+    }
+
+    internal fun skipPsdGuideOnce() = finishPsdGuideWithDefaults(disableGuide = false)
+
+    internal fun disablePsdGuideAndImport() = finishPsdGuideWithDefaults(disableGuide = true)
+
+    private fun finishPsdGuideWithDefaults(disableGuide: Boolean) {
+        val workspace = workspaceBackend as? DesktopWorkspace ?: return
+        if (psdGuide.busy || psdGuide.saving || _state.value.isBusy || _state.value.projectSaving) return
+        val draft = psdGuide.guide ?: return
+        withSavedChanges {
+            if (psdGuide.busy || psdGuide.saving || psdGuide.guide !== draft) return@withSavedChanges
+            if (disableGuide) setPromptEnabled(AppPrompt.PSD_IMPORT_GUIDE, false)
+            flushEditorFields()
+            endSwing()
+            previewRebuildJob?.cancel()
+            psdGuide.installDefaults(
+                host = workspace.host,
+                autoSplit = _state.value.autoDetectMeshSplitsOnImport,
+                before = { preparePsdGuideExecution(workspace) },
+                onSuccess = { completePsdGuideInstall(draft.path, psdGuide.outputDirectory) },
+            )
+        }
+    }
+
+    private fun importPsdWithDefaults(target: Path, outputDirectory: Path?) {
+        val workspace = workspaceBackend as? DesktopWorkspace ?: return
+        if (psdGuide.busy || psdGuide.saving || _state.value.isBusy || _state.value.projectSaving) return
+        withSavedChanges {
+            if (psdGuide.busy || psdGuide.saving || _state.value.isBusy || _state.value.projectSaving) return@withSavedChanges
+            flushEditorFields()
+            endSwing()
+            previewRebuildJob?.cancel()
+            psdGuide.importWithDefaults(
+                path = target,
+                outputDirectory = outputDirectory,
+                host = workspace.host,
+                autoSplit = _state.value.autoDetectMeshSplitsOnImport,
+                before = { preparePsdGuideExecution(workspace) },
+                onSuccess = { completePsdGuideInstall(target, outputDirectory) },
+                onError = ::setErrorMessage,
+            )
+        }
+    }
+
+    internal fun createPsdGuideProject(onCompleted: (() -> Unit)? = null) {
+        val workspace = workspaceBackend as? DesktopWorkspace ?: return
+        if (psdGuide.busy || psdGuide.saving || _state.value.isBusy || _state.value.projectSaving) return
+        val draft = psdGuide.guide ?: return
+        val candidate = psdGuide.finalCandidate ?: return
+        withSavedChanges {
+            if (psdGuide.guide !== draft || psdGuide.finalCandidate !== candidate) return@withSavedChanges
+            flushEditorFields()
+            endSwing()
+            previewRebuildJob?.cancel()
+            psdGuide.install(
+                workspace.host,
+                before = { preparePsdGuideExecution(workspace) },
+                onSuccess = {
+                    completePsdGuideInstall(draft.path, psdGuide.outputDirectory)
+                    onCompleted?.invoke()
+                },
+            )
+        }
+    }
+
+    private suspend fun preparePsdGuideExecution(
+        workspace: DesktopWorkspace,
+    ): io.github.psd2live.application.WorkspaceExecution {
+        awaitProjectDrafts(workspace, true)
+        _state.first { !it.workspaceEditBusy }
+        val expected = workspace.snapshot()
+        return io.github.psd2live.application.WorkspaceExecution(expected.projectId, expected.state, MutationAuthor.USER)
+    }
+
+    private fun completePsdGuideInstall(inputPath: Path, outputDirectory: Path?) {
+        outputDirectory?.let { setOutputPath(it.toAbsolutePath().toString()) }
+        setInputPath(inputPath.toString())
+        psdGuide.clear()
+        openPages = openPages - AppPage.PSD_GUIDE
+        leaveStartPage()
+        openWorkspacePreset(WorkspacePreset.EDIT)
     }
 
     /** Both adapters invoke the same application source capability; only this entry owns GUI confirmation. */
@@ -8151,7 +7970,6 @@ class PSD2LiveViewModel : AutoCloseable {
 		status: String,
 		expectedProjectId: String? = _state.value.projectId,
 		expectedProjectOpenGeneration: Long = _state.value.projectOpenGeneration,
-		restoreCheckedOutPose: Boolean = false,
 	) {
 		var applied = false
 		var drafted = false
@@ -8212,18 +8030,11 @@ class PSD2LiveViewModel : AutoCloseable {
 				// Canvas solo is local presentation; a document commit neither ends nor forgets it.
 				isolationSnapshot = current.isolationSnapshot,
 				lockedParameters = current.lockedParameters.intersect(preview.rig.puppet.parameters.mapTo(mutableSetOf()) { it.id }),
-				parameterValues = if (restoreCheckedOutPose) {
-					preview.rig.puppet.parameters.associate { it.id to it.default }
-				} else {
-					preview.rig.puppet.parameters.associate { parameter ->
-						parameter.id to (current.parameterValues[parameter.id] ?: parameter.default).coerceIn(parameter.min, parameter.max)
-					}
+				// The pose is not part of the document: a commit or a history checkout (undo, redo) keeps it.
+				parameterValues = preview.rig.puppet.parameters.associate { parameter ->
+					parameter.id to (current.parameterValues[parameter.id] ?: parameter.default).coerceIn(parameter.min, parameter.max)
 				},
-				previewParameterValues = if (restoreCheckedOutPose) {
-					preview.rig.puppet.parameters.associate { it.id to it.default }
-				} else {
-					current.previewParameterValues
-				},
+				previewParameterValues = current.previewParameterValues,
 				statusText = status,
 				errorMessage = null,
 			).let { shownState ->
@@ -8293,6 +8104,9 @@ class PSD2LiveViewModel : AutoCloseable {
 					if (it.previewModel !== previous || it.buildConfig() != config) it
 					else { accepted = true; it.copy(previewModel = updated) }
 				}
+				// This can reflect uncommitted editor settings, and updateRuntimeBundle may even rebuild textures.
+				// Never inherit the previous model's observation by revision: refreshSdkSession requires the exact
+				// currently captured model. A derived draft stays uncorrelated until an authoritative commit.
 				if (accepted) refreshSdkSession(updated) else scheduleRuntimeBundleUpdate()
 			} catch (failure: Throwable) {
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
@@ -8839,7 +8653,13 @@ class PSD2LiveViewModel : AutoCloseable {
 	internal fun dismissStaleRegenerations() = updateState { it.copy(staleRegenerationsDismissed = true) }
 
 	override fun close() {
-		if (!isClosed.compareAndSet(false, true)) return
+        if (!isClosed.compareAndSet(false, true)) return
+        psdGuide.clear()
+        projectLifecycle.close()
+        modifiers.close()
+        materials.close()
+        timelineGestures.clear()
+        canvasGestures.clear()
         interior.close()
         structureMesh.close()
         meshSplitCheck.cancel()
@@ -8874,9 +8694,6 @@ class PSD2LiveViewModel : AutoCloseable {
 		const val PREF_LAST_EXPORT_DIR = "last_export_dir"
 		/** The token every slider shares; the call sites predate the per-field tokens and stay untouched. */
 		const val SLIDER_SESSION = "slider"
-		/** Commits by other authors a motion key drag follows before it gives up. */
-		const val MOTION_DRAG_REBASES = 4
-		const val MOTION_DRAG_SESSION = "motion-drag"
 	}
 }
 

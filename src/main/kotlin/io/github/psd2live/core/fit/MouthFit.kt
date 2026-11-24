@@ -1,5 +1,6 @@
 package io.github.psd2live.core.fit
 
+import io.github.psd2live.algorithms.binding.MouthThreeLayerModel
 import io.github.psd2live.core.Bounds
 import io.github.psd2live.core.ClassifiedLayer
 import io.github.psd2live.core.PartRole
@@ -12,132 +13,9 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/**
- * Dense layered lip contour and inner-mouth frame extracted from layered mouth artwork (either independent cel lip
- * strokes or painted upper/lower lip skin patches over an inner mouth opening).
- */
-class LayeredMouthFrame(
-	val hasLines: Boolean,
-	val centerX: Float,
-	val centerY: Float,
-	val exX: Float,
-	val exY: Float,
-	val frameWidth: Float,
-	val upperWorld65: FloatArray,
-	val lowerWorld65: FloatArray,
-	val upperLocal65: FloatArray,
-	val lowerLocal65: FloatArray,
-	val lineNorm: Float,
-	val openColsX: FloatArray,
-	val openTopY: FloatArray,
-	val openBotY: FloatArray,
-	val upperLipBoundsLocal: Bounds?,
-	val lowerLipBoundsLocal: Bounds?,
-	val tongueBoundsLocal: Bounds?,
-	val hUtVis0: Float,
-	val utSideReserve: Float,
-	val hLtVis0: Float,
-) {
-	val eyX: Float get() = -exY
-	val eyY: Float get() = exX
-
-	fun toLocalPx(rigX: Float, rigY: Float): Pair<Float, Float> {
-		val dx = rigX - centerX
-		val dy = rigY - centerY
-		return (dx * exX + dy * exY) to (dx * eyX + dy * eyY)
-	}
-
-	fun localDeltaToRig(dxLoc: Float, dyLoc: Float): Pair<Float, Float> =
-		(dxLoc * exX + dyLoc * eyX) to (dxLoc * exY + dyLoc * eyY)
-
-	fun localPxToRig(xLoc: Float, yLoc: Float): Pair<Float, Float> =
-		(centerX + xLoc * exX + yLoc * eyX) to (centerY + xLoc * exY + yLoc * eyY)
-
-	override fun equals(other: Any?): Boolean {
-		if (this === other) return true
-		if (other !is LayeredMouthFrame) return false
-		return hasLines == other.hasLines &&
-			centerX == other.centerX && centerY == other.centerY &&
-			exX == other.exX && exY == other.exY &&
-			frameWidth == other.frameWidth &&
-			upperWorld65.contentEquals(other.upperWorld65) &&
-			lowerWorld65.contentEquals(other.lowerWorld65) &&
-			upperLocal65.contentEquals(other.upperLocal65) &&
-			lowerLocal65.contentEquals(other.lowerLocal65) &&
-			lineNorm == other.lineNorm &&
-			openColsX.contentEquals(other.openColsX) &&
-			openTopY.contentEquals(other.openTopY) &&
-			openBotY.contentEquals(other.openBotY) &&
-			upperLipBoundsLocal == other.upperLipBoundsLocal &&
-			lowerLipBoundsLocal == other.lowerLipBoundsLocal &&
-			tongueBoundsLocal == other.tongueBoundsLocal &&
-			hUtVis0 == other.hUtVis0 &&
-			utSideReserve == other.utSideReserve &&
-			hLtVis0 == other.hLtVis0
-	}
-
-	override fun hashCode(): Int {
-		var h = hasLines.hashCode()
-		h = 31 * h + centerX.hashCode()
-		h = 31 * h + centerY.hashCode()
-		h = 31 * h + frameWidth.hashCode()
-		h = 31 * h + upperLocal65.contentHashCode()
-		h = 31 * h + lowerLocal65.contentHashCode()
-		h = 31 * h + lineNorm.hashCode()
-		h = 31 * h + hUtVis0.hashCode()
-		h = 31 * h + utSideReserve.hashCode()
-		h = 31 * h + hLtVis0.hashCode()
-		return h
-	}
-}
-
-/**
- * The open mouth read off the art in the head's frame, as the eyes are ([EyeFit]): the first axis runs along the head's
- * level from the mouth's corner on the canvas's left (u = 0) to the other (u = 1), the second points down the face, and
- * a unit is the distance between the corners. The right corner may sit higher or lower ([cornerV]). [upper] and
- * [lower] are the outer edges of the drawn mouth - the top of the upper lip, the bottom of the lower one - sampled at
- * [SAMPLES] places between the corners, finely enough to follow a round mouth's steep sides at its corners.
- */
-data class MouthFit(
-	val originX: Float, val originY: Float,
-	val axisX: Float, val axisY: Float,
-	val width: Float,
-	val upper: List<Float>,
-	val lower: List<Float>,
-	internal val layered: LayeredMouthFrame? = null,
-) {
-	val cornerV: Float get() = upper.last()
-	val hasLines: Boolean get() = layered?.hasLines ?: true
-	private val downX: Float get() = -axisY
-	private val downY: Float get() = axisX
-
-	/** The line through both corners. */
-	fun baseline(u: Float): Float = cornerV * u
-
-	/** How far the drawn mouth opens at its middle, in units of its width. */
-	val opening: Float get() = sample(lower, 0.5f) - sample(upper, 0.5f)
-
-	fun toMouth(x: Float, y: Float): Pair<Float, Float> {
-		val dx = (x - originX) / width; val dy = (y - originY) / width
-		return (dx * axisX + dy * axisY) to (dx * downX + dy * downY)
-	}
-
-	fun toCanvas(u: Float, v: Float): Pair<Float, Float> = (originX + (u * axisX + v * downX) * width) to (originY + (u * axisY + v * downY) * width)
-
-	fun canvasDelta(du: Float, dv: Float): Pair<Float, Float> = ((du * axisX + dv * downX) * width) to ((du * axisY + dv * downY) * width)
-
-	companion object {
-		const val SAMPLES = 49
-		fun u(k: Int) = k.toFloat() / (SAMPLES - 1)
-
-		/** [curve] at [u], linear between samples, held at its ends outside 0..1. */
-		fun sample(curve: List<Float>, u: Float): Float {
-			val f = u.coerceIn(0f, 1f) * (curve.size - 1)
-			val i = f.toInt().coerceAtMost(curve.size - 2)
-			return curve[i] + (curve[i + 1] - curve[i]) * (f - i)
-		}
-	}
-}
+typealias MouthFit = io.github.psd2live.algorithms.binding.MouthFit
+internal typealias LayeredMouthFrame = io.github.psd2live.algorithms.binding.LayeredMouthFrame
+typealias MouthOptions = io.github.psd2live.algorithms.binding.MouthOptions
 
 /** Reads the mouth off the art: [fit] the drawn open mouth, or why it can not be read. */
 object MouthFitting {
@@ -177,15 +55,21 @@ object MouthFitting {
 	 * interior), in the head's [level] (in the rig's space; [toRig] carries canvas points there). A mouth drawn closed
 	 * - a line - has nothing to open from and is left to the legacy rig.
 	 */
-	fun fit(layers: List<ClassifiedLayer>, level: Pair<Float, Float>, toRig: (Float, Float) -> Pair<Float, Float>): Result {
+	fun fit(layers: List<ClassifiedLayer>, level: Pair<Float, Float>, toRig: (Float, Float) -> Pair<Float, Float>): Result =
+		fit(layers, level, toRig, preferLines = true)
+
+	private fun fit(layers: List<ClassifiedLayer>, level: Pair<Float, Float>, toRig: (Float, Float) -> Pair<Float, Float>, preferLines: Boolean): Result {
 		val lines = setOf(PartRole.UPPER_LINE, PartRole.LOWER_LINE)
 		val mouths = layers.filter { it.opaquePixels > 0 && !it.source.clipped && (it.semantic.role == null || it.semantic.role in lines) &&
 			it.semantic.tag in setOf(SemanticTag.MOUTH, SemanticTag.MOUTH_OPEN) && !io.github.psd2live.core.MouthLipLayer.isLipId(it.source.id.raw) }
-		val main = mouths.filter { it.semantic.tag == SemanticTag.MOUTH && it.semantic.role == null }.maxByOrNull { it.opaquePixels }
+		val main = mouths.filter { it.semantic.tag == SemanticTag.MOUTH && it.semantic.role == null && it.source.opacity > 0f }.maxByOrNull { it.opaquePixels }
+			?: mouths.filter { it.semantic.role == null && it.source.opacity > 0f }.maxByOrNull { it.opaquePixels }
+			?: mouths.filter { it.semantic.tag == SemanticTag.MOUTH && it.semantic.role == null }.maxByOrNull { it.opaquePixels }
 			?: mouths.filter { it.semantic.role == null }.maxByOrNull { it.opaquePixels } ?: return Result(null, "no mouth", emptyList())
-		val own = mouths.filter { it === main || it.semantic.variant == main.semantic.variant && it.semantic.side == main.semantic.side &&
-			it.bounds.left < main.bounds.right && main.bounds.left < it.bounds.right && it.bounds.top < main.bounds.bottom && main.bounds.top < it.bounds.bottom }
-		val edges = own.filter { it.semantic.role in lines }.takeIf { drawn -> drawn.any { it.semantic.role == PartRole.UPPER_LINE } &&
+		val own = mouths.filter { (it === main || it.source.opacity > 0f || main.source.opacity <= 0f) &&
+			(it === main || it.semantic.variant == main.semantic.variant && it.semantic.side == main.semantic.side &&
+			it.bounds.left < main.bounds.right && main.bounds.left < it.bounds.right && it.bounds.top < main.bounds.bottom && main.bounds.top < it.bounds.bottom) }
+		val edges = own.filter { it.semantic.role in lines }.takeIf { drawn -> preferLines && drawn.any { it.semantic.role == PartRole.UPPER_LINE } &&
 			drawn.any { it.semantic.role == PartRole.LOWER_LINE } } ?: own
 		val points = ArrayList<Pair<Float, Float>>()
 		val upperLine = ArrayList<Pair<Float, Float>>(); val lowerLine = ArrayList<Pair<Float, Float>>()
@@ -252,9 +136,22 @@ object MouthFitting {
 			}
 		}
 		val baseFit = frame.copy(upper = line(tops), lower = line(bottoms))
-		if (baseFit.opening < 0.12f) return Result(null, "the mouth is drawn closed", own)
+		// Overlaid lip strokes can be closed even when a separate cavity is present.
+		if (edges !== own && baseFit.opening < .12f) return fit(layers, level, toRig, preferLines = false)
+		val art = main.source
+		val origin = toRig(art.bounds.left.toFloat(), art.bounds.top.toFloat())
+		val pixelX = toRig(art.bounds.left + art.bounds.width / art.raster.width.coerceAtLeast(1).toFloat(), art.bounds.top.toFloat())
+		val pixelY = toRig(art.bounds.left.toFloat(), art.bounds.top + art.bounds.height / art.raster.height.coerceAtLeast(1).toFloat())
+		val pixelSize = max(hypot(pixelX.first - origin.first, pixelX.second - origin.second),
+			hypot(pixelY.first - origin.first, pixelY.second - origin.second))
+		// A narrow but resolved cavity is still an opening. Judge the sampled column gap in
+		// source pixels instead of letting curved closed-smile vertical excursion pass as open.
+		val maxGap = (0 until n).maxOf { baseFit.lower[it] - baseFit.upper[it] }
+		if (maxGap * baseFit.width <= 1.5f * pixelSize || maxGap < 0.06f) {
+			return Result(null, "the mouth is drawn closed", own)
+		}
 		if (baseFit.opening > 1.6f) return Result(null, "the mouth is taller than it is wide", own)
-		val layeredFrame = buildLayeredFrame(main, layers, level, toRig)
+		val layeredFrame = buildLayeredFrame(main, layers, level, toRig, useLines = preferLines)
 		return Result(baseFit.copy(layered = layeredFrame), null, own)
 	}
 
@@ -263,9 +160,11 @@ object MouthFitting {
 		allLayers: List<ClassifiedLayer>,
 		level: Pair<Float, Float>,
 		toRig: (Float, Float) -> Pair<Float, Float>,
+		useLines: Boolean,
 	): LayeredMouthFrame? {
 		val related = allLayers.filter {
 			it.opaquePixels > 0 &&
+				(it === main || it.source.opacity > 0f || main.source.opacity <= 0f) &&
 				it.semantic.variant == main.semantic.variant &&
 				it.semantic.side == main.semantic.side &&
 				it.semantic.tag in FittedMouth.TAGS &&
@@ -276,9 +175,10 @@ object MouthFitting {
 		val upperLipLayers = related.filter { it.semantic.role == PartRole.UPPER_LIP }
 		val lowerLipLayers = related.filter { it.semantic.role == PartRole.LOWER_LIP }
 
-		val hasLines = upperLineLayer != null && lowerLineLayer != null
+		val hasLineLayers = upperLineLayer != null && lowerLineLayer != null
+		val hasLines = useLines && hasLineLayers
 		val hasLipSkin = upperLipLayers.isNotEmpty() && lowerLipLayers.isNotEmpty()
-		if (!hasLines && !hasLipSkin) return null
+		if (!hasLineLayers && !hasLipSkin) return null
 
 		val uDense = MouthThreeLayerModel.DEFAULT.uDense
 		val stations = uDense.size
@@ -287,8 +187,8 @@ object MouthFitting {
 		val lowerWorld65: FloatArray
 		val linePx: Float
 		if (hasLines) {
-			val upStroke = extractMedialStroke(upperLineLayer!!, level, toRig, uDense) ?: return null
-			val loStroke = extractMedialStroke(lowerLineLayer!!, level, toRig, uDense) ?: return null
+			val upStroke = extractMedialStroke(upperLineLayer, level, toRig, uDense) ?: return null
+			val loStroke = extractMedialStroke(lowerLineLayer, level, toRig, uDense) ?: return null
 			upperWorld65 = upStroke.first
 			lowerWorld65 = loStroke.first
 			linePx = 0.5f * (upStroke.second + loStroke.second)
@@ -305,23 +205,9 @@ object MouthFitting {
 		val bx = 0.5f * (upperWorld65[lastIdx] + lowerWorld65[lastIdx])
 		val by = 0.5f * (upperWorld65[lastIdx + 1] + lowerWorld65[lastIdx + 1])
 
-		val jointSpan = 4
-		for (i in 0..jointSpan) {
-			val t = i.toFloat() / jointSpan
-			val w = t * t * (3f - 2f * t)
-			val leftW = 1f - w
-			upperWorld65[i * 2] = leftW * ax + w * upperWorld65[i * 2]
-			upperWorld65[i * 2 + 1] = leftW * ay + w * upperWorld65[i * 2 + 1]
-			lowerWorld65[i * 2] = leftW * ax + w * lowerWorld65[i * 2]
-			lowerWorld65[i * 2 + 1] = leftW * ay + w * lowerWorld65[i * 2 + 1]
-
-			val ri = stations - 1 - i
-			val rLast = ri * 2
-			upperWorld65[rLast] = leftW * bx + w * upperWorld65[rLast]
-			upperWorld65[rLast + 1] = leftW * by + w * upperWorld65[rLast + 1]
-			lowerWorld65[rLast] = leftW * bx + w * lowerWorld65[rLast]
-			lowerWorld65[rLast + 1] = leftW * by + w * lowerWorld65[rLast + 1]
-		}
+		// Keep the measured source curves intact. Joining their endpoints here changes
+		// the deformation reference while the raster still contains the original tips.
+		// The transferred closed pose joins the lips; their drawn pose retains its overlap.
 
 		val frameWidth = hypot(bx - ax, by - ay).coerceAtLeast(1f)
 		val exX = (bx - ax) / frameWidth
@@ -517,7 +403,9 @@ object MouthFitting {
 		if (opaqueLums.size >= 8) {
 			val dark = percentile(opaqueLums, 0.15f)
 			val light = percentile(opaqueLums, 0.85f)
-			if (light - dark >= 0.055f) {
+			// Only isolate dark strokes when a genuinely bright skin cushion surrounds them;
+			// subtle anti-aliasing/shading on a standalone U-stroke must not split its arms.
+			if (light >= 0.55f && light - dark >= 0.25f) {
 				val colLums = ArrayList<Float>(h)
 				for (x in 0 until w) {
 					var colMaxA = 0f
@@ -528,6 +416,7 @@ object MouthFitting {
 					if (colLums.size < 2) continue
 					val locDark = percentile(colLums, 0.20f)
 					val locLight = percentile(colLums, 0.85f)
+					if (locLight < 0.50f || locLight - locDark < 0.20f) continue
 					val cutoff = locDark + max(0.035f, 0.28f * (locLight - locDark))
 					for (y in 0 until h) {
 						val idx = y * w + x
@@ -582,8 +471,7 @@ object MouthFitting {
 			it.area >= 0.03f * mainArea && max(it.maxX - it.minX + 1, it.maxY - it.minY + 1) >= 0.08f * rw
 		}.ifEmpty { listOf(comps.maxBy { it.area }) }.sortedBy { it.minX }
 
-		val centersX = ArrayList<Float>()
-		val centersY = ArrayList<Float>()
+		val compPaths = ArrayList<Pair<List<Float>, List<Float>>>()
 		val thicknesses = ArrayList<Float>()
 		val sx = bounds.width / rw.coerceAtLeast(1).toFloat()
 		val sy = bounds.height / rh.coerceAtLeast(1).toFloat()
@@ -697,6 +585,8 @@ object MouthFitting {
 			val nRay = (4f * maxR).toInt() + 1
 			val rSteps = FloatArray(nRay) { -maxR + 2f * maxR * it / (nRay - 1).coerceAtLeast(1) }
 
+			val compX = ArrayList<Float>(mCount)
+			val compY = ArrayList<Float>(mCount)
 			for (m in 0 until mCount) {
 				val iPrev = max(0, m - win)
 				val iNext = min(mCount - 1, m + win)
@@ -741,20 +631,58 @@ object MouthFitting {
 					th = hypot(e1.first - e0.first, e1.second - e0.second)
 				}
 				val worldPt = toRig(bounds.left + (cx - pad) * sx, bounds.top + (cy - pad) * sy)
-				centersX += worldPt.first
-				centersY += worldPt.second
+				compX += worldPt.first
+				compY += worldPt.second
 				thicknesses += th
 			}
+			compPaths += compX to compY
 		}
 
-		if (centersX.size < 2) return null
-		// Ensure overall left-to-right ordering along head level
-		val firstAlong = centersX.first() * level.first + centersY.first() * level.second
-		val lastAlong = centersX.last() * level.first + centersY.last() * level.second
-		if (firstAlong > lastAlong) {
-			centersX.reverse()
-			centersY.reverse()
+		if (compPaths.isEmpty()) return null
+		val centersX = ArrayList<Float>()
+		val centersY = ArrayList<Float>()
+		fun alongPt(x: Float, y: Float) = x * level.first + y * level.second
+		if (compPaths.size == 1) {
+			centersX.addAll(compPaths[0].first)
+			centersY.addAll(compPaths[0].second)
+			val firstAlong = alongPt(centersX.first(), centersY.first())
+			val lastAlong = alongPt(centersX.last(), centersY.last())
+			if (firstAlong > lastAlong) {
+				centersX.reverse()
+				centersY.reverse()
+			}
+		} else {
+			// Chain split components by nearest-endpoint continuity from the leftmost tip.
+			val remaining = compPaths.toMutableList()
+			val seedIdx = remaining.indices.minBy { idx ->
+				val (xsC, ysC) = remaining[idx]
+				min(alongPt(xsC.first(), ysC.first()), alongPt(xsC.last(), ysC.last()))
+			}
+			val (seedX, seedY) = remaining.removeAt(seedIdx)
+			if (alongPt(seedX.first(), seedY.first()) <= alongPt(seedX.last(), seedY.last())) {
+				centersX.addAll(seedX); centersY.addAll(seedY)
+			} else {
+				centersX.addAll(seedX.asReversed()); centersY.addAll(seedY.asReversed())
+			}
+			while (remaining.isNotEmpty()) {
+				val curX = centersX.last(); val curY = centersY.last()
+				var bestIdx = 0; var bestFlip = false; var bestD2 = Float.POSITIVE_INFINITY
+				for (idx in remaining.indices) {
+					val (xsC, ysC) = remaining[idx]
+					val d2First = (xsC.first() - curX) * (xsC.first() - curX) + (ysC.first() - curY) * (ysC.first() - curY)
+					if (d2First < bestD2) { bestD2 = d2First; bestIdx = idx; bestFlip = false }
+					val d2Last = (xsC.last() - curX) * (xsC.last() - curX) + (ysC.last() - curY) * (ysC.last() - curY)
+					if (d2Last < bestD2) { bestD2 = d2Last; bestIdx = idx; bestFlip = true }
+				}
+				val (nextX, nextY) = remaining.removeAt(bestIdx)
+				if (bestFlip) {
+					centersX.addAll(nextX.asReversed()); centersY.addAll(nextY.asReversed())
+				} else {
+					centersX.addAll(nextX); centersY.addAll(nextY)
+				}
+			}
 		}
+		if (centersX.size < 2) return null
 
 		val cxArr = centersX.toFloatArray()
 		val cyArr = centersY.toFloatArray()
