@@ -94,14 +94,13 @@ internal object CanvasEdits {
                 val originY = origin?.get(1)?.jsonPrimitive?.float ?: 0f
                 val baseAngle = edit["angle"]?.jsonPrimitive?.float ?: 0f
                 val handleLength = edit["handle_length"]?.jsonPrimitive?.float
-                require(handleLength == null || (handleLength.isFinite() && handleLength > 1e-6f))
-                require(listOf(originX, originY, baseAngle).all(Float::isFinite))
 
                 when (addTo) {
                     "parent_of_deformer" -> {
                         val childId = edit.getValue("deformer_id").jsonPrimitive.content.let(::DeformerId)
                         val child = model.deformers.singleOrNull { it.id == childId }
                             ?: error("Deformer not found: ${childId.raw}")
+                        RigCoordinateLimits.validateRotationCreation(model, child.parent, originX, originY, baseAngle, handleLength)
                         val partId = edit["part_id"]?.jsonPrimitive?.contentOrNull?.let(::PartId) ?: child.partId
                         require(partId == null || model.parts.any { it.id == partId }) { "Part not found: $partId" }
                         val rotation = Deformer.Rotation(
@@ -136,6 +135,7 @@ internal object CanvasEdits {
                             "Select meshes with the same parent deformer"
                         }
                         val meshParent = drawables.first().parentDeformerId
+                        RigCoordinateLimits.validateRotationCreation(model, meshParent, originX, originY, baseAngle, handleLength)
                         val partId = edit["part_id"]?.jsonPrimitive?.contentOrNull?.let(::PartId)
                             ?: meshParent?.let { p -> model.deformers.firstOrNull { it.id == p }?.partId }
                             ?: model.partByDrawable()[drawables.first().id]
@@ -188,16 +188,10 @@ internal object CanvasEdits {
                             customBounds.getValue("h").jsonPrimitive.float,
                         )
                     } else when (parent) {
-                        is Deformer.Warp -> {
-                            val pts = parent.geometryGrid?.cells?.firstOrNull()?.form?.controlPoints
-                                ?: floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
-                            val xs = pts.filterIndexed { i, _ -> i % 2 == 0 }
-                            val ys = pts.filterIndexed { i, _ -> i % 2 == 1 }
-                            listOf(xs.min(), ys.min(), (xs.max() - xs.min()).coerceAtLeast(1e-3f), (ys.max() - ys.min()).coerceAtLeast(1e-3f))
-                        }
+                        is Deformer.Warp -> listOf(0f, 0f, 1f, 1f)
                         is Deformer.Rotation -> listOf(-50f, -50f, 100f, 100f)
                     }
-                    require(listOf(x, y, w, h).all(Float::isFinite) && w > 1e-6f && h > 1e-6f)
+                    RigCoordinateLimits.validateWarpBounds(model, parentId, x, y, w, h)
                     val points = (0..rows).flatMap { r -> (0..cols).flatMap { c -> listOf(x+c*w/cols, y+r*h/rows) } }.toFloatArray()
                     val warp = Deformer.Warp(DeformerId(id), edit.getValue("name").jsonPrimitive.content, parentId, partId, rows, cols, true,
                         KeyformGrid(emptyList(), listOf(KeyformCell(intArrayOf(), WarpLatticeForm(points)))))
@@ -232,11 +226,12 @@ internal object CanvasEdits {
                             is Deformer.Rotation -> {
                                 val ox = child.geometryGrid?.cells?.firstOrNull()?.form?.originX ?: 0f
                                 val oy = child.geometryGrid?.cells?.firstOrNull()?.form?.originY ?: 0f
-                                listOf(ox - 50f, oy - 50f, 100f, 100f)
+                                if (RigCoordinateLimits.parentIsWarp(model, child.parent)) listOf(ox - 0.25f, oy - 0.25f, 0.5f, 0.5f)
+                                else listOf(ox - 50f, oy - 50f, 100f, 100f)
                             }
                         }
                     }
-                    require(listOf(x, y, w, h).all(Float::isFinite) && w > 1e-6f && h > 1e-6f)
+                    RigCoordinateLimits.validateWarpBounds(model, child.parent, x, y, w, h)
                     val points = (0..rows).flatMap { r -> (0..cols).flatMap { c -> listOf(x+c*w/cols, y+r*h/rows) } }.toFloatArray()
                     val warp = Deformer.Warp(DeformerId(id), edit.getValue("name").jsonPrimitive.content, child.parent, partId, rows, cols, true,
                         KeyformGrid(emptyList(), listOf(KeyformCell(intArrayOf(), WarpLatticeForm(points)))))
@@ -321,7 +316,7 @@ internal object CanvasEdits {
                         else -> listOf(baseBounds[0] - baseBounds[2] * 0.05f, baseBounds[1] - baseBounds[3] * 0.05f, baseBounds[2] * 1.1f, baseBounds[3] * 1.1f)
                     }
                 }
-                require(listOf(x, y, w, h).all(Float::isFinite) && w > 1e-6f && h > 1e-6f) { "Warp bounds must have positive width and height" }
+                RigCoordinateLimits.validateWarpBounds(model, parent, x, y, w, h)
                 val points = (0..rows).flatMap { r -> (0..cols).flatMap { c -> listOf(x+c*w/cols, y+r*h/rows) } }.toFloatArray()
                 val warp = Deformer.Warp(DeformerId(id), edit.getValue("name").jsonPrimitive.content, parent, partId, rows, cols, true, KeyformGrid(emptyList(), listOf(KeyformCell(intArrayOf(), WarpLatticeForm(points)))))
                 model.copy(deformers=model.deformers+warp,drawables=model.drawables.map { d -> if(d.id.raw !in ids)d else {
@@ -369,6 +364,7 @@ internal object CanvasEdits {
                         angle - (blend?.angle ?: 0f),
                         scale - (blend?.scale ?: 0f),
                     )
+                    RigCoordinateLimits.validateRotationPivotForm(model, rotation.parent, "rotation:$id", form.originX, form.originY, form.angle, form.scale)
                     if(key.isEmpty())model.copy(deformers=model.deformers.map { if(it.id==rotation.id)rotation.copy(geometryGrid=KeyformGrid(emptyList(),listOf(KeyformCell(intArrayOf(),form)))) else it })
                     else applyKeyformSet(model,RigKeyformSetEdit(RigTargetRef(RigTargetKind.ROTATION_DEFORMER,id),key,RigKeyformGeometryEdit(originX=form.originX,originY=form.originY,angle=form.angle,scale=form.scale)))
                 } else if (kind == "warp") {
@@ -378,6 +374,7 @@ internal object CanvasEdits {
                         val offset = RigGeometryTools.blendOffset(model, "warp", id, pose)
                         FloatArray(points.size) { index -> points[index] - offset.getOrElse(index) { 0f } }
                     }
+                    RigCoordinateLimits.validateLocalPoints(model, oldWarp?.parent, "warp:$id", warpPoints)
                     val updated = if (key.isNotEmpty()) {
                         applyKeyformSet(model, RigKeyformSetEdit(RigTargetRef(RigTargetKind.WARP_DEFORMER, id), key, RigKeyformGeometryEdit(controlPoints = warpPoints.toList())), capturePose = pose)
                     } else {
@@ -407,10 +404,14 @@ internal object CanvasEdits {
                         updated
                     }
                 } else if (key.isNotEmpty()) {
+                    val drawable = model.drawables.firstOrNull { it.id.raw == id }
+                    RigCoordinateLimits.validateLocalPoints(model, drawable?.parentDeformerId, "mesh:$id", points)
                     val offset = if (blendEdit) FloatArray(0) else RigGeometryTools.blendOffset(model, "mesh", id, pose)
                     applyKeyformSet(model, RigKeyformSetEdit(RigTargetRef(RigTargetKind.fromString(kind), id), key,
                         RigKeyformGeometryEdit(positionDeltas = points.indices.map { points[it] - geometry.base[it] - offset.getOrElse(it) { 0f } })), capturePose = pose)
                 } else {
+                    val drawable = model.drawables.firstOrNull { it.id.raw == id }
+                    RigCoordinateLimits.validateLocalPoints(model, drawable?.parentDeformerId, "mesh:$id", points)
                     // The mesh moves by how far its DISPLAYED geometry moved, not to the displayed points.
                     // Assigning the displayed points to the rest mesh would apply a keyed default delta a
                     // second time and make the geometry jump out from under the pointer; taking the shift

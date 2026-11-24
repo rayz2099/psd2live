@@ -1,11 +1,13 @@
 package io.github.psd2live.application
 
+import io.github.psd2live.core.RigCoordinateLimits
 import io.github.psd2live.core.SkeletonRig
 import io.github.psd2live.core.StableIds
 import kotlinx.serialization.json.*
 import org.umamo.render.eval.buildDeformerWorlds
 import org.umamo.runtime.model.ParameterId
 import org.umamo.runtime.model.PuppetModel
+import kotlin.math.abs
 
 /** Materialize canvas requests against the model belonging to this candidate document. */
 internal object WorkspaceCanvasCommands {
@@ -60,6 +62,10 @@ internal object WorkspaceCanvasCommands {
     private fun parentLocalOrigin(model: PuppetModel, request: JsonObject, origin: JsonArray): JsonArray {
         require(origin.size == 2) { "Rotation origin must be [x, y]" }
         val x = origin[0].jsonPrimitive.float; val y = origin[1].jsonPrimitive.float
+        val canvasLimit = RigCoordinateLimits.maxCanvasCoord(RigCoordinateLimits.canvasSpan(model))
+        require(x.isFinite() && y.isFinite() && abs(x) <= canvasLimit && abs(y) <= canvasLimit) {
+            "Rotation origin [$x, $y] exceeds canvas coordinate limit +/-$canvasLimit"
+        }
         val parent = if (request["add_to"]?.jsonPrimitive?.contentOrNull == "parent_of_deformer")
             model.deformers.firstOrNull { it.id.raw == request["deformer_id"]?.jsonPrimitive?.contentOrNull }?.parent
         else request["meshes"]?.jsonArray?.firstOrNull()?.jsonPrimitive?.contentOrNull
@@ -67,6 +73,10 @@ internal object WorkspaceCanvasCommands {
         val defaults: (ParameterId) -> Float = { id -> model.parameters.firstOrNull { it.id == id }?.default ?: 0f }
         val world = parent?.let { buildDeformerWorlds(model.deformers, defaults, defaults)[it] } ?: return origin
         val local = SkeletonRig.inverse(world, x, y)
+        val localLimit = RigCoordinateLimits.localCoordLimit(model, parent)
+        require(local.size == 2 && local.all { it.isFinite() && abs(it) <= localLimit }) {
+            "Rotation origin [$x, $y] projects outside parent deformer local space (+/-$localLimit)"
+        }
         return JsonArray(local.map(::JsonPrimitive))
     }
 }

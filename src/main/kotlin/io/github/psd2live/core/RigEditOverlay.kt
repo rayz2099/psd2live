@@ -826,6 +826,7 @@ internal fun applyKeyformSet(model: PuppetModel, set: RigKeyformSetEdit, capture
 						"Warp ${set.target.id} control points size mismatch: expected $expectedSize, got ${geo.controlPoints.size}"
 					}
 					val form = WarpLatticeForm(geo.controlPoints.toFloatArray())
+					RigCoordinateLimits.validateLocalPoints(current, deformer.parent, "warp:${set.target.id}", form.controlPoints)
 					val identity = FloatArray(expectedSize)
 					for (r in 0..deformer.rows) for (c in 0..deformer.columns) {
 						val i = (r * (deformer.columns + 1) + c) * 2
@@ -856,6 +857,7 @@ internal fun applyKeyformSet(model: PuppetModel, set: RigKeyformSetEdit, capture
 				val deformer = current.deformers.firstOrNull { it.id.raw == set.target.id } as? Deformer.Rotation
 				if (deformer != null && geo.angle != null && geo.originX != null && geo.originY != null) {
 					val form = RotationPivotForm(geo.originX, geo.originY, geo.angle, geo.scale ?: 1f)
+					RigCoordinateLimits.validateRotationPivotForm(current, deformer.parent, "rotation:${set.target.id}", form.originX, form.originY, form.angle, form.scale)
 					var grid: KeyformGrid<RotationPivotForm>? = deformer.geometryGrid
 					for ((paramName, _) in gridSet.coordinate) {
 						val param = current.parameters.firstOrNull { it.id.raw == paramName }
@@ -881,6 +883,15 @@ internal fun applyKeyformSet(model: PuppetModel, set: RigKeyformSetEdit, capture
 					val expectedDeltas = (drawable.mesh?.positions?.size ?: geo.positionDeltas.size)
 					require(geo.positionDeltas.size == expectedDeltas) {
 						"Mesh ${set.target.id} position deltas size mismatch: expected $expectedDeltas, got ${geo.positionDeltas.size}"
+					}
+					require(geo.positionDeltas.all(Float::isFinite)) {
+						"Mesh ${set.target.id} position deltas must be finite"
+					}
+					drawable.mesh?.positions?.let { base ->
+						if (base.size == expectedDeltas) {
+							val shifted = FloatArray(expectedDeltas) { base[it] + geo.positionDeltas[it] }
+							RigCoordinateLimits.validateLocalPoints(current, drawable.parentDeformerId, "mesh:${set.target.id}", shifted)
+						}
 					}
 					val form = MeshDeltaForm(geo.positionDeltas.toFloatArray())
 					val neutralForm = MeshDeltaForm(FloatArray(expectedDeltas))

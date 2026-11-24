@@ -370,7 +370,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         operation("curve", buildJsonObject { put("axis", choices("x", "y")); put("controls", vector(4)) }, listOf("controls")),
         operation("landmarks", buildJsonObject { put("from", arraySchema(vector(2), 1, 16)); put("to", arraySchema(vector(2), 1, 16)) }, listOf("from", "to"))
     )), 1, 16)
-    registerJsonOperation("deform", "Edit whole ArtMesh/Warp surfaces at exact keys, atomically across changes. All points participate including empty cage regions. Units: fixed input bounds, normalized x-right/y-down; rotations in degrees. arc bends cross-sections along root→tip; root_pin is a fixed length fraction. Optional brush hardness gives a broad plateau. selection.indices picks points by index (mesh_get_topology lists a mesh's); with soft_radius and falloff the points around them follow, as the editor's soft selection carries them, and landmarks moves picked points the way the temporary lattice does. Unspecified directly bound axes are an error. This edits local shapes; parent motion is inherited.",
+    registerJsonOperation("deform", "Edit whole ArtMesh/Warp surfaces at exact keys, atomically across changes. All points participate including empty cage regions. Units: fixed input bounds, normalized x-right/y-down (e.g. delta [0.05, 0], NOT canvas pixels; normalized coords/factors/controls/landmarks are hard-capped); rotations in degrees (<= 3600). arc bends cross-sections along root→tip; root_pin is a fixed length fraction. Optional brush hardness gives a broad plateau. selection.indices picks points by index (mesh_get_topology lists a mesh's); with soft_radius and falloff the points around them follow, as the editor's soft selection carries them, and landmarks moves picked points the way the temporary lattice does. Unspecified directly bound axes are an error. This edits local shapes; parent motion is inherited.",
         buildJsonObject {
             put("state", string()); put("changes", arraySchema(objectSchema(buildJsonObject {
                 put("target", string()); put("key", key); put("operations", operations); put("selection", selection)
@@ -631,7 +631,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         }
         workspace.authorRig(a.text("state"), JsonArray(listOf(command)), MutationAuthor.AGENT).compact()
     }
-    registerJsonOperation("appearance", "Rename, show/hide or reorganize objects in one ordered edit. For an animated switch use form opacity keys instead of static visibility. Local reparenting changes inherited motion.",
+    registerJsonOperation("appearance", "Rename, show/hide or reorganize objects in one ordered edit. For an animated switch use form opacity keys instead of static visibility. Moving a deformer with space=local does NOT convert canvas pixels into parent Warp [0..1] local space and is rejected if coordinates exceed parent space.",
         buildJsonObject { put("state", string()); put("edits", objectEditSchema().properties.getValue("edits")) }, listOf("state", "edits"), true) { a ->
         workspace.authorRig(a.text("state"), buildJsonArray { add(buildJsonObject { put("op", "structure"); put("edits", a.getValue("edits")) }) }, MutationAuthor.AGENT).compact()
     }
@@ -651,7 +651,7 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
         put("partner_id", string()); put("linked", boolean()); put("open", boolean())
         put("label_type", string()); put("color", integer(Int.MIN_VALUE))
     }, listOf("action", "kind", "id"))
-    registerJsonOperation("structure", "Edit static object properties (opacity, draw order, colors, blend mode, clipping masks masked_by/invert_mask, culling), delete deformers, assign a deformer Part, or organize parameter folders and 2D links. Edits are ordered and use the same persistent structure journal as the UI. Parameter definitions use parameter instead. " + WorkspaceDrawOrderSchemas.GUIDE,
+    registerJsonOperation("structure", "Edit static object properties (opacity, draw order, colors, blend mode, clipping masks masked_by/invert_mask, culling), delete deformers, assign a deformer Part, or organize parameter folders and 2D links. Edits are ordered and use the same persistent structure journal as the UI. Parameter definitions use parameter instead. Moving a deformer with space=local preserves raw coordinates without converting canvas pixels into parent Warp [0..1] space; create top-down or wrap via canvas(mode='warp', add_to='parent_of_deformer'). " + WorkspaceDrawOrderSchemas.GUIDE,
         buildJsonObject { put("state", string()); put("edits", arraySchema(structureEdit, 1, 128)) }, listOf("state", "edits"), true) { a ->
         val edits = a.getValue("edits").jsonArray
         require(edits.none { edit ->
@@ -663,9 +663,9 @@ internal fun registerAuthoringOperations(registry: WorkspaceOperationRegistry, w
             add(buildJsonObject { put("op", "structure"); put("edits", edits) })
         }, MutationAuthor.AGENT).compact()
     }
-    val canvasBounds = objectSchema(buildJsonObject {
+    val canvasBounds = JsonObject(objectSchema(buildJsonObject {
         listOf("x", "y", "w", "h").forEach { put(it, number()) }
-    }, listOf("x", "y", "w", "h"))
+    }, listOf("x", "y", "w", "h")) + ("description" to JsonPrimitive("Bounds in parent-local units: normalized [0..1] when under a Warp parent (omit to inherit [0,0,1,1]), or canvas pixels at root / under a Rotation.")))
     val canvasBranches = listOf(
         variant("mode", "warp", buildJsonObject {
             put("state", string()); put("id", string()); put("name", string())

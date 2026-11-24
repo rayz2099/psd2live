@@ -41,13 +41,14 @@ import org.umamo.runtime.model.*
 
 /** Ordered document edits. Stored verbatim in history and replayed after rig construction. */
 internal object RigStructureEdits {
-    fun apply(model: PuppetModel, edits: List<JsonObject>): PuppetModel = edits.fold(model, ::applyOne)
+    fun apply(model: PuppetModel, edits: List<JsonObject>): PuppetModel =
+        edits.fold(model) { current, edit -> applyOne(current, edit, validateBounds = true) }
 
     /** A recorded mesh edit may outlive a temporarily removed source layer. Keep it for later rebuilds. */
     fun replay(model: PuppetModel, edits: List<JsonObject>): PuppetModel = edits.fold(model) { current, edit ->
         val missingMesh = edit["kind"]?.jsonPrimitive?.contentOrNull == "mesh" &&
             edit["id"]?.jsonPrimitive?.contentOrNull?.let { id -> current.drawables.none { it.id.raw == id } } == true
-        if (missingMesh || vanishedParent(current, edit)) current else applyOne(current, edit)
+        if (missingMesh || vanishedParent(current, edit)) current else applyOne(current, edit, validateBounds = false)
     }
 
     /**
@@ -64,7 +65,7 @@ internal object RigStructureEdits {
         return model.deformers.none { it.id.raw == parent }
     }
 
-    private fun applyOne(model: PuppetModel, edit: JsonObject): PuppetModel {
+    private fun applyOne(model: PuppetModel, edit: JsonObject, validateBounds: Boolean): PuppetModel {
         val action = edit.string("action")
         if(action == "create_warp") return RigWarpEdit.fromJson(JsonObject(edit - "action")).applyTo(model)
         val kind = edit.string("kind")
@@ -190,6 +191,9 @@ internal object RigStructureEdits {
                 }
                 val p = parent()?.let(::DeformerId)
                 require(p == null || model.deformers.any { it.id == p }) { "Parent deformer not found" }
+                if (validateBounds && space == "local" && mesh!!.parentDeformerId != p) {
+                    RigCoordinateLimits.validateDrawableBindLocal(model, mesh, p)
+                }
                 val rebound = model.copy(drawables = model.drawables.map { if(it.id == mesh!!.id) it.copy(parentDeformerId = p) else it }).withDerivedRenderRoot()
                 if (space == "canvas" && mesh!!.parentDeformerId != p) carriedToParent(model, rebound, mesh.id) else rebound
             }
@@ -203,6 +207,7 @@ internal object RigStructureEdits {
                     require(parentId == null || model.deformers.any { it.id == parentId }) { "Parent deformer not found" }
                     require(parentId == null || parentId !in model.deformerSelfAndDescendants(deformer!!.id)) { "Deformer cycle" }
                     require(before == null || model.deformers.any { it.id.raw == before && it.parent == parentId }) { "before_id must be a destination sibling" }
+                    if (validateBounds) RigCoordinateLimits.validateDeformerMove(model, deformer!!, parentId)
                     model.withDeformerMoved(deformer!!.id, parentId, before?.let(::DeformerId)).withDerivedRenderRoot()
                 } else {
                     require("space" !in edit) { "Organizational moves do not change deformation space" }

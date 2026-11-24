@@ -15,6 +15,7 @@ import io.github.psd2live.core.LayerSpace
 import io.github.psd2live.core.textureLayer
 import io.github.psd2live.project.WorkspaceViewReferenceMode
 import io.github.psd2live.core.PreviewRenderer
+import io.github.psd2live.core.RigCoordinateLimits
 import io.github.psd2live.core.RigPreviewModel
 import io.github.psd2live.core.CanvasViewport
 import io.github.psd2live.core.RigCanvasSupport
@@ -118,9 +119,9 @@ object WorkspaceViewRenderer {
 			evaluated.drawOrder, evaluated.opacity, evaluated.multiplyColor, evaluated.screenColor)
 		val drawableBounds = RigCanvasSupport.boundsByDrawable(geometry)
 		val boundsByLayer = boundsByLayer(model, drawableBounds)
-		val resolvedFrame = resolveFrame(frame, boundsByLayer)
 		val canvasWidth = model.analysis.source.widthPx.coerceAtLeast(1).toFloat()
 		val canvasHeight = model.analysis.source.heightPx.coerceAtLeast(1).toFloat()
+		val resolvedFrame = resolveFrame(frame, boundsByLayer, canvasWidth, canvasHeight)
 		val target = targetRaster(resolvedFrame.viewRect, output.targetLongEdge, canvasWidth, canvasHeight)
 		val image = when (background) {
 			WorkspaceViewBackground.TRANSPARENT -> BufferedImage(target.width, target.height, BufferedImage.TYPE_INT_ARGB)
@@ -384,7 +385,7 @@ object WorkspaceViewRenderer {
 			(layer.bounds.top + layer.bounds.height).toFloat(),
 		) else LayerSpace.of(layer).canvasBounds()
 		if (!CanvasDensity.dense(layer)) requireMatchingAspect(foreground.width, foreground.height, canvasRect)
-		val size = targetPixelSize(canvasRect, output.targetLongEdge)
+		val size = targetPixelSize(canvasRect, output.targetLongEdge, canvasWidth.toFloat(), canvasHeight.toFloat())
 		val image = when (background) {
 			WorkspaceViewBackground.TRANSPARENT -> BufferedImage(size.first, size.second, BufferedImage.TYPE_INT_ARGB)
 			WorkspaceViewBackground.CHECKERBOARD -> checkerboard(size.first, size.second)
@@ -423,8 +424,10 @@ object WorkspaceViewRenderer {
 		output: WorkspaceViewOutputSpec,
 	): WorkspaceRenderedView {
 		validateOutput(output)
-		val viewRect = focusViewRect(focusRect, objectScale, aspectRatio)
-		val target = targetRaster(viewRect, output.targetLongEdge, composite.width.toFloat(), composite.height.toFloat())
+		val canvasWidth = composite.width.toFloat()
+		val canvasHeight = composite.height.toFloat()
+		val viewRect = focusViewRect(focusRect, objectScale, aspectRatio, canvasWidth, canvasHeight)
+		val target = targetRaster(viewRect, output.targetLongEdge, canvasWidth, canvasHeight)
 		val image = when (background) {
 			WorkspaceViewBackground.TRANSPARENT -> BufferedImage(target.width, target.height, BufferedImage.TYPE_INT_ARGB)
 			WorkspaceViewBackground.CHECKERBOARD -> checkerboard(target.width, target.height)
@@ -653,10 +656,10 @@ object WorkspaceViewRenderer {
 		val viewport: CanvasViewport,
 	)
 
-	private fun resolveFrame(frame: WorkspaceViewFrame, boundsByLayer: Map<String, Bounds>): ResolvedFrame =
+	private fun resolveFrame(frame: WorkspaceViewFrame, boundsByLayer: Map<String, Bounds>, canvasWidth: Float, canvasHeight: Float): ResolvedFrame =
 		when (frame) {
 			is WorkspaceViewFrame.CanvasRect -> {
-				validateRect(frame.rect)
+				validateRect(frame.rect, canvasWidth, canvasHeight)
 				ResolvedFrame(frame.rect)
 			}
 
@@ -666,7 +669,7 @@ object WorkspaceViewRenderer {
 				require(missing.isEmpty()) { "Focus layers have no evaluated geometry: ${missing.sorted().joinToString()}" }
 				val focus = frame.layerIds.map(boundsByLayer::getValue).reduce(Bounds::union)
 				ResolvedFrame(
-					viewRect = focusViewRect(focus, frame.objectScale, frame.aspectRatio),
+					viewRect = focusViewRect(focus, frame.objectScale, frame.aspectRatio, canvasWidth, canvasHeight),
 					focusRect = focus,
 					focusLayerIds = frame.layerIds.sorted(),
 					objectScale = frame.objectScale,
@@ -674,8 +677,8 @@ object WorkspaceViewRenderer {
 			}
 		}
 
-	private fun focusViewRect(focus: Bounds, objectScale: Float, aspectRatio: Float): Bounds {
-		validateRect(focus)
+	private fun focusViewRect(focus: Bounds, objectScale: Float, aspectRatio: Float, canvasWidth: Float, canvasHeight: Float): Bounds {
+		validateRect(focus, canvasWidth, canvasHeight)
 		require(objectScale.isFinite() && objectScale in 0.05f..4f) { "object_scale must be between 0.05 and 4" }
 		require(aspectRatio.isFinite() && aspectRatio in 0.1f..10f) { "aspect_ratio must be between 0.1 and 10" }
 		var width = focus.width.coerceAtLeast(1f)
@@ -697,7 +700,7 @@ object WorkspaceViewRenderer {
 		canvasWidth: Float,
 		canvasHeight: Float,
 	): TargetRaster {
-		validateRect(requestedRect)
+		validateRect(requestedRect, canvasWidth, canvasHeight)
 		val scale = targetLongEdge.toDouble() / maxOf(requestedRect.width, requestedRect.height).toDouble()
 		val width = maxOf(1, (requestedRect.width * scale).roundToInt())
 		val height = maxOf(1, (requestedRect.height * scale).roundToInt())
@@ -725,8 +728,8 @@ object WorkspaceViewRenderer {
 		)
 	}
 
-	private fun targetPixelSize(rect: Bounds, targetLongEdge: Int): Pair<Int, Int> {
-		validateRect(rect)
+	private fun targetPixelSize(rect: Bounds, targetLongEdge: Int, canvasWidth: Float, canvasHeight: Float): Pair<Int, Int> {
+		validateRect(rect, canvasWidth, canvasHeight)
 		val scale = targetLongEdge.toFloat() / maxOf(rect.width, rect.height)
 		return maxOf(1, (rect.width * scale).roundToInt()) to maxOf(1, (rect.height * scale).roundToInt())
 	}
@@ -745,10 +748,8 @@ object WorkspaceViewRenderer {
 		require(output.maxBytes in 64 * 1024..16 * 1024 * 1024) { "max_bytes must be between 65536 and 16777216" }
 	}
 
-	private fun validateRect(rect: Bounds) {
-		require(
-			listOf(rect.left, rect.top, rect.right, rect.bottom).all(Float::isFinite) && rect.width > 0f && rect.height > 0f,
-		) { "Canvas rectangle must contain finite coordinates and have positive width and height" }
+	private fun validateRect(rect: Bounds, canvasWidth: Float, canvasHeight: Float) {
+		RigCoordinateLimits.validateViewportRect(rect, canvasWidth, canvasHeight)
 	}
 
 	private fun requireMatchingAspect(pixelWidth: Int, pixelHeight: Int, canvasRect: Bounds) {

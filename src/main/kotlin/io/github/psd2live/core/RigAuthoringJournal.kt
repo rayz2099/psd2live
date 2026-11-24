@@ -2,6 +2,7 @@ package io.github.psd2live.core
 
 import kotlinx.serialization.json.*
 import org.umamo.runtime.model.*
+import kotlin.math.abs
 import io.github.psd2live.core.legacy.RigGenerationJournal
 import io.github.psd2live.core.legacy.RigGenerationFrames
 import io.github.psd2live.core.legacy.RigGenerationScaffold
@@ -195,6 +196,10 @@ internal object RigAuthoringJournal {
                             is JsonObject -> elem.getValue("x").jsonPrimitive.float to elem.getValue("y").jsonPrimitive.float
                             else -> error("Moved point must be [x, y] or {x, y}")
                         }
+                    }
+                    val coordLimit = RigCoordinateLimits.maxCanvasCoord(RigCoordinateLimits.canvasSpan(current))
+                    require(movedPoints.all { (x, y) -> x.isFinite() && y.isFinite() && abs(x) <= coordLimit && abs(y) <= coordLimit }) {
+                        "path_deform moved_points must contain finite coordinates within +/-$coordLimit"
                     }
                     val deformed = DeformPathTools.deform(geometry.base, current.deformPaths, pathId, movedPoints, org.umamo.render.eval.DeformPathMetrics.canvasScale(current, current.drawables.single { it.id.raw == ref.id }))
                     buildJsonObject {

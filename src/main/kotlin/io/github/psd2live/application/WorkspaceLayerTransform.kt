@@ -23,6 +23,22 @@ internal object WorkspaceLayerTransform {
 
     fun apply(document: WorkspaceDocument, model: RigPreviewModel, request: JsonObject): WorkspaceDocument {
         val layerId = request.getValue("layer_id").jsonPrimitive.content
+        val canvasWidth = document.source.widthPx.toFloat()
+        val canvasHeight = document.source.heightPx.toFloat()
+        request["matrix"]?.let { matrix ->
+            RigCoordinateLimits.validateLayerTransformMatrix(canvasWidth, canvasHeight, matrix.jsonArray.map { it.jsonPrimitive.float })
+        } ?: run {
+            fun pair(name: String, default: Float): Pair<Float, Float> = when (val value = request[name]) {
+                null, JsonNull -> default to default
+                is JsonArray -> { require(value.size == 2) { "$name takes [x, y]" }; value[0].jsonPrimitive.float to value[1].jsonPrimitive.float }
+                else -> value.jsonPrimitive.float.let { it to it }
+            }
+            val (tx, ty) = pair("translate", 0f)
+            val (sx, sy) = pair("scale", 1f)
+            val (px, py) = request["pivot"]?.let { pair("pivot", 0f) } ?: (0f to 0f)
+            val rotateDeg = request["rotate"]?.jsonPrimitive?.float ?: 0f
+            RigCoordinateLimits.validateLayerTransform(canvasWidth, canvasHeight, tx, ty, sx, sy, px, py, rotateDeg)
+        }
         val delta = transform(request)
         if (delta.isIdentity) return document
         val layer = document.source.layers.singleOrNull { it.id.raw == layerId } ?: throw IllegalArgumentException("Layer not found: $layerId")
@@ -45,9 +61,14 @@ internal object WorkspaceLayerTransform {
         // World space is canvas with y up.
         val world = mapping.localToWorld(geometry.points)
         val target = FloatArray(world.size)
+        val worldLimit = RigCoordinateLimits.maxWorldCoord(RigCoordinateLimits.canvasSpan(puppet))
         for (i in 0 until world.size / 2) {
             val x = world[i * 2]; val y = -world[i * 2 + 1]
-            target[i * 2] = delta.x(x, y); target[i * 2 + 1] = -delta.y(x, y)
+            val tx = delta.x(x, y); val ty = -delta.y(x, y)
+            require(tx.isFinite() && ty.isFinite() && abs(tx) <= worldLimit && abs(ty) <= worldLimit) {
+                "Mesh $id transformed position ($tx, ${-ty}) exceeds world coordinate limit +/-$worldLimit"
+            }
+            target[i * 2] = tx; target[i * 2 + 1] = ty
         }
         val all = (0 until world.size / 2).toSet()
         val local = mapping.worldToLocalLinearized(target, geometry.points, geometry.points, all)

@@ -267,6 +267,7 @@ internal object RigGeometryTools {
                 require(from.size in 1..64 && from.size==to.size && (from+to).all { it.size==2 && it.all(Float::isFinite) }) { "from/to need matching lists of 1..64 finite point pairs" }
                 require(from.distinct().size==from.size) { "Source landmarks must be distinct" }
             }
+            RigCoordinateLimits.validateDeformOp(type, delta, factors, pivot, amount, degrees, curve, root, tip, from, to)
             val before = result.copyOf()
             for (i in weights.indices) {
                 val j = i*2; val x = before[j]; val y = before[j+1]

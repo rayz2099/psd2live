@@ -147,6 +147,7 @@ internal object RigCanvasSupport {
 					viewport.x(positions[ib * 2]), viewport.yFromWorld(positions[ib * 2 + 1]),
 					viewport.x(positions[ic * 2]), viewport.yFromWorld(positions[ic * 2 + 1]),
 				)
+				if (target.any { !it.isFinite() || abs(it) > 1e6 }) continue
 				val transform = triangleTransform(source, target) ?: continue
 				val triangle = Path2D.Double().apply {
 					moveTo(target[0], target[1])
@@ -194,7 +195,7 @@ internal object RigCanvasSupport {
 		var region = screenBounds(positions, viewport)
 		g.deviceConfiguration?.bounds?.let { region = region.intersection(it) }
 		originalClip?.bounds?.let { region = region.intersection(it) }
-		if (region.isEmpty) return
+		if (region.isEmpty || region.width <= 0 || region.height <= 0 || region.width.toLong() * region.height > 67_108_864L) return
 		fun layerOf(paint: (Graphics2D) -> Unit): BufferedImage = BufferedImage(region.width, region.height, BufferedImage.TYPE_INT_ARGB_PRE).also { image ->
 			val lg = image.createGraphics()
 			try {
@@ -241,13 +242,18 @@ internal object RigCanvasSupport {
 		var left = Double.POSITIVE_INFINITY; var top = Double.POSITIVE_INFINITY
 		var right = Double.NEGATIVE_INFINITY; var bottom = Double.NEGATIVE_INFINITY
 		for (i in 0 until positions.size - 1 step 2) {
-			val x = viewport.x(positions[i]); val y = viewport.yFromWorld(positions[i + 1])
+			val px = positions[i]; val py = positions[i + 1]
+			if (!px.isFinite() || !py.isFinite()) continue
+			val x = viewport.x(px); val y = viewport.yFromWorld(py)
+			if (!x.isFinite() || !y.isFinite()) continue
 			left = minOf(left, x); right = maxOf(right, x); top = minOf(top, y); bottom = maxOf(bottom, y)
 		}
 		if (left > right) return java.awt.Rectangle()
-		val x0 = kotlin.math.floor(left).toInt() - 1
-		val y0 = kotlin.math.floor(top).toInt() - 1
-		return java.awt.Rectangle(x0, y0, kotlin.math.ceil(right).toInt() + 1 - x0, kotlin.math.ceil(bottom).toInt() + 1 - y0)
+		val x0 = kotlin.math.floor(left.coerceIn(-1_000_000.0, 1_000_000.0)).toInt() - 1
+		val y0 = kotlin.math.floor(top.coerceIn(-1_000_000.0, 1_000_000.0)).toInt() - 1
+		val x1 = kotlin.math.ceil(right.coerceIn(-1_000_000.0, 1_000_000.0)).toInt() + 1
+		val y1 = kotlin.math.ceil(bottom.coerceIn(-1_000_000.0, 1_000_000.0)).toInt() + 1
+		return java.awt.Rectangle(x0, y0, maxOf(0, x1 - x0), maxOf(0, y1 - y0))
 	}
 
 	fun boundsByDrawable(geometry: DeformedGeometry): Map<String, Bounds> = buildMap {

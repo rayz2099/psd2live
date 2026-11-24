@@ -1,6 +1,8 @@
 package io.github.psd2live.core
 
 import kotlinx.serialization.json.*
+import org.umamo.render.eval.DeformerWorld
+import org.umamo.render.eval.buildDeformerWorlds
 import org.umamo.render.eval.meshBlendState
 import org.umamo.runtime.eval.cellsByLinearIndex
 import org.umamo.runtime.eval.gridCorners
@@ -14,6 +16,7 @@ internal enum class GeometrySafetyReason {
     GEOMETRY_NEW_FLIP,
     GEOMETRY_NEW_DEGENERATE,
     GEOMETRY_NEW_COLLAPSE,
+    GEOMETRY_COORDINATE_OVERFLOW,
     GEOMETRY_SAMPLING_LIMIT,
 }
 
@@ -122,8 +125,13 @@ internal data class GeometrySafetyCoverage(val mode: String, val checkedTargets:
 }
 
 internal class GeometrySafetyRejectedException(val safetyReport: GeometrySafetyReport) :
-    IllegalArgumentException("Geometry safety gate rejected the candidate: " +
-        safetyReport.violations.map { it.reason.name }.distinct().joinToString(","))
+    IllegalArgumentException(buildString {
+        append("Geometry safety gate rejected the candidate: ")
+        append(safetyReport.violations.map { it.reason.name }.distinct().joinToString(","))
+        safetyReport.violations.firstNotNullOfOrNull { it.detail?.takeIf(String::isNotBlank) }?.let { detail ->
+            append(" — ").append(detail)
+        }
+    })
 
 internal object GeometrySafetyEvaluator {
     private class Target(
@@ -192,6 +200,156 @@ internal object GeometrySafetyEvaluator {
         val beforeSampler = Sampler(before)
         val candidateSampler = Sampler(candidate)
 
+        val candidateDefaults = candidate.parameters.associate { it.id to it.default }
+        val beforeDefaults = before.parameters.associate { it.id to it.default }
+        val candidateWorldsCache = LinkedHashMap<String, Map<DeformerId, DeformerWorld>>()
+        val beforeWorldsCache = LinkedHashMap<String, Map<DeformerId, DeformerWorld>>()
+        val worldScratch = FloatArray(2)
+        val candidateCanvasSpan = RigCoordinateLimits.canvasSpan(candidate)
+        val candidateWorldLimit = RigCoordinateLimits.maxWorldCoord(candidateCanvasSpan)
+        val beforeCanvasSpan = RigCoordinateLimits.canvasSpan(before)
+        val beforeWorldLimit = RigCoordinateLimits.maxWorldCoord(beforeCanvasSpan)
+
+        fun worldsFor(
+            model: PuppetModel,
+            defaults: Map<ParameterId, Float>,
+            cache: LinkedHashMap<String, Map<DeformerId, DeformerWorld>>,
+            pose: Map<String, Float>,
+            force: Boolean,
+        ): Map<DeformerId, DeformerWorld>? {
+            val key = if (pose.isEmpty()) "" else coordinateKey(pose)
+            cache[key]?.let { return it }
+            if (!force && cache.size >= 64) return null
+            return buildDeformerWorlds(
+                model.deformers,
+                { id -> pose[id.raw] ?: defaults[id] ?: 0f },
+                { id -> defaults[id] ?: 0f },
+            ).also { cache[key] = it }
+        }
+
+        fun localMagnitude(target: Target, points: FloatArray): Float {
+            val count = if (target.kind == "rotation") minOf(2, points.size) else points.size
+            var maxVal = 0f
+            for (i in 0 until count) {
+                val v = abs(points[i])
+                if (v > maxVal) maxVal = v
+            }
+            return maxVal
+        }
+
+        fun worldMagnitude(
+            target: Target,
+            points: FloatArray,
+            worlds: Map<DeformerId, DeformerWorld>?,
+        ): Float? {
+            val parentId = target.parent?.let(::DeformerId) ?: return localMagnitude(target, points)
+            val parentWorld = worlds?.get(parentId) ?: return null
+            val count = if (target.kind == "rotation") minOf(2, points.size) else points.size
+            var maxVal = 0f
+            var i = 0
+            while (i + 1 < count) {
+                parentWorld.apply(points[i], points[i + 1], worldScratch, 0)
+                val wx = worldScratch[0]
+                val wy = worldScratch[1]
+                if (!wx.isFinite() || !wy.isFinite()) return Float.NaN
+                maxVal = maxOf(maxVal, abs(wx), abs(wy))
+                i += 2
+            }
+            return maxVal
+        }
+
+        fun checkBoundsOverflow(
+            ref: String,
+            coordinate: Map<String, Float>,
+            old: Target?,
+            next: Target,
+            candidatePoints: FloatArray,
+            oldComparable: FloatArray?,
+            reparented: Boolean,
+            firstCoord: Map<String, Float>?,
+            lastCoord: Map<String, Float>?,
+        ): Boolean {
+            val beforePose = coordinate.filterKeys { id -> id in beforeParameters }
+            val beforeFiniteComparable = oldComparable?.takeIf { it.all(Float::isFinite) }
+
+            val nextParentId = next.parent?.let(::DeformerId)
+            val localLimit = RigCoordinateLimits.localCoordLimit(candidate, nextParentId)
+            val candLocalMax = localMagnitude(next, candidatePoints)
+            val oldLocalLimit = old?.parent?.let { RigCoordinateLimits.localCoordLimit(before, DeformerId(it)) } ?: localLimit
+            val oldLocalMax = if (old != null && beforeFiniteComparable != null) localMagnitude(old, beforeFiniteComparable) else 0f
+            if (candLocalMax > localLimit && (beforeFiniteComparable == null || reparented || oldLocalMax <= oldLocalLimit || candLocalMax > oldLocalMax * 1.01f)) {
+                val spaceLabel = if (RigCoordinateLimits.parentIsWarp(candidate, nextParentId)) {
+                    "parent Warp normalized [0..1] space"
+                } else {
+                    "canvas space"
+                }
+                violations += GeometrySafetyViolation(
+                    GeometrySafetyReason.GEOMETRY_COORDINATE_OVERFLOW,
+                    ref,
+                    coordinate,
+                    detail = "Local coordinate magnitude $candLocalMax exceeds $spaceLabel limit +/-$localLimit",
+                )
+                return true
+            }
+
+            if (next.kind == "rotation") {
+                val candRot = RigCoordinateLimits.rotationStateAt(candidate, next.source as Deformer.Rotation, coordinate)
+                if (candRot != null) {
+                    val (angle, scale) = candRot
+                    val badAngle = !angle.isFinite() || abs(angle) > RigCoordinateLimits.MAX_ANGLE_DEGREES
+                    val badScale = !scale.isFinite() || scale !in RigCoordinateLimits.MIN_ROTATION_SCALE..RigCoordinateLimits.MAX_ROTATION_SCALE
+                    if (badAngle || badScale) {
+                        val oldRot = if (!reparented && old != null) {
+                            RigCoordinateLimits.rotationStateAt(before, old.source as Deformer.Rotation, beforePose)
+                        } else null
+                        val oldBad = oldRot != null && (
+                            !oldRot.first.isFinite() || abs(oldRot.first) > RigCoordinateLimits.MAX_ANGLE_DEGREES ||
+                                !oldRot.second.isFinite() || oldRot.second !in RigCoordinateLimits.MIN_ROTATION_SCALE..RigCoordinateLimits.MAX_ROTATION_SCALE
+                            )
+                        val worsened = oldRot == null || !oldBad ||
+                            (badScale && abs(scale) > abs(oldRot.second) * 1.01f) ||
+                            (badAngle && abs(angle) > abs(oldRot.first) * 1.01f)
+                        if (worsened) {
+                            violations += GeometrySafetyViolation(
+                                GeometrySafetyReason.GEOMETRY_COORDINATE_OVERFLOW,
+                                ref,
+                                coordinate,
+                                detail = "Rotation keyform state out of bounds (angle=$angle, scale=$scale)",
+                            )
+                            return true
+                        }
+                    }
+                }
+            }
+
+            val forceWorld = coordinate.isEmpty() || coordinate == firstCoord || coordinate == lastCoord
+            val candWorlds = if (next.parent != null) worldsFor(candidate, candidateDefaults, candidateWorldsCache, coordinate, forceWorld) else null
+            if (next.parent == null || candWorlds != null) {
+                val candWorldMax = worldMagnitude(next, candidatePoints, candWorlds)
+                if (candWorldMax != null && candWorldMax.isNaN()) {
+                    nonFinite++
+                    violations += GeometrySafetyViolation(GeometrySafetyReason.GEOMETRY_NON_FINITE, ref, coordinate)
+                    return true
+                }
+                if (candWorldMax != null && candWorldMax > candidateWorldLimit) {
+                    val oldWorldMax = if (!reparented && beforeFiniteComparable != null) {
+                        val bWorlds = if (old!!.parent != null) worldsFor(before, beforeDefaults, beforeWorldsCache, beforePose, force = true) else null
+                        if (old.parent == null || bWorlds != null) worldMagnitude(old, beforeFiniteComparable, bWorlds) else null
+                    } else null
+                    if (oldWorldMax == null || !oldWorldMax.isFinite() || oldWorldMax <= beforeWorldLimit || candWorldMax > oldWorldMax * 1.01f) {
+                        violations += GeometrySafetyViolation(
+                            GeometrySafetyReason.GEOMETRY_COORDINATE_OVERFLOW,
+                            ref,
+                            coordinate,
+                            detail = "Composed world coordinate magnitude $candWorldMax exceeds canvas world limit +/-$candidateWorldLimit",
+                        )
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
         for (ref in affected.sorted()) {
             checkpoint()
             val old = beforeTargets[ref]
@@ -215,6 +373,8 @@ internal object GeometrySafetyEvaluator {
             val reparented = comparable != null && old.parent != next.parent
             // The reference and triangles are the same at every coordinate: their validity and areas once per target.
             val inspections = HashMap<FloatArray, Inspection>(2)
+            val firstCoord = next.coordinates.firstOrNull()
+            val lastCoord = next.coordinates.lastOrNull()
             for (coordinate in next.coordinates) {
                 checkpoint()
                 val candidatePoints = candidateSampler.points(next, coordinate)
@@ -228,12 +388,14 @@ internal object GeometrySafetyEvaluator {
                     violations += GeometrySafetyViolation(GeometrySafetyReason.GEOMETRY_NON_FINITE, ref, coordinate)
                     continue
                 }
+                val oldComparable = comparable?.let { beforeSampler.points(it, coordinate.filterKeys { id -> id in beforeParameters }) }
+                if (checkBoundsOverflow(ref, coordinate, old, next, candidatePoints, oldComparable, reparented, firstCoord, lastCoord)) {
+                    continue
+                }
                 if (next.triangles.isEmpty()) {
                     diagnostics += coordinateDiagnostic(ref, coordinate, "finite", candidatePoints.size / 2)
                     continue
                 }
-
-                val oldComparable = comparable?.let { beforeSampler.points(it, coordinate.filterKeys { id -> id in beforeParameters }) }
                 val reference = if (oldComparable != null && !reparented) old.reference else next.reference
                 val inspection = inspections.getOrPut(reference) { Inspection(reference, next.triangles) }
                 val candidateStatus = inspection.inspect(candidatePoints)
@@ -288,6 +450,18 @@ internal object GeometrySafetyEvaluator {
                     put("candidateFlipCount", candidateStatus.flippedTriangles.size)
                     put("candidateDegenerateCount", candidateDegenerateTriangles.size)
                     put("candidateCollapseCount", candidateStatus.collapsedTriangles.size)
+                }
+            }
+            if (next.coordinates.none { it.isEmpty() } && violations.none { it.target == ref }) {
+                val defaultPoints = candidateSampler.points(next, emptyMap())
+                if (defaultPoints != null) {
+                    if (!defaultPoints.all(Float::isFinite)) {
+                        nonFinite++
+                        violations += GeometrySafetyViolation(GeometrySafetyReason.GEOMETRY_NON_FINITE, ref, emptyMap())
+                    } else {
+                        val oldDefault = comparable?.let { beforeSampler.points(it, emptyMap()) }
+                        checkBoundsOverflow(ref, emptyMap(), old, next, defaultPoints, oldDefault, reparented, null, null)
+                    }
                 }
             }
         }
