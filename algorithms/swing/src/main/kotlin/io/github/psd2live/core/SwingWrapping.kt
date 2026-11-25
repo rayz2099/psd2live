@@ -13,7 +13,10 @@ object SwingWrapping {
         val meshes = mutableListOf<Drawable>()
         for (target in edit.targets) {
             when (val deformer = model.deformers.firstOrNull { it.id.raw == target }) {
-                is Deformer.Warp -> deformerTargets += target
+                is Deformer.Warp -> {
+                    validateExistingWarp(model, deformer, edit)
+                    deformerTargets += target
+                }
                 is Deformer.Rotation -> error("Swing needs a Warp or a mesh, not rotation $target")
                 null -> meshes += requireNotNull(model.drawables.firstOrNull { it.id.raw == target }) { "Swing target not found: $target" }
             }
@@ -49,6 +52,39 @@ object SwingWrapping {
             created += id
         }
         return Wrapped(current, commands, (deformerTargets + created).distinct())
+    }
+
+    /**
+     * 校验既有 Warp 网格密度是否足以承载摇摆分段，防止 2×2 等过粗网格将多段鞭梢退化为刚性平移。
+     * 原因：SwingDeformer 仅在控制点处采样，沿摇摆轴分段数不足 n+1 时末段无内部采样点，必须显式报错拒绝而非静默降级。
+     */
+    private fun validateExistingWarp(model: PuppetModel, warp: Deformer.Warp, edit: RigSwingEdit) {
+        val resolvedFulcrum = resolveFulcrum(model, warp, edit.fulcrum)
+        val verticalAxis = resolvedFulcrum == SwingFulcrum.TOP || resolvedFulcrum == SwingFulcrum.BOTTOM
+        val maxSegments = edit.motions.maxOf { it.segments }
+        val minAxisDivs = maxSegments + 1
+        val minCrossDivs = 2
+        val axisDivs = if (verticalAxis) warp.rows else warp.columns
+        val crossDivs = if (verticalAxis) warp.columns else warp.rows
+        if (axisDivs >= minAxisDivs && crossDivs >= minCrossDivs) return
+        val minRows = if (verticalAxis) minAxisDivs else minCrossDivs
+        val minCols = if (verticalAxis) minCrossDivs else minAxisDivs
+        val recAxisDivs = maxOf(3, maxSegments * 2)
+        val recRows = if (verticalAxis) recAxisDivs else 3
+        val recCols = if (verticalAxis) 3 else recAxisDivs
+        throw IllegalArgumentException(
+            "Swing target Warp '${warp.id.raw}' (${warp.rows}x${warp.columns}) has too few grid divisions for " +
+                "${maxSegments}-segment swing (fulcrum=${resolvedFulcrum.name}); minimum is ${minRows}x${minCols} " +
+                "(recommended smooth grid: ${recRows}x${recCols}). Densify the warp first with warp_set_topology."
+        )
+    }
+
+    /** 解析摇摆支点方向：显式支点直接使用，AUTO 时复用 SwingSpace 几何长宽比判定。 */
+    private fun resolveFulcrum(model: PuppetModel, warp: Deformer.Warp, fulcrum: SwingFulcrum): SwingFulcrum {
+        if (fulcrum != SwingFulcrum.AUTO) return fulcrum
+        val space = SwingSpace(model, warp)
+        val rest = space.rest
+        return if (rest != null) space.autoFulcrum(rest) else SwingFulcrum.TOP
     }
 
     private fun createWarp(model: PuppetModel, edit: JsonObject): PuppetModel {

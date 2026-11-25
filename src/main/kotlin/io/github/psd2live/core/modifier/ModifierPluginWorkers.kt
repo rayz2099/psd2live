@@ -39,10 +39,39 @@ internal object ModifierPluginWorkers {
     private data class WorkerKey(val storeRoot: Path, val protocol: Int, val command: List<String>, val files: Map<String, String>,
                                  val dependencies: List<ModifierPluginReference>, val executionGeneration: Long = 0L)
 
-    internal fun launchCommand(entry: InstalledModifierPlugin, runtimeDir: Path): List<String> {
+    internal const val WORKER_MAX_HEAP_PROP = "psd2live.worker.maxHeap"
+    internal const val WORKER_MAX_HEAP_ENV = "PSD2LIVE_WORKER_MAX_HEAP"
+    internal const val DEFAULT_WORKER_MAX_HEAP = "1g"
+    private val heapSpecPattern = Regex("[1-9][0-9]*[kKmMgG]?")
+
+    /**
+     * 解析插件子进程 JVM 堆上限（优先系统属性，其次环境变量，默认 1g）。
+     * 原因：子 JVM 若不传 -Xmx 会按宿主机物理内存 25% 自动分配，多会话并发时易突破宿主内存预算。
+     */
+    internal fun resolveWorkerMaxHeap(
+        propertyValue: String? = System.getProperty(WORKER_MAX_HEAP_PROP),
+        envValue: String? = System.getenv(WORKER_MAX_HEAP_ENV),
+    ): String {
+        val raw = propertyValue?.trim()?.takeIf { it.isNotEmpty() }
+            ?: envValue?.trim()?.takeIf { it.isNotEmpty() }
+            ?: DEFAULT_WORKER_MAX_HEAP
+        require(heapSpecPattern.matches(raw)) {
+            "Invalid plugin worker max heap '$raw' (expected e.g. 512m, 1g, 2g)"
+        }
+        return raw
+    }
+
+    /** 构造插件子进程启动命令，为未显式指定堆上限的 `$JAVA` 子进程注入 `-Xmx` 限制。 */
+    internal fun launchCommand(
+        entry: InstalledModifierPlugin,
+        runtimeDir: Path,
+        workerMaxHeap: String = resolveWorkerMaxHeap(),
+    ): List<String> {
         val args = entry.manifest.commands[ModifierPluginStore.platform] ?: entry.manifest.commands.getValue("jvm")
-        val jarFlag = if (args.first() == "\$JAVA") args.indexOf("-jar") else -1
-        return args.mapIndexed { index, value ->
+        val isJava = args.firstOrNull() == "\$JAVA"
+        val jarFlag = if (isJava) args.indexOf("-jar") else -1
+        val hasHeapCap = args.any { it.startsWith("-Xmx") || it.startsWith("-XX:MaxRAMPercentage") }
+        val resolved = args.mapIndexed { index, value ->
             when {
                 value == "\$JAVA" -> Path.of(System.getProperty("java.home"), "bin", if (ModifierPluginStore.platform.startsWith("windows")) "java.exe" else "java").toString()
                 // Windows Java can lose characters in an absolute -jar argument. The child already runs in runtimeDir.
@@ -52,6 +81,15 @@ internal object ModifierPluginWorkers {
                 else -> value
             }
         }
+        if (!isJava || hasHeapCap) return resolved
+        require(heapSpecPattern.matches(workerMaxHeap)) {
+            "Invalid plugin worker max heap '$workerMaxHeap' (expected e.g. 512m, 1g, 2g)"
+        }
+        val out = ArrayList<String>(resolved.size + 1)
+        out += resolved.first()
+        out += "-Xmx$workerMaxHeap"
+        out.addAll(resolved.drop(1))
+        return out
     }
 
     private fun workerKey(store: ModifierPluginStore, entry: InstalledModifierPlugin, executionGeneration: Long = 0L): WorkerKey {

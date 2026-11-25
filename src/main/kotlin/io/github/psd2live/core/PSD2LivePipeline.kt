@@ -732,10 +732,34 @@ class PSD2LivePipeline {
 		// the authored PSD layer artwork and atlas UV coordinates, avoiding singular affine transforms in CMO3.
 		val physics = PhysicsCatalog.active(model)
 		val cleaned = io.github.psd2live.core.interior.InteriorLifecycle.exportModel(rig.puppet, config.rigEdits, physics)
-		val idWarnings = RigIdCheck.checked(generatedLabel, cleaned)
+		val conflicts = RigIdCheck.conflicts(cleaned)
+		require(conflicts.isEmpty()) { tr("validation.idConflict", generatedLabel, conflicts.joinToString()) }
 		val restPose = rig.modifierOutput?.restPose?.mapKeys { org.umamo.runtime.model.ParameterId(it.key) }
-            ?: if (imported) emptyMap() else mapOf(StandardParameters.MOUTH_OPEN to 1.0f)
-		val exportPuppet = restMeshesToCanvasSpace(cleaned, restPose)
+			?: if (imported) emptyMap() else mapOf(StandardParameters.MOUTH_OPEN to 1.0f)
+		// 导出阶段先按 Cubism 字母表做确定性 ID 清洗，使回读校验与 .moc3/.cmo3/.can3 保持完全一致并消除非法 ID 告警。
+		val paramMap = io.github.psd2live.targets.cubism.CubismIdSanitizer.buildNamespaceMap(
+			cleaned.parameters.map { it.id.raw } + restPose.keys.map { it.raw }
+		)
+		val groupMap = io.github.psd2live.targets.cubism.CubismIdSanitizer.buildNamespaceMap(RigIdConversion.ids(cleaned, "param_group"))
+		val partMap = io.github.psd2live.targets.cubism.CubismIdSanitizer.buildNamespaceMap(cleaned.parts.map { it.id.raw })
+		val deformerMap = io.github.psd2live.targets.cubism.CubismIdSanitizer.buildNamespaceMap(cleaned.deformers.map { it.id.raw })
+		val drawableMap = io.github.psd2live.targets.cubism.CubismIdSanitizer.buildNamespaceMap(cleaned.drawables.map { it.id.raw })
+		val exportRemap = io.github.psd2live.algorithms.binding.ModelIdRemap(
+			parameters = paramMap.entries.associate { org.umamo.runtime.model.ParameterId(it.key) to org.umamo.runtime.model.ParameterId(it.value) },
+			groups = groupMap.entries.associate { org.umamo.runtime.model.ParameterGroupId(it.key) to org.umamo.runtime.model.ParameterGroupId(it.value) },
+			drawables = drawableMap.entries.associate { org.umamo.runtime.model.DrawableId(it.key) to org.umamo.runtime.model.DrawableId(it.value) },
+			deformers = deformerMap.entries.associate { org.umamo.runtime.model.DeformerId(it.key) to org.umamo.runtime.model.DeformerId(it.value) },
+			parts = partMap.entries.associate { org.umamo.runtime.model.PartId(it.key) to org.umamo.runtime.model.PartId(it.value) },
+		)
+		val exportCleaned = if (exportRemap.isEmpty) cleaned else exportRemap.model(cleaned)
+		val idWarnings = RigIdCheck.checked(generatedLabel, exportCleaned)
+		val exportRestPose = if (paramMap.isEmpty()) restPose else restPose.mapKeys { (id, _) ->
+			org.umamo.runtime.model.ParameterId(paramMap[id.raw] ?: id.raw)
+		}
+		val exportBoundsByDrawableId = if (drawableMap.isEmpty()) rig.sourceBoundsByDrawableId else rig.sourceBoundsByDrawableId.mapKeys { (k, _) ->
+			drawableMap[k] ?: k
+		}
+		val exportPuppet = restMeshesToCanvasSpace(exportCleaned, exportRestPose)
 		val outputRoot = outputDirectory.toAbsolutePath().normalize()
 		Files.createDirectories(outputRoot)
 		val files = mutableListOf<ExportedFile>()
@@ -750,7 +774,7 @@ class PSD2LivePipeline {
 			val reimported = Moc3Import.fromMocDocument(Moc3.read(mocBytes), null)
 			warnings += validateRigShape("MOC3", exportPuppet, reimported)
 			val moc3Label = tr("validation.moc3Readback")
-			val mocNeutral = RigIntegrityValidator.validateNeutralPose(moc3Label, reimported, rig.sourceBoundsByDrawableId)
+			val mocNeutral = RigIntegrityValidator.validateNeutralPose(moc3Label, reimported, exportBoundsByDrawableId)
 			warnings += mocNeutral.warnings
 			warnings += RigIntegrityValidator.validateHeadAnglePoses(moc3Label, reimported, mocNeutral.boundsByDrawableId)
 			warnings += RigIntegrityValidator.validateDirectionalWarpDimensions(moc3Label, reimported)
@@ -758,7 +782,8 @@ class PSD2LivePipeline {
 		progress.update(tr("progress.exportMoc3"), 0.77)
 
 		if (config.exportCmo3) {
-			val ir = RigIrCompiler.compile(analysis, atlas, rig, config, tileArt = true)
+			val rawIr = RigIrCompiler.compile(analysis, atlas, rig, config, tileArt = true)
+			val ir = io.github.psd2live.targets.cubism.CubismIdSanitizer.sanitize(rawIr)
 			val cmo3 = io.github.psd2live.targets.cubism.Cmo3Target { BezierWarp.configureEditor(it, config.rigEdits) }
 			val cmo3Options = io.github.psd2live.format.compile.ExportOptions(baseName, settings = mapOf("clips" to config.exportCan3.toString()))
 			val converted = cmo3.convert(ir, cmo3Options)
@@ -773,7 +798,7 @@ class PSD2LivePipeline {
 			val reimported = Cmo3Import.fromModelSource(source)
 			warnings += validateRigShape("CMO3", converted.puppet, reimported)
 			val cmo3Label = tr("validation.cmo3Readback")
-			val cmoNeutral = RigIntegrityValidator.validateNeutralPose(cmo3Label, reimported, rig.sourceBoundsByDrawableId)
+			val cmoNeutral = RigIntegrityValidator.validateNeutralPose(cmo3Label, reimported, exportBoundsByDrawableId)
 			warnings += cmoNeutral.warnings
 			warnings += RigIntegrityValidator.validateHeadAnglePoses(cmo3Label, reimported, cmoNeutral.boundsByDrawableId)
 			warnings += RigIntegrityValidator.validateDirectionalWarpDimensions(cmo3Label, reimported)
@@ -781,7 +806,7 @@ class PSD2LivePipeline {
 		progress.update(tr("progress.exportCmo3"), 0.91)
 
 		if (config.exportJson) {
-			val report = projectReport(baseName, analysis, rig.copy(puppet = cleaned), atlas, config, physics.map { it.id }, warnings)
+			val report = projectReport(baseName, analysis, rig.copy(puppet = exportCleaned), atlas, config, physics.map { it.id }, warnings)
 			Json.parseToJsonElement(report)
 			files += writeContained(outputRoot, "$baseName.psd2live.json", report.encodeToByteArray())
 		}
@@ -813,9 +838,11 @@ class PSD2LivePipeline {
 	): Pair<CubismRuntimeBundle, org.umamo.interop.ExportReport> {
 		val textures = if (preview && rig.modifierOutput == null) atlas.forPreview() else atlas
 		val compiled = RigIrCompiler.compile(analysis, textures, rig, config)
+		// 仅对外写盘的正式运行包做 Cubism ID 清洗，编辑器内部预览保留原始内部 ID 供修改器面板与回放对照。
+		val sanitized = if (preview) compiled else io.github.psd2live.targets.cubism.CubismIdSanitizer.sanitize(compiled)
 		// The Cubism SDK applies a pose3 as it loads, hiding every part of a group but the first; the editor shows and
 		// edits all of them, so only written bundles carry the pose.
-		val ir = if (preview) compiled.copy(advanced = compiled.advanced.copy(pose = null)) else compiled
+		val ir = if (preview) sanitized.copy(advanced = sanitized.advanced.copy(pose = null)) else sanitized
 		val bundle = io.github.psd2live.targets.cubism.Moc3Target.bundle(ir, moc3ExportOptions(baseName, config))
 		if (validate) validateBundle(bundle)
 		val manifest = bundle.files.single { it.name.endsWith(".model3.json") }.name

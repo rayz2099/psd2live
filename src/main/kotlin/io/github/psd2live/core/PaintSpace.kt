@@ -191,12 +191,31 @@ internal class PaintSpace(
 		placedOn(layer, imageX + offsetX, imageY + offsetY, width, height, raster)
 
 	companion object {
-		/** Working images above this many pixels shrink their margins around the layer. */
-		const val MAX_PIXELS: Long = 16L * 1024 * 1024
+		/** 绘画工作区单次允许的最大像素预算（32 MP，约 128 MB RGBA），兼顾 4K–5K 画布与 -Xmx6g 内存边界。 */
+		const val MAX_PIXELS: Long = 32L * 1024 * 1024
 
 		/** The canvas itself, one pixel per canvas unit, with a layer raster at [raster] (none when null). */
 		fun canvas(width: Int, height: Int, raster: Rectangle? = null): PaintSpace =
 			PaintSpace(LayerSpace(0f, 0f, width.toFloat(), height.toFloat(), width, height), 0, 0, width, height, raster)
+
+		/**
+		 * 仅用于无全画布图像分配的图层裁剪路径（如 `layer_mesh_rebuild` / 像素比对）。
+		 * 原因：`cropLayer` 直接读取图层自有栅格而不创建全画布 `BufferedImage`，按整张画布像素校验会误伤超大图幅 PSD 上的普通图层。
+		 */
+		fun forLayerCrop(layer: SourceLayer, canvasWidth: Int, canvasHeight: Int, budget: Long = MAX_PIXELS): PaintSpace {
+			if (!CanvasDensity.dense(layer)) {
+				val bounds = layer.bounds
+				val fits = layer.raster.width == bounds.width && layer.raster.height == bounds.height &&
+					layer.raster.width > 0 && layer.raster.height > 0 && !layer.raster.isFullyTransparent()
+				val layerRect = if (fits) Rectangle(bounds.left, bounds.top, bounds.width, bounds.height) else null
+				val canvasRect = Rectangle(0, 0, canvasWidth, canvasHeight)
+				val clippedArea = layerRect?.intersection(canvasRect)
+				val clippedPixels = if (clippedArea == null || clippedArea.isEmpty) 0L else clippedArea.width.toLong() * clippedArea.height
+				require(clippedPixels <= budget) { "Layer raster exceeds ${budget / (1024 * 1024)} megapixels" }
+				return canvas(canvasWidth, canvasHeight, layerRect)
+			}
+			return of(layer, canvasWidth, canvasHeight, budget)
+		}
 
 		/**
 		 * The space [layer] is painted in on a [canvasWidth] x [canvasHeight] canvas: the canvas itself for a layer
@@ -207,7 +226,8 @@ internal class PaintSpace(
 		fun of(layer: SourceLayer, canvasWidth: Int, canvasHeight: Int, budget: Long = MAX_PIXELS): PaintSpace {
 			if (!CanvasDensity.dense(layer)) {
 				// One raster pixel per canvas unit over the integer bounds - or nothing to show.
-				require(canvasWidth.toLong() * canvasHeight <= budget) { "Painting requires a canvas of at most 16 megapixels" }
+				val budgetMp = budget / (1024 * 1024)
+				require(canvasWidth.toLong() * canvasHeight <= budget) { "Painting requires a canvas of at most $budgetMp megapixels" }
 				val bounds = layer.bounds
 				val fits = layer.raster.width == bounds.width && layer.raster.height == bounds.height &&
 					layer.raster.width > 0 && layer.raster.height > 0 && !layer.raster.isFullyTransparent()

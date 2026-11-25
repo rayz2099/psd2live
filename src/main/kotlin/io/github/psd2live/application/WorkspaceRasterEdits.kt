@@ -15,7 +15,7 @@ data class WorkspacePaintRaster(val layerId: String, val raster: LayerRaster,
                                 val rebuildMesh: Boolean, val preserveSourceRaster: Boolean = false,
                                 val rect: LayerCanvasRect? = null) {
     init {
-        require(raster.width > 0 && raster.height > 0 && raster.width.toLong() * raster.height <= 16_777_216)
+        require(raster.width > 0 && raster.height > 0 && raster.width.toLong() * raster.height <= PaintSpace.MAX_PIXELS)
         require(raster.rgba.size.toLong() == raster.width.toLong() * raster.height * 4)
     }
 
@@ -37,7 +37,8 @@ data class WorkspacePaintRaster(val layerId: String, val raster: LayerRaster,
         /** The whole canvas-sized [image], one pixel per canvas unit. */
         fun capture(layerId: String, image: BufferedImage, rebuildMesh: Boolean, preserveSourceRaster: Boolean = false,
                     checkpoint: () -> Unit = {}): WorkspacePaintRaster {
-            require(image.width.toLong() * image.height <= 16_777_216) { "Painting requires a canvas of at most 16 megapixels" }
+            val budgetMp = PaintSpace.MAX_PIXELS / (1024 * 1024)
+            require(image.width.toLong() * image.height <= PaintSpace.MAX_PIXELS) { "Painting requires a canvas of at most $budgetMp megapixels" }
             val rgba = ByteArray(Math.multiplyExact(Math.multiplyExact(image.width, image.height), 4))
             val row = IntArray(image.width)
             for (y in 0 until image.height) {
@@ -83,7 +84,7 @@ internal object WorkspaceRasterEdits {
         // A layer sharing a material keeps the material's whole raster over its rectangle.
         if (WorkspaceMaterialLinks.shared(document, id) != null) return prepare(document, model, WorkspacePaintRaster(layerId, layer.raster,
             rebuildMesh = true, rect = LayerSpace.of(layer).let { LayerCanvasRect(it.left, it.top, it.width, it.height) }), work)
-        val own = PaintSpace.of(layer, document.source.widthPx, document.source.heightPx).cropLayer(layer, work::checkpoint)
+        val own = PaintSpace.forLayerCrop(layer, document.source.widthPx, document.source.heightPx).cropLayer(layer, work::checkpoint)
         require((0 until own.raster.width * own.raster.height).any { (own.raster.rgba[it * 4 + 3].toInt() and 255) > model.config.alphaThreshold }) {
             "Layer $layerId has no visible pixels to mesh"
         }
@@ -115,7 +116,7 @@ internal object WorkspaceRasterEdits {
         // whole capture; anything else is handed the crop.
         val pixels = if (DepthSplit.isFrontLayer(model, id) || WorkspaceMaterialLinks.shared(document, id) != null) request.pixels
             else PaintPixels(painted.raster, painted.rect ?: LayerCanvasRect.of(painted.bounds))
-        val samePixels = painted.samePixels(PaintSpace.of(layer, canvasWidth, canvasHeight).cropLayer(layer, work::checkpoint))
+        val samePixels = painted.samePixels(PaintSpace.forLayerCrop(layer, canvasWidth, canvasHeight).cropLayer(layer, work::checkpoint))
         val missingMesh = model.rig.puppet.drawables.none { drawable -> drawable.mesh != null && model.rig.ownLayerIdByDrawableId[drawable.id.raw] == id }
         val visiblePixels = (0 until painted.raster.width * painted.raster.height).any {
             if (it % painted.raster.width == 0) work.checkpoint()

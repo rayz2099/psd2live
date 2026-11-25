@@ -212,6 +212,8 @@ public class RasterTargets(private val renderer: FrameRenderer) {
 			TargetSetting.ClipChoice("clip", rest = false), TargetSetting.Number("fps", null, 1.0, 120.0, 1.0, 0),
 			TargetSetting.Number("size", 1024.0, 16.0, 8192.0, 64.0, 0), TargetSetting.Flag("physics", true),
 			TargetSetting.Text("background", "AARRGGBB"),
+			TargetSetting.Choice("framing", "canvas", listOf("canvas", "fit_motion", "pad")),
+			TargetSetting.Number("padding", null, 0.0, 0.5, 0.01, 2),
 		) + extraSettings
 		override fun plan(ir: RigIR, options: ExportOptions): LoweredExport {
 			val clip = options.setting("clip")?.let { clipNamed(ir, it) } ?: ir.clips.firstOrNull()
@@ -221,17 +223,38 @@ public class RasterTargets(private val renderer: FrameRenderer) {
 			require(size in 16..8192) { "Size must be within 16..8192" }
 			val background = options.setting("background")?.let { java.lang.Long.parseUnsignedLong(it.removePrefix("#"), 16).toInt() }
 				?: if (opaqueBackground) 0xffffffff.toInt() else 0
+			val framing = options.choice("framing", "canvas", listOf("canvas", "fit_motion", "pad"))
+			val defaultPadding = if (framing == "canvas") 0f else 0.05f
+			val padding = options.float("padding", defaultPadding)
+			require(padding.isFinite() && padding in 0f..0.5f) { "Padding must be within 0..0.5" }
 			val physics = options.flag("physics", true) && ir.physics.groups.isNotEmpty()
-			val spec = FrameSpec.canvas(ir, size, background)
 			val times = clip?.let { ClipSampler.frameTimes(it, fps) } ?: listOf(0f)
 			require(times.size <= MAX_FRAMES) { "${times.size} frames exceed the limit of $MAX_FRAMES" }
-			precheck?.invoke(times.size, spec.outputWidth, spec.outputHeight)
+			val fixedSpec = when (framing) {
+				"canvas" -> FrameSpec.canvas(ir, size, background)
+				"pad" -> FrameSpec.paddedCanvas(ir, padding, size, background)
+				else -> null
+			}
+			if (fixedSpec != null) precheck?.invoke(times.size, fixedSpec.outputWidth, fixedSpec.outputHeight)
 			var simulated = false
 			val frames = renderer.open(ir, physics).use { session ->
 				var previous = 0f
-				session.renderSequence(times.map { time ->
-					(clip?.let { ClipSampler.valuesAt(it, time) } ?: emptyMap()) to (time - previous).also { previous = time }
-				}, spec).also { simulated = session.simulatesPhysics }
+				val sequence = times.map { time ->
+					val pose = clip?.let { ClipSampler.valuesAt(it, time) } ?: emptyMap()
+					val delta = time - previous
+					previous = time
+					pose to delta
+				}
+				val rendered = if (fixedSpec != null) {
+					session.renderSequence(sequence, fixedSpec)
+				} else {
+					session.renderSequenceFitMotion(sequence, ir.canvas.width, ir.canvas.height, padding, size, background)
+				}
+				simulated = session.simulatesPhysics
+				rendered
+			}
+			if (fixedSpec == null && frames.isNotEmpty()) {
+				precheck?.invoke(frames.size, frames.first().width, frames.first().height)
 			}
 			val timing = if (id == "gif" && fps > 100f) LossEntry("*", Feature.TIMELINE, Handling.APPROXIMATED,
 				note = "GIF delays are whole centiseconds, so playback is capped at 100 fps") else null

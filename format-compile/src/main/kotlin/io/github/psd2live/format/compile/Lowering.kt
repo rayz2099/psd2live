@@ -183,11 +183,26 @@ public data class FrameSpec(
 	init { require(width > 0f && height > 0f && outputWidth > 0 && outputHeight > 0) { "Empty frame" } }
 
 	public companion object {
+		/** 按长边等比缩放将任意画布矩形适配到 [maxSize] 像素内，供超画布运动取景与留白模式复用。 */
+		public fun fromRect(left: Float, top: Float, width: Float, height: Float, maxSize: Int, background: Int = 0): FrameSpec {
+			require(left.isFinite() && top.isFinite() && width.isFinite() && height.isFinite() && width > 0f && height > 0f) {
+				"Frame rectangle must be finite and positive"
+			}
+			val scale = maxSize / maxOf(width, height)
+			val outW = (width * scale).toInt().coerceAtLeast(1)
+			val outH = (height * scale).toInt().coerceAtLeast(1)
+			return FrameSpec(left, top, width, height, outW, outH, background)
+		}
+
 		/** The whole canvas, fitted into [maxSize] pixels on its longer side. */
-		public fun canvas(ir: RigIR, maxSize: Int, background: Int = 0): FrameSpec {
-			val scale = maxSize / maxOf(ir.canvas.width, ir.canvas.height)
-			return FrameSpec(0f, 0f, ir.canvas.width, ir.canvas.height,
-				(ir.canvas.width * scale).toInt().coerceAtLeast(1), (ir.canvas.height * scale).toInt().coerceAtLeast(1), background)
+		public fun canvas(ir: RigIR, maxSize: Int, background: Int = 0): FrameSpec =
+			fromRect(0f, 0f, ir.canvas.width, ir.canvas.height, maxSize, background)
+
+		/** 在原 PSD 画布四周各扩展 [padding] 比例留白，保留靠近画布边缘的甩动/破框动作。 */
+		public fun paddedCanvas(ir: RigIR, padding: Float, maxSize: Int, background: Int = 0): FrameSpec {
+			val padX = ir.canvas.width * padding
+			val padY = ir.canvas.height * padding
+			return fromRect(-padX, -padY, ir.canvas.width + padX * 2f, ir.canvas.height + padY * 2f, maxSize, background)
 		}
 	}
 }
@@ -223,6 +238,21 @@ public interface FrameSession : AutoCloseable {
 	 */
 	public fun renderSequence(frames: List<Pair<Map<String, Float>, Float>>, frame: FrameSpec): List<RasterImage> =
 		frames.map { (parameters, delta) -> render(parameters, delta, frame) }
+
+	/**
+	 * 先求值整段动画全部帧的顶点包围盒并与原画布求并集，再按固定单机位渲染整段序列，
+	 * 避免破框动作在画布边缘被裁切的同时杜绝逐帧镜头抖动。
+	 */
+	public fun renderSequenceFitMotion(
+		frames: List<Pair<Map<String, Float>, Float>>,
+		canvasWidth: Float,
+		canvasHeight: Float,
+		padding: Float,
+		maxSize: Int,
+		background: Int,
+	): List<RasterImage> {
+		throw UnsupportedOperationException("This FrameSession does not support fit_motion framing")
+	}
 }
 
 /**

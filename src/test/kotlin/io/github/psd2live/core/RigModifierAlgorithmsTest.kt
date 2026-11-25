@@ -13,8 +13,12 @@ class RigModifierAlgorithmsTest {
     private val meshTarget = ModifierTarget("mesh", "mesh")
     private val rig = RigIR(Canvas(100f, 100f),
         parameters = listOf(IrParameter("ParamAngleX", "X", -30f, 30f, 0f), IrParameter("ParamOutput", "Output", -1f, 1f, 0f)),
-        deformers = listOf(Deformer.Warp("warp", "Warp", null, null, 1, 1, true,
-            KeyGrid.single(LatticePoints(Floats.of(floatArrayOf(0f, 0f, 100f, 0f, 0f, 100f, 100f, 100f)))))),
+        deformers = listOf(Deformer.Warp("warp", "Warp", null, null, 2, 2, true,
+            KeyGrid.single(LatticePoints(Floats.of(floatArrayOf(
+                0f, 0f, 50f, 0f, 100f, 0f,
+                0f, 50f, 50f, 50f, 100f, 50f,
+                0f, 100f, 50f, 100f, 100f, 100f,
+            )))))),
         meshes = listOf(Mesh("mesh", "Mesh", null, geometry = MeshGeometry(Floats.of(floatArrayOf(0f, 0f, 100f, 0f, 0f, 100f)),
             Floats.of(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)), Ints.of(intArrayOf(0, 1, 2))), offsets = null)),
     )

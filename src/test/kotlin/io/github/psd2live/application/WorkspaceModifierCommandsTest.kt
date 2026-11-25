@@ -457,7 +457,7 @@ class WorkspaceModifierCommandsTest {
     }
 
     private suspend fun fixture(withWarp: Boolean = false, layerCount: Int = 1,
-                                additionalParameters: List<RigParameterEdit> = emptyList(), physicsOrder: List<String> = emptyList(), warpDivisions: Int = 1): Fixture {
+                                additionalParameters: List<RigParameterEdit> = emptyList(), physicsOrder: List<String> = emptyList(), warpDivisions: Int = 2): Fixture {
         val source = SyntheticProject(temp.resolve("source"), layerCount, 12, 1).tree.head().snapshot
         val config = PipelineConfig(atlasSize = 64, meshSpacing = 8, rigEdits = RigEditOverlay(
             physicsOrder = physicsOrder, parameterEdits = listOf(RigParameterEdit("ParamInput", "Input", -1f, 1f, 0f, created = true),
@@ -1676,7 +1676,7 @@ class WorkspaceModifierCommandsTest {
     }
 
     @Test fun anOverrideThatCannotMigrateIsKeptReportedAndPreventsApplyingItsPrefix(): Unit = runBlocking<Unit> {
-        val f = fixture(withWarp = true)
+        val f = fixture(withWarp = true, warpDivisions = 3)
         val swing = RigSwingEdit.single("template", "Swing", SwingKind.LATERAL, listOf("warp"), listOf("P"))
         f.edit("modifier_add", add(f, "swing", swing.toJson(), "sway", ModifierTarget("deformer", "warp")))
         overrideFarPoint(f)

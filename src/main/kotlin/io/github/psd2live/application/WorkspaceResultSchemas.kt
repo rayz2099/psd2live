@@ -42,18 +42,30 @@ internal object WorkspaceResultSchema {
         val conversion = mapOf("code" to constant("modifier_conversion_mismatch"), "message" to string(),
             "fields" to array(handle()), "objects" to dictionary(obj(mapOf(
                 "added" to objectIds, "removed" to objectIds, "changed" to objectIds, "order_changed" to boolean()))))
+        // 必须与 WorkspaceFailures.from 发出的全部错误码严格对齐，防止 job_wait/job_list 响应契约校验吞掉真实故障。
+        val batchFields = mapOf("edit_index" to integer(0), "edit_operation" to handle())
+        val notGenerated = linkedMapOf("code" to constant("not_generated"), "message" to string()) + batchFields
+        val generatedCopy = linkedMapOf(
+            "code" to constant("generated_copy"),
+            "message" to string(),
+            "target" to handle(),
+            "original" to handle(),
+        ) + batchFields
         union(listOf(
-            obj(conversion + mapOf("edit_index" to integer(0), "edit_operation" to handle()), conversion.keys),
+            obj(conversion + batchFields, conversion.keys),
+            branch(choices("out_of_memory", "stack_overflow"), mapOf("exception_type" to string())),
+            obj(notGenerated, setOf("code", "message")),
+            obj(generatedCopy, setOf("code", "message", "target", "original")),
             branch(constant("geometry_unsafe"), mapOf("diagnostics" to WorkspaceGeometrySafetySchemas.report)),
             branch(constant("invalid_request"), mapOf("field" to string())),
             branch(constant("output_contract"), mapOf("field" to string(), "operation" to handle())),
-            branch(constant("invalid_edit"), mapOf("edit_index" to integer(0), "edit_operation" to handle())),
+            branch(constant("invalid_edit"), batchFields),
             branch(constant("tile_collides"), mapOf("layer_ids" to array(handle()))),
             branch(constant("state_conflict"), mapOf("expected_state" to string(), "actual_state" to string())),
             branch(constant("project_conflict"), mapOf("expected_project" to nullable(string()), "actual_project" to nullable(string()))),
             obj(linkedMapOf("code" to choices(*io.github.psd2live.core.RigRefusal.Code.entries.map { it.json }.toTypedArray()),
                 "message" to string(), "target" to handle(), "edit_index" to integer(0), "edit_operation" to handle()), setOf("code", "message")),
-            branch(choices("request_id_reused", "unsaved_changes", "workspace_busy", "permission_denied", "io_error",
+            branch(choices("request_id_reused", "unsaved_changes", "workspace_busy", "mesh_check_timeout", "permission_denied", "io_error",
                 "invalid_argument", "invalid_state", "operation_failed")),
         ))
     }

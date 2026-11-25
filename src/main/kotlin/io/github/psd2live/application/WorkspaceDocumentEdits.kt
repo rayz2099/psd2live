@@ -460,7 +460,12 @@ internal object WorkspaceDocumentEdits {
                 owner?.targets?.firstOrNull { it.id == target }
                     ?: io.github.psd2live.core.modifier.ModifierTarget(if (puppet.deformers.any { it.id.raw == target }) "deformer" else "mesh", target)
             }
-            val next = if (owner == null) stack.add("swing", 1, targets, source.toJson(), id = source.id)
+            // 新建 swing 修改器预分配 Cubism 合规参数别名，避免生成含冒号的 modifier: 参数 ID。
+            val aliases = io.github.psd2live.core.modifier.RigModifierInstance.swingOutputAliases(
+                source.id,
+                RigSwingEdit.MAX_SEGMENTS,
+            )
+            val next = if (owner == null) stack.add("swing", 1, targets, source.toJson(), id = source.id, outputAliases = aliases)
             else stack.update(owner.id) { it.copy(targets = targets, config = JsonObject(it.config + source.toJson())) }
             return document.copy(rigEdits = document.rigEdits.copy(modifierStack = next.toJson()))
         }

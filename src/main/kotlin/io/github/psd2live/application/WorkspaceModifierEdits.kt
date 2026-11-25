@@ -172,8 +172,22 @@ internal object WorkspaceModifierEdits {
         if (devEntry != null) {
             PluginDevArtifactStore.adoptByReference(devEntry.reference, request["project_id"]?.jsonPrimitive?.contentOrNull ?: "workspace")
         }
+        val requestedId = request["id"]?.jsonPrimitive?.content
+        val plannedId = requestedId ?: run {
+            var seq = stack.nextId
+            val reserved = stack.instances.mapTo(HashSet()) { it.id } + stack.retiredIds + stack.appliedNodes.keys
+            while ("m$seq" in reserved) seq = Math.addExact(seq, 1)
+            "m$seq"
+        }
+        // 新建 swing 修改器预分配 Cubism 合规参数别名，避免导出时出现含冒号的非法 ID 告警。
+        val defaultAliases = if (stored == "swing") {
+            io.github.psd2live.core.modifier.RigModifierInstance.swingOutputAliases(plannedId, RigSwingEdit.MAX_SEGMENTS)
+        } else {
+            emptyMap()
+        }
         val candidate = stack.add(stored, version, targets, config,
-            request["group"]?.jsonPrimitive?.content, request["id"]?.jsonPrimitive?.content,
+            request["group"]?.jsonPrimitive?.content, requestedId,
+            outputAliases = defaultAliases,
             plugin = resolvedPlugin)
         val instance = candidate.instances.last()
         registry.definition(instance)

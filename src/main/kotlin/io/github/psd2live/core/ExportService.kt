@@ -76,7 +76,11 @@ internal object ExportService {
 		val exported = RigIdCheck.exported(preview)
 		RigIdCheck.checked(target.id, exported)
 		val advanced = target.id == "p2lrt" || target.id == "web"
-		val ir = RigIrCompiler.compile(preview, tileArt = target.id == "cmo3", simulations = advanced)
+		val compiledIr = RigIrCompiler.compile(preview, tileArt = target.id == "cmo3", simulations = advanced)
+		// Cubism 系列导出统一清洗含冒号等非法字符的历史修改器 ID，确保 .moc3/.cmo3/.can3/.vtube.json 跨文件一致。
+		val isCubismTarget = target.id == Moc3Target.id || target.id == "cmo3" ||
+			target.id == io.github.psd2live.targets.cubism.VTubeStudioTarget.id
+		val ir = if (isCubismTarget) io.github.psd2live.targets.cubism.CubismIdSanitizer.sanitize(compiledIr) else compiledIr
 		// The runtime's advanced mode adds virtual bones, simulations and colliders: only its targets carry them.
 		if (advanced) RigIdCheck.checked(target.id, exported, ir.advanced)
 		val root = stage.toAbsolutePath().normalize()

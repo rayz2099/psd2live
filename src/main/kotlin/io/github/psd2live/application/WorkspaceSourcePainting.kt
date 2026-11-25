@@ -34,7 +34,8 @@ internal fun WorkspaceDocument.sourceLayerImage(id: String, checkpoint: () -> Un
     checkpoint()
     val layer = source.layers.singleOrNull { it.id.raw == id && id !in deletedLayerIds }
         ?: throw IllegalArgumentException("Source layer not found: $id")
-    require(source.widthPx.toLong() * source.heightPx <= 16_777_216) { "Painting requires a canvas of at most 16 megapixels" }
+    val budgetMp = PaintSpace.MAX_PIXELS / (1024 * 1024)
+    require(source.widthPx.toLong() * source.heightPx <= PaintSpace.MAX_PIXELS) { "Painting requires a canvas of at most $budgetMp megapixels" }
     val width = source.widthPx
     val height = source.heightPx
     val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)

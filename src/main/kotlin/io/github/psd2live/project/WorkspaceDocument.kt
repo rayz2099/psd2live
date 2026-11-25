@@ -35,7 +35,6 @@ data class WorkspaceDocument(
 
 /**
  * The document stores raw v1 settings: what the user or Agent chose, never the value generation derived from
- * The document stores raw v1 settings: what the user or Agent chose, never the value generation derived from
  * them. [WorkspaceSettingsPolicy.effective] is applied only where generation, export or queries consume them.
  */
 internal fun WorkspaceDocument.rawConfig(base: PipelineConfig = PipelineConfig()): PipelineConfig =
