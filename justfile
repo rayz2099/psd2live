@@ -5,32 +5,63 @@ set shell := ["bash", "-cu"]
 default:
     @just --list
 
-# 本地启动 GUI 开发界面（支持指定端口如 `just dev 23872`、`just dev auto` 自动分配端口组空闲端口或透传参数）
-dev port="" *args:
+# 本地启动 GUI 开发界面（支持 `just dev 23872`、`just dev auto`、透传应用参数如 `--store/--token/--lang`，以及注入 JVM 参数如 `-Xmx8g`/`-D...`）
+dev *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    target_port="{{port}}"
-    if [ "$target_port" = "auto" ]; then
+    raw_args=({{args}})
+    jvm_args=()
+    app_args=()
+    has_psd_file=0
+    has_gui_cmd=0
+
+    for arg in "${raw_args[@]}"; do
+        case "$arg" in
+            -D*|-X*)
+                jvm_args+=("$arg")
+                ;;
+            gui)
+                has_gui_cmd=1
+                app_args+=("$arg")
+                ;;
+            *.psd|*.PSD|*.psd2live|*.PSD2LIVE)
+                has_psd_file=1
+                app_args+=("$arg")
+                ;;
+            *)
+                app_args+=("$arg")
+                ;;
+        esac
+    done
+
+    first_arg="${app_args[0]:-}"
+    if [ "$first_arg" = "auto" ]; then
+        target_port=""
         for p in $(seq 23871 23880); do
             if ! lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
                 target_port="$p"
                 break
             fi
         done
-        if [ "$target_port" = "auto" ]; then
+        if [ -z "$target_port" ]; then
             echo "Error: 端口组 23871..23880 内所有端口均已被占用！" >&2
             exit 1
         fi
         echo "=== 自动分配 MCP 端口: $target_port (Endpoint: http://127.0.0.1:$target_port/mcp) ==="
-        exec ./run-gui.sh --port "$target_port" {{args}}
-    elif [[ "$target_port" =~ ^[0-9]+$ ]]; then
-        echo "=== 启动 GUI 并绑定 MCP 端口: $target_port (Endpoint: http://127.0.0.1:$target_port/mcp) ==="
-        exec ./run-gui.sh --port "$target_port" {{args}}
-    elif [ -n "$target_port" ]; then
-        exec ./run-gui.sh "$target_port" {{args}}
+        exec ./run-gui.sh "${jvm_args[@]}" gui --port "$target_port" "${app_args[@]:1}"
+    elif [[ "$first_arg" =~ ^[0-9]+$ ]]; then
+        echo "=== 启动 GUI 并绑定 MCP 端口: $first_arg (Endpoint: http://127.0.0.1:$first_arg/mcp) ==="
+        exec ./run-gui.sh "${jvm_args[@]}" gui --port "$first_arg" "${app_args[@]:1}"
+    elif [ "$has_psd_file" -eq 1 ] && [ "$has_gui_cmd" -eq 0 ]; then
+        echo "=== 启动 GUI 并打开文件 ==="
+        exec ./run-gui.sh "${jvm_args[@]}" "${app_args[@]}"
     else
-        echo "=== 启动默认 GUI (默认 MCP 端口: 23871) ==="
-        exec ./run-gui.sh {{args}}
+        echo "=== 启动 GUI (默认 MCP 端口: 23871) ==="
+        if [ "$has_gui_cmd" -eq 1 ]; then
+            exec ./run-gui.sh "${jvm_args[@]}" "${app_args[@]}"
+        else
+            exec ./run-gui.sh "${jvm_args[@]}" gui "${app_args[@]}"
+        fi
     fi
 
 # 启动无窗口 Headless MCP 独立服务（支持指定端口如 `just mcp 23872`、`just mcp auto` 自动探测或透传参数）
